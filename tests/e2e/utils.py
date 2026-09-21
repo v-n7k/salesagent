@@ -10,12 +10,15 @@ from fastmcp.client import Client
 from fastmcp.client.transports import StreamableHttpTransport
 from sqlalchemy import select
 
+from scripts.setup.init_database_ci import CI_TEST_SUBDOMAIN
+from tests.helpers.credentials import credential_headers
+
 
 def make_mcp_client(
     live_server: dict,
     *,
     token: str | None = None,
-    tenant: str | None = "ci-test",
+    tenant: str | None = CI_TEST_SUBDOMAIN,
     dry_run: bool = False,
     session_id: str | None = None,
     host: str | None = None,
@@ -24,11 +27,14 @@ def make_mcp_client(
     """Build an MCP client against the live e2e stack (GH #1423 consolidation).
 
     Single home for the authed-client construction previously copy-pasted across
-    ~10 tests/e2e files. The intentional variations are explicit kwargs:
+    ~10 tests/e2e files. The credential trio comes from ``credential_headers``
+    (``tests/harness/client.py``), the one producer; the kwargs below are the
+    intentional variations, and only the first two are credentials:
 
-    - ``token``: value for ``x-adcp-auth`` (omit for unauthenticated flows).
+    - ``token``: the credential, sent as ``Authorization: Bearer`` (omit for
+      unauthenticated flows).
     - ``tenant``: value for ``x-adcp-tenant`` (default ``ci-test``; pass None to
-      omit, e.g. domain-routing tests that select the tenant via ``host``).
+      omit, for example domain-routing tests that select the tenant via ``host``).
     - ``dry_run``: adds ``X-Dry-Run: true`` (the ``e2e_client`` fixture default;
       lifecycle tests that must persist real state leave it off).
     - ``session_id``: adds ``X-Test-Session-ID`` for testing-hook isolation.
@@ -36,11 +42,7 @@ def make_mcp_client(
 
     Returns an un-entered ``Client``; callers use ``async with``.
     """
-    headers: dict[str, str] = {}
-    if token is not None:
-        headers["x-adcp-auth"] = token
-    if tenant is not None:
-        headers["x-adcp-tenant"] = tenant
+    headers = credential_headers(token=token, tenant=tenant)
     if session_id is not None:
         headers["X-Test-Session-ID"] = session_id
     if dry_run:
@@ -54,10 +56,11 @@ def make_mcp_client(
 
 
 class _LiveDBEnv:
-    """Minimal env shim exposing ``get_session()`` over the live e2e database.
+    """Minimal env shim over the live e2e database for ``tests/factories`` helpers.
 
-    Bridges ``tests/factories`` helpers (which expect a harness env exposing
-    ``get_session()``, see tests/harness/_base.py) to the Docker-hosted e2e
+    Bridges factory-level helpers (which expect a harness env exposing
+    ``get_session()`` and ``_commit_factory_data()``, and which may invoke
+    factory classes — see tests/harness/_base.py) to the Docker-hosted e2e
     stack, where only the DSN in ``live_server['postgres']`` is available
     (GH #1423 consolidation).
     """
@@ -68,23 +71,47 @@ class _LiveDBEnv:
     def get_session(self):
         return self._session
 
+    def _commit_factory_data(self) -> None:
+        """Commit pending factory/session state (harness env contract)."""
+        self._session.commit()
+
 
 @contextmanager
 def live_db_env(live_server: dict):
-    """Yield a ``get_session()``-bearing env bound to the live e2e database."""
+    """Yield a harness-contract env bound to the live e2e database.
+
+    Binds ``tests/factories`` to the live-DB session for the duration of the
+    context (mirroring tests/harness/_base.py ``__enter__``/``__exit__``), so
+    factory-based helpers like ``set_adapter_test_behavior`` can create rows —
+    without the binding, factory instantiation crashes with "No session
+    provided". Nested factory-binding envs are rejected the same way the
+    harness rejects them: the binding is global state.
+    """
     from sqlalchemy import create_engine
     from sqlalchemy.orm import Session
 
-    engine = create_engine(live_server["postgres"])
+    from src.core.database.database_session import _pydantic_json_serializer
+    from tests.factories import ALL_FACTORIES
+
+    engine = create_engine(live_server["postgres"], json_serializer=_pydantic_json_serializer)
     session = Session(engine)
+    for f in ALL_FACTORIES:
+        assert f._meta.sqlalchemy_session is None, (
+            f"Factory {getattr(f, '__name__', type(f).__name__)} session already bound — "
+            "live_db_env cannot nest inside another factory-binding env"
+        )
+    for f in ALL_FACTORIES:
+        f._meta.sqlalchemy_session = session
     try:
         yield _LiveDBEnv(session)
     finally:
+        for f in ALL_FACTORIES:
+            f._meta.sqlalchemy_session = None
         session.close()
         engine.dispose()
 
 
-def set_live_adapter_behavior(live_server: dict, *, tenant_subdomain: str = "ci-test", **behavior):
+def set_live_adapter_behavior(live_server: dict, *, tenant_subdomain: str = CI_TEST_SUBDOMAIN, **behavior):
     """Upsert adapter test-behavior on the live e2e DB via the shared factory helper.
 
     Single e2e entry point for what used to be five copy-pasted psycopg2

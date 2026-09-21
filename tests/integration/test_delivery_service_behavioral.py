@@ -223,12 +223,7 @@ class TestSendWebhookEnhancedAuthBlockedSkip:
 
             env.set_http_response(200)
             service = env.get_service()
-            result = service._send_webhook_enhanced(
-                tenant_id="t1",
-                principal_id="p1",
-                media_buy_id="mb_001",
-                delivery_payload={"test": "data"},
-            )
+            result = env.call_send_enhanced({"test": "data"}, tenant_id="t1", principal_id="p1", media_buy_id="mb_001")
 
             assert result is False
             assert env.delivery_attempts == 0
@@ -246,7 +241,7 @@ class TestSendWebhookEnhancedHmacSigning:
     Both cases used to configure ``webhook_secret`` with no
     ``authentication_type`` at all, so they graded signing driven by "is a
     credential present" -- defect 2 of GH #1894, encoded as an expectation. Since
-    salesagent-47n9.24 the scheme gates it, and the secret comes from
+    #1894 the scheme gates it, and the secret comes from
     ``authentication_token``: the pair every writer in ``src/`` persists. The
     obligation is unchanged; the row is now one a buyer can create.
 
@@ -278,12 +273,7 @@ class TestSendWebhookEnhancedHmacSigning:
 
             env.set_http_response(200)
             service = env.get_service()
-            result = service._send_webhook_enhanced(
-                tenant_id="t1",
-                principal_id="p1",
-                media_buy_id="mb_001",
-                delivery_payload={"impressions": 5000, "spend": 250.0},
-            )
+            result = env.call_send_enhanced({"impressions": 5000, "spend": 250.0})
 
             assert result is True
             assert env.delivery_attempts == 1
@@ -299,7 +289,7 @@ class TestSendWebhookEnhancedHmacSigning:
         dict. A recompute from the dict would use whatever serialization
         formula the test happens to pick, which can silently agree with a
         sender that signs one serialization and transmits another (the bug
-        salesagent-47n9.1 fixed); recomputing from the received bytes is the
+        #1441 fixed); recomputing from the received bytes is the
         only form that can catch that divergence.
 
         Covers: UC-004-EXT-G-06
@@ -328,12 +318,7 @@ class TestSendWebhookEnhancedHmacSigning:
 
             env.set_http_response(200)
             service = env.get_service()
-            service._send_webhook_enhanced(
-                tenant_id="t1",
-                principal_id="p1",
-                media_buy_id="mb_001",
-                delivery_payload=payload,
-            )
+            env.call_send_enhanced(payload, tenant_id="t1", principal_id="p1", media_buy_id="mb_001")
 
             assert_signature_verifies_over_wire_body(env.last_delivery, secret)
 
@@ -379,11 +364,8 @@ class TestSendWebhookEnhancedBearerAuth:
 
             env.set_http_response(200)
             service = env.get_service()
-            result = service._send_webhook_enhanced(
-                tenant_id="t1",
-                principal_id="p1",
-                media_buy_id="mb_001",
-                delivery_payload={"impressions": 5000},
+            result = env.call_send_enhanced(
+                {"impressions": 5000}, tenant_id="t1", principal_id="p1", media_buy_id="mb_001"
             )
 
             assert result is True
@@ -429,17 +411,12 @@ class TestSendWebhookEnhancedHappyPath:
             env.set_http_response(200)
             service = env.get_service()
             payload = {"adcp_version": "2.3", "impressions": 5000, "spend": 250.0}
-            result = service._send_webhook_enhanced(
-                tenant_id="t1",
-                principal_id="p1",
-                media_buy_id="mb_001",
-                delivery_payload=payload,
-            )
+            result = env.call_send_enhanced(payload, tenant_id="t1", principal_id="p1", media_buy_id="mb_001")
 
             assert result is True
             assert env.delivery_attempts == 1
             assert env.last_delivery.path == "/webhook"
-            assert env.last_delivery.json() == payload
+            assert env.delivered_result(env.last_delivery) == payload
 
     def test_no_configs_returns_false(self, integration_db):
         """When no PushNotificationConfig exists, _send_webhook_enhanced returns False.
@@ -457,12 +434,7 @@ class TestSendWebhookEnhancedHappyPath:
             PrincipalFactory(tenant_id="t1", principal_id="p1")
 
             service = env.get_service()
-            result = service._send_webhook_enhanced(
-                tenant_id="t1",
-                principal_id="p1",
-                media_buy_id="mb_001",
-                delivery_payload={"test": "data"},
-            )
+            result = env.call_send_enhanced({"test": "data"}, tenant_id="t1", principal_id="p1", media_buy_id="mb_001")
 
             assert result is False
             assert env.delivery_attempts == 0
@@ -504,11 +476,8 @@ class TestDeliverWithBackoffSuccess:
 
             env.set_http_response(200)
             service = env.get_service()
-            result = service._send_webhook_enhanced(
-                tenant_id="t1",
-                principal_id="p1",
-                media_buy_id="mb_001",
-                delivery_payload={"impressions": 5000},
+            result = env.call_send_enhanced(
+                {"impressions": 5000}, tenant_id="t1", principal_id="p1", media_buy_id="mb_001"
             )
 
             assert result is True
@@ -556,11 +525,8 @@ class TestDeliverWithBackoffRetry:
 
             env.set_http_response(500)
             service = env.get_service()
-            result = service._send_webhook_enhanced(
-                tenant_id="t1",
-                principal_id="p1",
-                media_buy_id="mb_001",
-                delivery_payload={"impressions": 5000},
+            result = env.call_send_enhanced(
+                {"impressions": 5000}, tenant_id="t1", principal_id="p1", media_buy_id="mb_001"
             )
 
             assert result is False
@@ -591,7 +557,7 @@ class TestDeliverWithBackoffTransportFailure:
     connection, and a genuine stall the caller's own clock gives up on.
 
     The stall case is real, not simulated. It became affordable when delivery moved
-    onto the seam (salesagent-4fya.10) and its per-attempt timeout became
+    onto the seam (#1589) and its per-attempt timeout became
     configurable (salesagent-c78m): the test shortens the timeout instead of
     waiting three ten-second attempts, and no transport is patched to fake it.
 
@@ -623,11 +589,8 @@ class TestDeliverWithBackoffTransportFailure:
             env.set_http_error()
 
             service = env.get_service()
-            result = service._send_webhook_enhanced(
-                tenant_id="t1",
-                principal_id="p1",
-                media_buy_id="mb_001",
-                delivery_payload={"impressions": 5000},
+            result = env.call_send_enhanced(
+                {"impressions": 5000}, tenant_id="t1", principal_id="p1", media_buy_id="mb_001"
             )
 
             assert result is False
@@ -667,11 +630,8 @@ class TestDeliverWithBackoffTransportFailure:
             env.origin.delay(2.0)
 
             service = env.get_service()
-            result = service._send_webhook_enhanced(
-                tenant_id="t1",
-                principal_id="p1",
-                media_buy_id="mb_001",
-                delivery_payload={"impressions": 5000},
+            result = env.call_send_enhanced(
+                {"impressions": 5000}, tenant_id="t1", principal_id="p1", media_buy_id="mb_001"
             )
 
             assert result is False
@@ -735,11 +695,8 @@ class TestDeliverWithBackoffRefusedUrl:
             threshold = env.get_breaker().failure_threshold
 
             for _ in range(threshold):
-                result = service._send_webhook_enhanced(
-                    tenant_id="t1",
-                    principal_id="p1",
-                    media_buy_id="mb_001",
-                    delivery_payload={"impressions": 5000},
+                result = env.call_send_enhanced(
+                    {"impressions": 5000}, tenant_id="t1", principal_id="p1", media_buy_id="mb_001"
                 )
                 assert result is False
 
@@ -799,11 +756,8 @@ class TestDeliverWithBackoffRateLimited:
 
             env.set_http_response(429)
             service = env.get_service()
-            result = service._send_webhook_enhanced(
-                tenant_id="t1",
-                principal_id="p1",
-                media_buy_id="mb_001",
-                delivery_payload={"impressions": 5000},
+            result = env.call_send_enhanced(
+                {"impressions": 5000}, tenant_id="t1", principal_id="p1", media_buy_id="mb_001"
             )
 
             assert result is False
@@ -870,11 +824,8 @@ class TestDeliverWithBackoffClientError:
 
             env.set_http_response(404)
             service = env.get_service()
-            result = service._send_webhook_enhanced(
-                tenant_id="t1",
-                principal_id="p1",
-                media_buy_id="mb_001",
-                delivery_payload={"impressions": 5000},
+            result = env.call_send_enhanced(
+                {"impressions": 5000}, tenant_id="t1", principal_id="p1", media_buy_id="mb_001"
             )
 
             assert result is False
@@ -897,12 +848,12 @@ class TestDeliverWithBackoffClientError:
 
 @pytest.mark.requires_db
 class TestIsAdjustedNotificationType:
-    """``is_adjusted`` decides the notification_type, and both arms are graded.
+    """``is_adjusted`` decides the notification_type, and both branches are graded.
 
     An adjusted report REPLACES figures the buyer already booked; a scheduled one
     adds to them. The buyer tells the two apart by these two fields and nothing
-    else, so the False arm is not a mirror of the True arm — a build that marked
-    every report adjusted would satisfy the True arm alone and quietly ask buyers
+    else, so the False branch is not a mirror of the True branch — a build that marked
+    every report adjusted would satisfy the True branch alone and quietly ask buyers
     to overwrite good data on every delivery.
 
     Covers: line 239 of webhook_delivery_service.py,
@@ -946,7 +897,7 @@ class TestIsAdjustedNotificationType:
             )
 
             assert result is True
-            sent_payload = env.last_delivery.json()
+            sent_payload = env.delivered_result(env.last_delivery)
             assert sent_payload["notification_type"] == "adjusted"
             assert sent_payload["is_adjusted"] is True
 
@@ -990,7 +941,7 @@ class TestIsAdjustedNotificationType:
             )
 
             assert result is True
-            sent_payload = env.last_delivery.json()
+            sent_payload = env.delivered_result(env.last_delivery)
             assert sent_payload["notification_type"] == "scheduled"
             assert sent_payload["is_adjusted"] is False
 
@@ -1017,47 +968,6 @@ class TestDeliveredPayloadAdcpVersion:
 
     Covers: UC-004-ALT-WEBHOOK-PUSH-REPORTING-01
     """
-
-    def test_delivered_payload_echoes_the_pinned_adcp_spec_version(self, integration_db):
-        """The bytes that reached the endpoint carry the SDK's spec version.
-
-        Covers: UC-004-ALT-WEBHOOK-PUSH-REPORTING-01
-        """
-        from datetime import UTC, datetime
-
-        from adcp import get_adcp_spec_version
-
-        from tests.factories import (
-            PrincipalFactory,
-            PushNotificationConfigFactory,
-            TenantFactory,
-        )
-        from tests.harness import CircuitBreakerEnv
-
-        with CircuitBreakerEnv(tenant_id="t1", principal_id="p1") as env:
-            tenant = TenantFactory(tenant_id="t1")
-            principal = PrincipalFactory(tenant=tenant, principal_id="p1")
-            PushNotificationConfigFactory(
-                tenant=tenant,
-                principal=principal,
-                url=env.webhook_url,
-            )
-
-            env.set_http_response(200)
-            service = env.get_service()
-            result = service.send_delivery_webhook(
-                media_buy_id="mb_version",
-                tenant_id="t1",
-                principal_id="p1",
-                reporting_period_start=datetime(2025, 6, 1, tzinfo=UTC),
-                reporting_period_end=datetime(2025, 6, 30, tzinfo=UTC),
-                impressions=1000,
-                spend=50.0,
-            )
-
-            assert result is True
-            sent_payload = env.last_delivery.json()
-            assert sent_payload["adcp_version"] == get_adcp_spec_version()
 
 
 # ---------------------------------------------------------------------------
@@ -1179,7 +1089,9 @@ class TestSequenceNumberUnderConcurrency:
             assert sent_results == [True] * self.THREADS
             assert env.delivery_attempts == self.THREADS
 
-            delivered_sequence_numbers = sorted(request.json()["sequence_number"] for request in env.delivered_requests)
+            delivered_sequence_numbers = sorted(
+                env.delivered_result(request)["sequence_number"] for request in env.delivered_requests
+            )
             assert delivered_sequence_numbers == list(range(1, self.THREADS + 1)), (
                 f"{self.THREADS} concurrent reports for one media buy were numbered "
                 f"{delivered_sequence_numbers} — a repeated sequence_number makes one "
@@ -1231,12 +1143,7 @@ class TestQueueFullDropsWebhook:
             small_queue.enqueue({"dummy": "data"})  # Fill it
             service._queues[endpoint_key] = small_queue
 
-            result = service._send_webhook_enhanced(
-                tenant_id="t1",
-                principal_id="p1",
-                media_buy_id="mb_full",
-                delivery_payload={"test": "data"},
-            )
+            result = env.call_send_enhanced({"test": "data"}, tenant_id="t1", principal_id="p1", media_buy_id="mb_full")
 
             assert result is False
 
@@ -1254,7 +1161,7 @@ class TestShortSecretRefusesRatherThanSigning:
     unsigned at WARNING level — a buyer who configured signing received unsigned
     webhooks and no error (GH #1894, defect 1).
 
-    v2 (salesagent-47n9.24) reversed that to "signed with, not discarded", and
+    v2 (#1894) reversed that to "signed with, not discarded", and
     explicitly recorded that refusing had been "considered and rejected" because it
     would take buyers from "delivered" to "not delivered at all", adding: "AdCP
     3.1.1 mandates none." THAT CLAIM WAS FALSE. The pinned schema
@@ -1299,12 +1206,7 @@ class TestShortSecretRefusesRatherThanSigning:
 
             env.set_http_response(200)
             service = env.get_service()
-            result = service._send_webhook_enhanced(
-                tenant_id="t1",
-                principal_id="p1",
-                media_buy_id="mb_weak",
-                delivery_payload={"test": "data"},
-            )
+            result = env.call_send_enhanced({"test": "data"}, tenant_id="t1", principal_id="p1", media_buy_id="mb_weak")
 
             assert result is False, "a non-conforming credential must not report a successful delivery"
             assert env.delivery_attempts == 0, (

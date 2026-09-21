@@ -1,35 +1,30 @@
-"""
-Protocol-level webhook delivery service for A2A/MCP push notifications.
+"""Sender for AdCP task-status webhooks.
 
-This service handles protocol-level push notifications (operation status updates)
-as distinct from application-level webhooks (scheduled reporting delivery).
-
-Protocol-level webhooks are configured via:
-- A2A: MessageSendConfiguration.pushNotificationConfig
-- MCP: (future) protocol wrapper extension
-
-Application-level webhooks are configured via:
-- AdCP: CreateMediaBuyRequest.reporting_webhook
+Every notification this service delivers is one ``mcp-webhook-payload`` envelope,
+because every registration it delivers against arrived through the AdCP channel --
+``push_notification_config`` in the task arguments, or ``reporting_webhook`` on
+``create_media_buy``. AdCP 3.1.1 ``L3/webhooks.mdx`` § "Registration channel
+determines envelope shape" (:308) makes that the rule: the envelope follows the
+registration mechanism, and the page names keying on the sync transport as the
+model it is NOT ("Why this is the model, not 'match inbound transport'", :328).
+The A2A-native channel that would ask for a ``Task`` -- ``TaskPushNotificationConfig``
+-- is not implemented here at all.
 """
 
 import logging
 import time
-from collections.abc import Mapping
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 from uuid import uuid4
 
-from a2a.types import Task, TaskStatusUpdateEvent
-from adcp import create_a2a_webhook_payload, create_mcp_webhook_payload
 from adcp.types import McpWebhookPayload
 from adcp.webhooks import GeneratedTaskStatus
-from google.protobuf.json_format import MessageToDict
 from pydantic import BaseModel as PydanticBaseModel
 
 from src.core.audit_logger import get_audit_logger
 from src.core.database.database_session import get_db_session
 from src.core.security.webhook_egress import adeliver_webhook
-from src.core.webhook_validator import validate_webhook_task_type, webhook_url_for_log
-from src.core.webhooks.delivery import WebhookDeliveryOutcome, WebhookTaskContext
+from src.core.webhook_validator import webhook_url_for_log
+from src.core.webhooks.delivery import WebhookDeliveryOutcome, WebhookTaskContext, build_webhook_envelope
 from src.services.webhook_conclusion import record_conclusion
 
 
@@ -59,74 +54,16 @@ class DeliverableWebhookTarget(Protocol):
     @property
     def authentication_token(self) -> str | None: ...
 
+    #: The two values core/push-notification-config.json obliges the seller to echo
+    #: verbatim into every payload built against this registration.
+    @property
+    def operation_id(self) -> str | None: ...
+
+    @property
+    def token(self) -> str | None: ...
+
 
 logger = logging.getLogger(__name__)
-
-
-# FIXME(gh-#1299): behaviour-identical backport of adcp 5.4.0
-# ``adcp.to_wire_dict`` + ``_normalize_a2a_task_state_to_v03`` (adcp #602).
-# salesagent is pinned to adcp 4.3.0, which predates that public seam.
-# Delete this block and call ``adcp.to_wire_dict()`` directly once salesagent
-# bumps adcp to the version that ships it.
-def _normalize_message_role(message: dict[str, Any]) -> None:
-    """Rewrite a2a-sdk 1.0 ``ROLE_*`` to the A2A 0.3 lowercase wire form."""
-    role = message.get("role")
-    if isinstance(role, str) and role.startswith("ROLE_"):
-        message["role"] = role[len("ROLE_") :].lower()
-
-
-def _normalize_a2a_task_state_to_v03(payload: dict[str, Any]) -> None:
-    """Rewrite a2a-sdk 1.0 ``TASK_STATE_*`` / ``ROLE_*`` enums to A2A 0.3
-    lowercase wire strings in-place. Buyer receivers parse the 0.3 shape
-    (``"state": "completed"``); the 1.0 protobuf JSON emitter produces
-    ``"state": "TASK_STATE_COMPLETED"`` by default.
-    """
-    status = payload.get("status")
-    if isinstance(status, dict):
-        state = status.get("state")
-        if isinstance(state, str) and state.startswith("TASK_STATE_"):
-            # Spec uses hyphens for multi-word states (e.g. "auth-required").
-            status["state"] = state[len("TASK_STATE_") :].lower().replace("_", "-")
-        message = status.get("message")
-        if isinstance(message, dict):
-            _normalize_message_role(message)
-    history = payload.get("history")
-    if isinstance(history, list):
-        for entry in history:
-            if isinstance(entry, dict):
-                _normalize_message_role(entry)
-    if "role" in payload:
-        _normalize_message_role(payload)
-
-
-def _to_wire_dict(payload: Any) -> dict[str, Any]:
-    """Serialize any AdCP webhook payload to a JSON-ready dict.
-
-    Behaviour-identical backport of adcp 5.4.0 ``adcp.to_wire_dict``:
-
-    * a2a ``Task`` / ``TaskStatusUpdateEvent`` (protobuf, a2a-sdk 1.0+) ->
-      ``MessageToDict(preserving_proto_field_name=False)`` so JSON keys are
-      the A2A wire camelCase (``id``, ``contextId``, ``taskId``), then enum
-      values normalized from the 1.0 form (``TASK_STATE_COMPLETED``,
-      ``ROLE_AGENT``) to the 0.3-spec lowercase form (``completed``,
-      ``agent``).
-    * Any Pydantic model (``McpWebhookPayload`` ...) ->
-      ``model_dump(mode="json", exclude_none=True)``.
-    * ``Mapping`` -> coerced to ``dict`` (legacy hand-built passthrough).
-    """
-    if isinstance(payload, (Task, TaskStatusUpdateEvent)):
-        data: dict[str, Any] = MessageToDict(payload, preserving_proto_field_name=False)
-        _normalize_a2a_task_state_to_v03(data)
-        return data
-    if hasattr(payload, "model_dump"):
-        return cast(dict[str, Any], payload.model_dump(mode="json", exclude_none=True))
-    if isinstance(payload, Mapping):
-        return dict(payload)
-    raise TypeError(
-        f"Unsupported webhook payload type {type(payload).__name__}: expected "
-        "a2a Task / TaskStatusUpdateEvent (protobuf), an AdCP Pydantic model "
-        "(e.g. McpWebhookPayload), or a Mapping[str, Any]."
-    )
 
 
 class ProtocolWebhookService:
@@ -146,18 +83,13 @@ class ProtocolWebhookService:
         task: WebhookTaskContext,
         status: GeneratedTaskStatus,
         result: PydanticBaseModel | dict[str, Any],
-        protocol: str,
-        context_id: str = "",
     ) -> bool:
-        """Deliver one protocol notification from VALUES, choosing the dialect here.
+        """Deliver one notification from VALUES; the envelope is built here.
 
-        THE delivery entry point. Every sender used to re-derive the same two
-        decisions at its own call site: which payload builder to call
-        (``create_a2a_webhook_payload`` vs ``create_mcp_webhook_payload``, forked
-        on ``protocol``), and what to put in a free-form ``metadata`` dict. Seven
-        files forked the dialect and six built the dict, which is how
-        ``delivery_webhook_scheduler`` came to import only the MCP builder — a
-        buyer registered over A2A receives an MCP-shaped delivery report from it.
+        THE delivery entry point. Every sender used to build its own payload and
+        its own free-form ``metadata`` dict at its own call site, which is how
+        ``delivery_webhook_scheduler`` came to emit a different shape from the
+        admin routes.
 
         Taking a typed :class:`WebhookTaskContext` instead of ``metadata:
         dict[str, Any]`` is what closes the other half. ``records_delivery_log``
@@ -167,24 +99,16 @@ class ProtocolWebhookService:
         to name those fields to construct the context, so omitting one is a
         visible decision at the call site rather than an absence in a dict.
 
-        The dialect is selected ONCE, here, from ``protocol``. A caller passes
-        values and cannot choose a builder.
+        There is no dialect to pick. A caller passes values; every buyer receives
+        the same envelope, built where both senders build it.
         """
-        payload: Task | TaskStatusUpdateEvent | McpWebhookPayload
-        if protocol == "a2a":
-            payload = create_a2a_webhook_payload(
-                task_id=task.task_id,
-                status=status,
-                result=result,
-                context_id=context_id,
-            )
-        else:
-            payload = create_mcp_webhook_payload(
-                task_id=task.task_id,
-                status=status,
-                task_type=validate_webhook_task_type(task.task_type or ""),
-                result=result,
-            )
+        payload = build_webhook_envelope(
+            task=task,
+            status=status,
+            result=result,
+            operation_id=push_notification_config.operation_id,
+            token=push_notification_config.token,
+        )
 
         return await self.send_notification(
             push_notification_config=push_notification_config,
@@ -195,7 +119,7 @@ class ProtocolWebhookService:
     async def send_notification(
         self,
         push_notification_config: DeliverableWebhookTarget,
-        payload: Task | TaskStatusUpdateEvent | McpWebhookPayload,
+        payload: McpWebhookPayload,
         task: WebhookTaskContext,
     ) -> bool:
         """
@@ -203,8 +127,7 @@ class ProtocolWebhookService:
 
         Args:
             push_notification_config: Push notification configuration from protocol layer
-            payload: For A2A it can be Task or TaskStatusUpdateEvent types for MCP it wil be McpWebhookPayload.
-                Use create_a2a_webhook_payload or create_mcp_webhook_payload from adcp's official python client to get the payload for particular task and status
+            payload: The AdCP webhook envelope, from ``create_mcp_webhook_payload``.
             task: The delivery's task identity, typed. Threaded through to the
                 logger unchanged -- it used to be flattened to a loose dict here
                 and rebuilt from the PAYLOAD downstream, which silently reset
@@ -215,7 +138,6 @@ class ProtocolWebhookService:
             True if notification sent successfully, False otherwise
         """
         if not push_notification_config or not push_notification_config.url:
-            # TODO: @yusuf - Double check logging actually works for Task, TaskStatusUpdateEvent and McpWebhookPayload types
             logger.debug(
                 f"No webhook URL configured in the push notification. Here's payload: {payload}, skipping notification"
             )
@@ -253,10 +175,10 @@ class ProtocolWebhookService:
         }
         logger.info(f"push_notification_config (sanitized): {safe_config}")
 
-        # Serialize payload to dict at the delivery boundary (for HMAC signing
-        # and JSON send). Single seam: a2a protobuf -> camelCase + A2A 0.3
-        # lowercase enum values; Pydantic -> model_dump; Mapping -> dict.
-        payload_dict: dict[str, Any] = _to_wire_dict(payload)
+        # Serialize once, at the delivery boundary, for HMAC signing and the JSON
+        # send. ``exclude_none`` keeps the envelope's optional fields off the wire
+        # rather than sending them as explicit nulls.
+        payload_dict: dict[str, Any] = payload.model_dump(mode="json", exclude_none=True)
 
         # No authentication decision here. The seam validates the stored pair against
         # the pinned type and applies whatever that scheme requires — the same
@@ -286,17 +208,17 @@ class ProtocolWebhookService:
     ) -> bool:
         """Book one delivery: the row, the audit entry, and the bool the caller gets.
 
-        THE single conclusion for this sender. Every arm — refused destination,
+        THE single conclusion for this sender. Every branch — refused destination,
         client error, exhausted retries, an unexpected exception, and success —
         ends here, because a refusal, a failure and a delivery differ only in
         what they KNOW (attempts, status, wording), not in what they must record.
-        An arm that concludes on its own is an arm that can be written without
+        An branch that concludes on its own is an branch that can be written without
         recording anything, which for a refusal means a misconfigured destination
         leaving no trace at all — the absence lane salesagent-gra7.1 closes.
 
         The outcome IS the conclusion: the returned bool is derived from it, not
         decided here, and the row is written from it rather than from arguments
-        each arm re-derived.
+        each branch re-derived.
         """
         response_time_ms = int((time.time() - start_time) * 1000)
 
@@ -417,8 +339,8 @@ class ProtocolWebhookService:
             # bare RuntimeError, which belongs here.
             logger.error(f"Unexpected error sending webhook for task {ctx.task_id}: {e}", exc_info=True)
             # Nothing reached the wire, and no outcome kind covers a NON-transport
-            # failure — so this arm builds the one it means: exhausted with zero
-            # attempts. The arm no longer decides what gets recorded; it only says
+            # failure — so this branch builds the one it means: exhausted with zero
+            # attempts. The branch no longer decides what gets recorded; it only says
             # what became of the delivery, and the epilogue books it.
             return self._conclude(
                 ctx=ctx,
@@ -437,7 +359,7 @@ class ProtocolWebhookService:
             # refusal as a delivery that failed on the wire. The refusal a buyer can
             # act on already happened at ingest.
             #
-            # It still concludes through the epilogue, so this arm cannot be the one
+            # It still concludes through the epilogue, so this branch cannot be the one
             # that forgets to. Both absences survive the move and are the RULING,
             # not an oversight: record_outcome maps no status for ``refused_auth``
             # (so no row), and _conclude is passed no audit_logger (so no entry).
@@ -460,7 +382,7 @@ class ProtocolWebhookService:
             # Refused before a connection was opened. It still writes a row and an
             # audit entry — a misconfigured destination that leaves no trace is
             # indistinguishable from one nobody configured. The honest attempt count
-            # (0) and the ``refused`` spelling are the recorder's, not this arm's.
+            # (0) and the ``refused`` spelling are the recorder's, not this branch's.
             # Severity carried on the outcome, not chosen here (salesagent-pldmk.39).
             logger.log(outcome.log_level, f"Webhook for task {ctx.task_id} was refused by egress policy")
         elif outcome.kind != "delivered":

@@ -218,21 +218,25 @@ def _persist_simulation_config(env: Any, resp: AdapterGetMediaBuyDeliveryRespons
 def make_adapter_update_side_effect() -> Any:
     """Return a side_effect for a mocked ``adapter.update_media_buy``.
 
-    Produces an ``UpdateMediaBuySuccess`` echoing the media_buy_id from the
-    call and a resolved ``implementation_date``, mirroring the mock adapter's
-    own ``update_media_buy`` return (mock_ad_server.update_media_buy). Used by
+    Produces the adapter contract, ``AdapterUpdateResult``, echoing the
+    media_buy_id from the call and claiming no affected packages, which mirrors
+    what the mock adapter's own ``update_media_buy`` returns. Used by
     MediaBuyDualEnv to wire the update-path adapter mock.
-    """
-    from src.core.schemas._base import UpdateMediaBuySuccess
 
-    def _update_response(*args: Any, **kwargs: Any) -> UpdateMediaBuySuccess:
+    It passes no ``implementation_date``, and ``AdapterUpdateResult``'s
+    ``extra="forbid"`` is what makes that a check rather than a convention. The
+    field is not an adapter's to report: ``media_buy_update`` mints it itself
+    from ``_applied_instant()`` on the branch that applied the change. An
+    adapter kept passing it after the carrier split precisely because nothing
+    refused it, which is the case the carrier's own docstring cites.
+    """
+    from src.adapters.base import AdapterUpdateResult
+
+    def _update_response(*args: Any, **kwargs: Any) -> AdapterUpdateResult:
+        # The tool calls adapter.update_media_buy with every argument by
+        # keyword, so media_buy_id arrives in kwargs.
         media_buy_id = kwargs.get("media_buy_id") or (args[0] if args else "")
-        today = kwargs.get("today") or datetime.now(UTC)
-        return UpdateMediaBuySuccess.carrier(
-            media_buy_id=media_buy_id,
-            affected_packages=[],
-            implementation_date=today,
-        )
+        return AdapterUpdateResult(media_buy_id=media_buy_id, affected_packages=[])
 
     return _update_response
 
@@ -751,6 +755,56 @@ class CircuitBreakerMixin(LocalOriginMixin):
 
     _service: WebhookDeliveryService | None
 
+    @staticmethod
+    def delivered_result(request: Any) -> dict[str, Any]:
+        """The delivery REPORT inside one webhook POST, not the envelope around it.
+
+        AdCP 3.1.1 L3/webhooks.mdx :217 puts the report under ``result`` and says it "is not
+        valid as the top-level POST body by itself", so a test reading ``notification_type``
+        or ``sequence_number`` off the body finds nothing. One accessor, so no case
+        re-decides where a report field lives.
+        """
+        body = request.json()
+        result = body.get("result")
+        assert isinstance(result, dict), (
+            f"the webhook envelope carries no `result` object: got {type(result).__name__} "
+            f"at `result`, envelope keys {sorted(body)}"
+        )
+        return result
+
+    def call_send_enhanced(
+        self,
+        result: dict[str, Any] | None = None,
+        *,
+        tenant_id: str = "t1",
+        principal_id: str = "p1",
+        media_buy_id: str = "mb_001",
+        notification_type: str | None = "scheduled",
+        sequence_number: int = 1,
+    ) -> bool:
+        """Call ``_send_webhook_enhanced`` with a task context built from these values.
+
+        The sender takes the delivery REPORT and a typed context, and builds the AdCP
+        envelope per registration. Constructing that context is seven fields; doing it at
+        each of sixteen call sites is the copy-paste shape the duplication ratchet refuses,
+        and it is also how a site ends up naming the wrong sequence number without saying so.
+        """
+        from src.core.webhooks.delivery import WebhookTaskContext
+
+        service = self.get_service()
+        return service._send_webhook_enhanced(
+            ctx=WebhookTaskContext(
+                task_id=media_buy_id,
+                task_type="delivery_report",
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                media_buy_id=media_buy_id,
+                sequence_number=sequence_number,
+                notification_type=notification_type,
+            ),
+            result=result if result is not None else {"test": "data"},
+        )
+
     def get_service(self) -> WebhookDeliveryService:
         """Return a WebhookDeliveryService instance (cached per env)."""
         if self._service is None:
@@ -1142,3 +1196,58 @@ class ProductMixin:
             **extra,
         )
         return await _get_products_impl(req, identity)
+
+
+class AccountListDispatchMixin:
+    """The ``list_accounts`` verb's four transport methods, shared by both account envs.
+
+    ``AccountListEnv`` dispatches only this verb; ``AccountSyncEnv`` dispatches it
+    as its SECOND verb, behind a request-type discriminator (the ``MediaBuyDualEnv``
+    pattern). They share these methods rather than each owning a copy, because a
+    second copy is how the two envs would drift into grading the same production
+    call two different ways.
+
+    The alternative — a step calling ``_list_accounts_impl`` directly because the
+    sync env "doesn't dispatch list" — is what this mixin exists to delete: such a
+    bypass grades ``_impl`` on EVERY transport, so the a2a/mcp/rest/e2e legs of a
+    scenario never touch the wire they claim to.
+    """
+
+    LIST_REST_ENDPOINT = "/api/v1/accounts"
+
+    @staticmethod
+    def is_list_request(kwargs: dict[str, Any]) -> bool:
+        """Whether this dispatch is the list verb rather than the env's primary one.
+
+        Discriminates on the request TYPE, so one uniform rule covers every call
+        site; a ``sync_accounts`` dispatch never carries a ``ListAccountsRequest``,
+        so there is no ambiguity.
+        """
+        from src.core.schemas.account import ListAccountsRequest
+
+        return isinstance(kwargs.get("req"), ListAccountsRequest)
+
+    def _call_list_impl(self, **kwargs: Any) -> Any:
+        from src.core.tools.accounts import _list_accounts_impl
+
+        self._commit_factory_data()  # type: ignore[attr-defined]
+        kwargs.setdefault("req", None)
+        kwargs.setdefault("identity", self.identity)  # type: ignore[attr-defined]
+        return _list_accounts_impl(**kwargs)
+
+    def _call_list_a2a(self, **kwargs: Any) -> Any:
+        from src.core.schemas.account import ListAccountsResponse
+
+        return self._run_a2a_handler("list_accounts", ListAccountsResponse, **kwargs)  # type: ignore[attr-defined]
+
+    def _call_list_mcp(self, **kwargs: Any) -> Any:
+        from src.core.schemas.account import ListAccountsResponse
+
+        return self._run_mcp_client("list_accounts", ListAccountsResponse, **kwargs)  # type: ignore[attr-defined]
+
+    def _parse_list_rest_response(self, data: dict[str, Any]) -> Any:
+        # revive, not the constructor: a served document carries the context the boundary
+        # stamped and AdcpResponse refuses that field on construction.
+        from src.core.schemas.account import ListAccountsResponse
+
+        return ListAccountsResponse.revive(data)

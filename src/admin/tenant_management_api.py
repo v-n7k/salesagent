@@ -1,9 +1,6 @@
 """Tenant Management API for managing tenants - Using direct SQL queries."""
 
-import json
 import logging
-import os
-import secrets
 import uuid
 from datetime import UTC, datetime
 
@@ -11,17 +8,21 @@ from flask import Blueprint, Response, jsonify, request
 from sqlalchemy import delete, func, select
 
 from src.admin.auth_helpers import require_api_key_auth
+from src.admin.utils.operator_errors import safe_error_message
 from src.admin.utils.url_policy import json_error_if_url_blocked
+from src.core.config import get_settings
 from src.core.database.database_session import get_db_session
+from src.core.database.integrity import resolve_or_write
 from src.core.database.models import (
     AdapterConfig,
     AuditLog,
     MediaBuy,
-    Principal,
     Product,
     Tenant,
     User,
 )
+from src.core.database.repositories import TenantLookupRepository
+from src.core.database.repositories.principal import PrincipalRepository
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ tenant_management_api = Blueprint("tenant_management_api", __name__, url_prefix=
 
 
 require_tenant_management_api_key = require_api_key_auth(
-    env_var="TENANT_MANAGEMENT_API_KEY",
+    setting="tenant_management_api_key",
     config_key="tenant_management_api_key",
     header="X-Tenant-Management-API-Key",
 )
@@ -137,7 +138,6 @@ def create_tenant():
 
             # Generate tenant ID
             tenant_id = f"tenant_{uuid.uuid4().hex[:8]}"
-            admin_token = secrets.token_urlsafe(32)
 
             # Handle authorized emails - automatically add creator's email
             email_list = data.get("authorized_emails", [])
@@ -177,21 +177,45 @@ def create_tenant():
                 billing_contact=data.get("billing_contact"),
                 # Note: max_daily_budget moved to currency_limits table (per models.py line 55)
                 enable_axe_signals=data.get("enable_axe_signals", True),
-                authorized_emails=json.dumps(email_list),
-                authorized_domains=json.dumps(domain_list),
+                # JSONType/JSONB columns take lists/dicts directly. json.dumps
+                # here hands the type a STRING, which its bind coerces to {} —
+                # an object the tenants array CHECK constraints reject, so on a
+                # migrated schema these writes failed outright.
+                authorized_emails=email_list,
+                authorized_domains=domain_list,
                 slack_webhook_url=data.get("slack_webhook_url"),
                 slack_audit_webhook_url=data.get("slack_audit_webhook_url"),
                 hitl_webhook_url=data.get("hitl_webhook_url"),
-                admin_token=admin_token,
-                auto_approve_format_ids=json.dumps(data.get("auto_approve_format_ids", ["display_300x250"])),
+                auto_approve_format_ids=data.get("auto_approve_format_ids", ["display_300x250"]),
                 human_review_required=data.get("human_review_required", True),
-                policy_settings=json.dumps(data.get("policy_settings", {})),
+                policy_settings=data.get("policy_settings", {}),
                 created_at=datetime.now(UTC),
                 updated_at=datetime.now(UTC),
                 # Set default measurement provider (Publisher Ad Server)
                 measurement_providers={"providers": ["Publisher Ad Server"], "default": "Publisher Ad Server"},
             )
-            db_session.add(new_tenant)
+
+            # This route had no duplicate-subdomain pre-check at all, so every
+            # collision — race or not — fell through to the 500 below. The
+            # helper invokes `conflict` on both paths, so the check has to be a
+            # real query: a callable that unconditionally answered 409 would
+            # answer 409 before ever writing.
+            def subdomain_taken():
+                if TenantLookupRepository(db_session).find_by_subdomain(data["subdomain"]):
+                    return jsonify({"error": "Subdomain already exists"}), 409
+                return None
+
+            # Only the tenant INSERT is contested. The adapter config and default
+            # principal are added after, so a conflict returns 409 before they
+            # are ever staged.
+            conflict = resolve_or_write(
+                db_session,
+                conflict=subdomain_taken,
+                write=lambda: db_session.add(new_tenant),
+                constraint="tenants_subdomain_key",
+            )
+            if conflict is not None:
+                return conflict
 
             # Create adapter config
             adapter_type = data["ad_server"]
@@ -232,7 +256,6 @@ def create_tenant():
                 new_adapter = AdapterConfig(
                     tenant_id=tenant_id,
                     adapter_type=adapter_type,
-                    mock_dry_run=data.get("mock_dry_run", False),
                     created_at=datetime.now(UTC),
                     updated_at=datetime.now(UTC),
                 )
@@ -243,7 +266,6 @@ def create_tenant():
             principal_token = None
             if data.get("create_default_principal", True):
                 principal_id = f"principal_{uuid.uuid4().hex[:8]}"
-                principal_token = secrets.token_urlsafe(32)
 
                 # Add a default platform mapping based on the adapter type
                 default_mappings = {}
@@ -258,15 +280,13 @@ def create_tenant():
                     # For mock and others
                     default_mappings = {"mock": {"advertiser_id": "default"}}
 
-                new_principal = Principal(
-                    tenant_id=tenant_id,
+                # The token is returned once, in the result; the row keeps its hash.
+                new_principal, principal_token = PrincipalRepository(db_session, tenant_id).issue(
                     principal_id=principal_id,
                     name=f"{data['name']} Default Principal",
-                    platform_mappings=json.dumps(default_mappings),
-                    access_token=principal_token,
+                    platform_mappings=default_mappings,
                     created_at=datetime.now(UTC),
                 )
-                db_session.add(new_principal)
 
             db_session.commit()
 
@@ -274,9 +294,8 @@ def create_tenant():
                 "tenant_id": tenant_id,
                 "name": data["name"],
                 "subdomain": data["subdomain"],
-                "admin_token": admin_token,
                 "admin_ui_url": (
-                    f"http://{data['subdomain']}.localhost:{os.environ.get('ADCP_SALES_PORT', '8080')}"
+                    f"http://{data['subdomain']}.localhost:{get_settings().runtime.adcp_sales_port}"
                     f"/admin/tenant/{tenant_id}"
                 ),
             }
@@ -288,8 +307,6 @@ def create_tenant():
 
         except Exception as e:
             db_session.rollback()
-            if "UNIQUE constraint failed: tenants.subdomain" in str(e):
-                return jsonify({"error": "Subdomain already exists"}), 409
             logger.error(f"Error creating tenant: {str(e)}")
             return jsonify({"error": "Failed to create tenant"}), 500
 
@@ -362,15 +379,10 @@ def get_tenant(tenant_id):
                     adapter_data.update(
                         {"triton_station_id": adapter.triton_station_id, "has_api_key": bool(adapter.triton_api_key)}
                     )
-                elif adapter.adapter_type == "mock":
-                    adapter_data.update({"mock_dry_run": bool(adapter.mock_dry_run)})
-
                 result["adapter_config"] = adapter_data
 
             # Get principals count
-            stmt = select(func.count()).select_from(Principal).filter_by(tenant_id=tenant_id)
-            principals_count = db_session.scalar(stmt)
-            result["principals_count"] = principals_count
+            result["principals_count"] = PrincipalRepository(db_session, tenant_id).count()
 
             return jsonify(result)
 
@@ -408,10 +420,13 @@ def update_tenant(tenant_id):
             # Note: max_daily_budget moved to currency_limits table (per models.py line 55)
             if "enable_axe_signals" in data:
                 tenant.enable_axe_signals = data["enable_axe_signals"]
+            # JSONType/JSONB columns take the list directly — json.dumps here
+            # stores a JSON-encoded STRING, which breaks the jsonb operators
+            # behind TenantConfigRepository's atomic list mutations.
             if "authorized_emails" in data:
-                tenant.authorized_emails = json.dumps(data["authorized_emails"])
+                tenant.authorized_emails = data["authorized_emails"]  # noqa: authorized-list-assign — whole-list REPLACE semantics of the management API
             if "authorized_domains" in data:
-                tenant.authorized_domains = json.dumps(data["authorized_domains"])
+                tenant.authorized_domains = data["authorized_domains"]  # noqa: authorized-list-assign — whole-list REPLACE semantics of the management API
             if "slack_webhook_url" in data:
                 tenant.slack_webhook_url = data["slack_webhook_url"]
             if "slack_audit_webhook_url" in data:
@@ -419,11 +434,11 @@ def update_tenant(tenant_id):
             if "hitl_webhook_url" in data:
                 tenant.hitl_webhook_url = data["hitl_webhook_url"]
             if "auto_approve_format_ids" in data:
-                tenant.auto_approve_format_ids = json.dumps(data["auto_approve_format_ids"])
+                tenant.auto_approve_format_ids = data["auto_approve_format_ids"]
             if "human_review_required" in data:
                 tenant.human_review_required = data["human_review_required"]
             if "policy_settings" in data:
-                tenant.policy_settings = json.dumps(data["policy_settings"])
+                tenant.policy_settings = data["policy_settings"]
 
             # Always update the updated_at timestamp
             tenant.updated_at = datetime.now(UTC)
@@ -462,9 +477,7 @@ def update_tenant(tenant_id):
                         if "triton_api_key" in adapter_data:
                             adapter.triton_api_key = adapter_data["triton_api_key"]
 
-                    elif adapter.adapter_type == "mock":
-                        if "mock_dry_run" in adapter_data:
-                            adapter.mock_dry_run = adapter_data["mock_dry_run"]
+                    # The mock adapter has no connection fields this API can set.
 
                     adapter.updated_at = datetime.now(UTC)
 
@@ -481,7 +494,7 @@ def update_tenant(tenant_id):
         except Exception as e:
             db_session.rollback()
             logger.error(f"Error updating tenant {tenant_id}: {str(e)}")
-            return jsonify({"error": f"Failed to update tenant: {str(e)}"}), 500
+            return jsonify({"error": f"Failed to update tenant: {safe_error_message(e)}"}), 500
 
 
 @tenant_management_api.route("/tenants/<tenant_id>", methods=["DELETE"])
@@ -506,7 +519,7 @@ def delete_tenant(tenant_id):
             if hard_delete:
                 # Delete related records first due to foreign key constraints
                 db_session.execute(delete(AdapterConfig).where(AdapterConfig.tenant_id == tenant_id))
-                db_session.execute(delete(Principal).where(Principal.tenant_id == tenant_id))
+                PrincipalRepository(db_session, tenant_id).delete_all()
                 db_session.execute(delete(Product).where(Product.tenant_id == tenant_id))
                 db_session.execute(delete(MediaBuy).where(MediaBuy.tenant_id == tenant_id))
                 db_session.execute(delete(AuditLog).where(AuditLog.tenant_id == tenant_id))
@@ -528,4 +541,4 @@ def delete_tenant(tenant_id):
         except Exception as e:
             db_session.rollback()
             logger.error(f"Error deleting tenant {tenant_id}: {str(e)}")
-            return jsonify({"error": f"Failed to delete tenant: {str(e)}"}), 500
+            return jsonify({"error": f"Failed to delete tenant: {safe_error_message(e)}"}), 500

@@ -2,8 +2,6 @@
 
 import json
 import logging
-import os
-import secrets
 
 import markdown
 from flask import Flask, request
@@ -36,8 +34,10 @@ from src.admin.blueprints.signals_agents import signals_agents_bp
 
 # from src.admin.blueprints.tasks import tasks_bp  # Disabled - tasks eliminated in favor of workflow system
 from src.admin.blueprints.tenants import tenants_bp
+from src.admin.blueprints.test_auth import test_auth_bp
 from src.admin.blueprints.users import users_bp
 from src.admin.blueprints.workflows import workflows_bp
+from src.core.config import load_settings
 from src.core.config_loader import is_single_tenant_mode
 from src.core.domain_config import (
     get_session_cookie_domain,
@@ -102,16 +102,27 @@ class CustomProxyFix:
         return self.app(environ, custom_start_response)
 
 
-def create_app(config=None):
-    """Create and configure the Flask application."""
+def create_app(config=None, settings=None):
+    """Create and configure the Flask application.
+
+    The composition root for the admin UI: the app is composed from *settings* (a
+    :class:`src.core.config.Settings`). A root that already read the environment
+    (src/app.py) hands its object in; the standalone admin server and the tests let this
+    factory read it, once, here. The signature stays unannotated on purpose: annotating it
+    puts the factory body under mypy, and the body carries Flask ``wsgi_app`` and ``cache``
+    assignments mypy rejects that are not this change's to fix.
+    """
+    settings = settings or load_settings()
+    is_production = settings.runtime.is_production
+
     app = Flask(__name__, template_folder="../../templates", static_folder="../../static")
 
     # Configuration
-    app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+    app.secret_key = settings.runtime.flask_secret_key
     app.logger.setLevel(logging.INFO)
 
     # Configure session cookies for EventSource compatibility
-    if os.environ.get("PRODUCTION") == "true":
+    if is_production:
         app.config["SESSION_COOKIE_SECURE"] = True  # Required for SameSite=None over HTTPS
         app.config["SESSION_COOKIE_HTTPONLY"] = False  # Allow EventSource to access cookies
         app.config["SESSION_COOKIE_SAMESITE"] = "None"  # Required for EventSource cross-origin requests
@@ -155,7 +166,7 @@ def create_app(config=None):
     app.jinja_env.filters["markdown"] = markdown_filter
 
     # Trust proxy headers in production
-    if os.environ.get("PRODUCTION") == "true":
+    if is_production:
         app.config["PREFERRED_URL_SCHEME"] = "https"
         # Force external URLs to use HTTPS
         app.config["SERVER_NAME"] = None  # Let Flask detect from request
@@ -166,7 +177,7 @@ def create_app(config=None):
         app.config.update(config)
 
     # Apply proxy fixes for production
-    if os.environ.get("PRODUCTION") == "true":
+    if is_production:
         # Create a middleware to copy Fly.io headers to standard headers
         # Fly sends Fly-Forwarded-Proto but Werkzeug expects X-Forwarded-Proto
         class FlyHeadersMiddleware:
@@ -242,14 +253,14 @@ def create_app(config=None):
 
         # External domain detected - redirect to tenant subdomain
         logger.info(f"External domain /admin request detected: {apx_host} -> {request.path}")
-        tenant = get_tenant_by_virtual_host(apx_host)
-        if not tenant:
+        tenant_row = get_tenant_by_virtual_host(apx_host)
+        if not tenant_row:
             logger.warning(f"No tenant found for external domain: {apx_host}")
             return None  # Can't determine tenant, let normal routing handle it
 
-        tenant_subdomain = tenant.get("subdomain")
+        tenant_subdomain = tenant_row.get("subdomain")
         if not tenant_subdomain:
-            logger.warning(f"Tenant {tenant.get('tenant_id')} has no subdomain configured")
+            logger.warning(f"Tenant {tenant_row.get('tenant_id')} has no subdomain configured")
             return None  # No subdomain configured, let normal routing handle it
 
         # Build redirect URL to tenant subdomain
@@ -258,11 +269,11 @@ def create_app(config=None):
             f"/admin{request.full_path}" if not request.full_path.startswith("/admin") else request.full_path
         )
 
-        if os.environ.get("PRODUCTION") == "true":
+        if is_production:
             redirect_url = f"{get_tenant_url(tenant_subdomain)}{path_with_admin}"
         else:
             # Local dev: Use localhost with port (unified FastAPI port)
-            port = os.environ.get("ADCP_SALES_PORT", "8080")
+            port = settings.runtime.adcp_sales_port
             redirect_url = f"http://{tenant_subdomain}.localhost:{port}{path_with_admin}"
 
         logger.info(f"Redirecting external domain {apx_host}/admin to subdomain: {redirect_url}")
@@ -333,6 +344,11 @@ def create_app(config=None):
     app.register_blueprint(public_bp)  # Public routes (no auth required) - MUST BE FIRST
     app.register_blueprint(core_bp)  # Core routes (/, /health, /static)
     app.register_blueprint(auth_bp)  # No url_prefix - auth routes are at root
+    # The test-credential login path EXISTS only where the deployment allows it: selected
+    # here, once, rather than answering 404 per request from inside the route. Never in
+    # production, whatever the flag says.
+    if settings.testing.adcp_auth_test_mode and not is_production:
+        app.register_blueprint(test_auth_bp)
     app.register_blueprint(oidc_bp)  # OIDC/OAuth routes at /auth/oidc
     app.register_blueprint(tenant_management_settings_bp)  # Tenant management settings at /settings
     app.register_blueprint(tenants_bp, url_prefix="/tenant")
@@ -409,7 +425,7 @@ def register_adapter_routes(app):
         # Note: We skip instantiation errors since routes are optional
         adapter_configs = [
             (GoogleAdManager, {"config": {}, "principal": None}),
-            (MockAdServer, {"principal": None, "dry_run": False}),
+            (MockAdServer, {"principal": None}),
         ]
 
         for adapter_class, kwargs in adapter_configs:

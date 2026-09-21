@@ -42,11 +42,10 @@ async def test_schema_validator_initialization():
 # the same hand-maintained-second-copy disease PR #1868 exists to remove.
 # Its debugging purpose (what does the pinned schema require, does a given
 # payload validate) is already covered here (test_invalid_get_products_response,
-# test_get_products_request_validation below) and by
-# tests/unit/test_pydantic_schema_alignment.py's generate_minimal_valid_request /
-# generate_example_value (the schema-derived generator the script should have
-# reused instead of hand-rolling) and tests/unit/test_adcp_contract.py (the
-# production-model contract check). Had zero external references (no CI job,
+# test_get_products_request_validation below) and by tests/unit/test_adcp_contract.py
+# (the production-model contract check). The schema-derived request generator it should
+# have reused instead of hand-rolling lived in the alignment suite, deleted with it
+# (docs/development/building-tools.md). Had zero external references (no CI job,
 # Makefile target, or doc link) — deleted rather than repaired.
 
 
@@ -193,7 +192,7 @@ async def test_resolution_failure_is_not_a_validation_error():
 
     Callers branch on SchemaValidationError to mean "the payload violates the
     contract" — a missing/unresolvable schema must not be conflated with that
-    (the ``except SchemaError: raise`` arm in ``_validate_against_schema``).
+    (the ``except SchemaError: raise`` branch in ``_validate_against_schema``).
     """
     validator = AdCPSchemaValidator()
     with pytest.raises(SchemaError) as exc_info:
@@ -206,11 +205,16 @@ async def test_schema_path_rejects_embedded_traversal():
     """A ref that normalizes clean but traverses mid-path is contained.
 
     '_normalize_ref' only rejects '..' prefixes; the containment check in
-    'tests.helpers.pinned_schema._resolve_filename' must stop
+    'tests/helpers/adcp_pinned_schema.py' must stop
     'media-buy/../../../../etc/hosts' before any filesystem read.
+
+    Matches the message's STABLE half only. The raiser (adcp_pinned_schema.py:139)
+    interpolates the resolved path, which is the runner's absolute path -- '/app/.tox/etc/hosts'
+    in-network, something else on a laptop -- so pinning the whole sentence makes this test
+    fail on where it runs rather than on what it grades.
     """
     validator = AdCPSchemaValidator()
-    with pytest.raises(SchemaError, match="escapes the pinned SDK schema tree"):
+    with pytest.raises(SchemaError, match="escapes the schema trees"):
         await validator.get_schema("media-buy/" + "../" * 8 + "etc/hosts")
 
 
@@ -253,7 +257,7 @@ async def test_find_schema_ref_searches_every_index_section():
 
     #1843: _find_schema_ref_for_task only checked the media-buy and
     signals sections. The pinned 3.1.1 index carries tasks in 10 sections;
-    sync-creatives and list-creatives live under "creative", get-task-status
+    sync-creatives and list-creatives live under "creative", get-task-status-status
     lives under "protocol" — none of them resolvable before this fix, so any
     validate_request/validate_response call for them silently no-op'd.
     """

@@ -5,11 +5,26 @@ was retired by salesagent-4n88: the OPERATOR agent path no longer constructs
 that SDK client at all — it dials through the guarded MCP seam
 (``src.core.utils.mcp_client.call_mcp_tool``, reached through
 ``src.core.utils.operator_mcp.call_operator_mcp_tool``) instead, via
-``_fetch_formats_operator``. Its behavioral contracts (auth propagation,
-connection-alias routing, error taxonomy) are re-expressed as integration
-tests against a real local origin in
-``tests/integration/test_creative_agent_operator_seam.py`` — the project's
-stated preference over mocking the thing under test's own dependency.
+``_fetch_formats_operator``. ``_build_adcp_client``, ``_fetch_formats_from_agent``
+and ``_as_format_dict`` no longer exist, so every test that mocked them tested a
+mechanism rather than a behaviour. Their contracts are re-expressed against a
+real local origin — the project's stated preference over mocking the thing under
+test's own dependency:
+
+* auth propagation (custom header, default header, no auth) —
+  ``tests/integration/test_auth_header_propagation.py``
+* connection-alias routing — ``tests/unit/test_creative_agent_connection_alias.py``
+* error taxonomy — ``tests/integration/test_operator_agent_mcp_seam_egress.py``
+  and ``tests/integration/test_operator_probe_agent.py``
+
+The message-provenance pairs this branch added to the retired class (the
+buyer-facing ``message`` is the CODE_TABLE sentence, the upstream SDK text
+reaches only ``internal_detail``, per AdCP 3.1.1 transport-errors.mdx
+§ Security Considerations) survive one layer out and one notch stronger: they
+are graded on the wire envelope, not on a reconstructed exception, by
+``tests/integration/test_creative_agent_egress.py::TestTaxonomy::test_a_delivery_failure_does_not_echo_the_operators_endpoint``
+— which asserts the operator's host, port AND the origin's response body are all
+absent from the serialized envelope.
 """
 
 import pytest
@@ -32,7 +47,9 @@ class TestCacheKeyAcceptsAnyUrl:
         registry = CreativeAgentRegistry()
         agent_url = AnyUrl("https://creative.adcontextprotocol.org/")
         result = registry._cache_key(agent_url)
-        assert result == "https://creative.adcontextprotocol.org"
+        # The canonical form renders an empty path as "/" (the algorithm's step 5), which
+        # is what makes "https://x.org" and "https://x.org/" one cache entry rather than two.
+        assert result == "https://creative.adcontextprotocol.org/"
 
     def test_cache_key_normalizes_anyurl_same_as_str(self):
         """AnyUrl and equivalent str must produce the same cache key."""

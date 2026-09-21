@@ -8,6 +8,7 @@ import os
 import uuid
 from contextlib import ExitStack
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import psycopg2
 import pytest
@@ -15,6 +16,12 @@ from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from sqlalchemy import create_engine, delete, select
 
 from src.admin.app import create_app
+
+# Registers the ci-test tenant/principal fixture for this package. Imported by
+# name rather than star-imported: the one star import in tests/conftest.py is an
+# allowlisted exception, not the pattern.
+from tests.helpers.ledger import load_ledger_nodeids
+from tests.integration.conftest_ci_seed import ci_test_principal  # noqa: F401
 
 admin_app = create_app()
 from src.core.database.database_session import get_db_session
@@ -255,11 +262,13 @@ def test_tenant_with_data(integration_db):
 
         # Principal (required for setup completion)
         # Include both kevel and mock mappings to support ad_server="kevel" (which is production-ready)
-        principal = Principal(
+        # with_token, not access_token=: the row keeps sha256 plus a display prefix,
+        # so the plaintext is an ARGUMENT to the constructor rather than a column.
+        principal = Principal.with_token(
+            f"{tenant_id}_token",
             tenant_id=tenant_id,
             principal_id=f"{tenant_id}_principal",
             name="Test Principal",
-            access_token=f"{tenant_id}_token",
             platform_mappings={
                 "kevel": {"advertiser_id": f"kevel_adv_{tenant_id}"},
                 "mock": {"advertiser_id": f"mock_adv_{tenant_id}"},
@@ -347,7 +356,6 @@ def sample_tenant(integration_db):
             authorized_domains=["example.com"],
             auto_approve_format_ids=["display_300x250"],
             human_review_required=False,
-            admin_token="test_admin_token",
             created_at=now,
             updated_at=now,
         )
@@ -425,7 +433,9 @@ def sample_tenant(integration_db):
             "tenant_id": tenant.tenant_id,
             "name": tenant.name,
             "subdomain": tenant.subdomain,
-            "admin_token": tenant.admin_token,
+            # No admin_token: the tenant-level admin credential was dropped in 84a86e019
+            # (migration e4b7c2a91f05). Principal tokens are hashed and shown once; there
+            # is no tenant admin credential path left. No consumer read this key.
         }
 
 
@@ -439,11 +449,12 @@ def sample_principal(integration_db, sample_tenant):
         from datetime import UTC, datetime
 
         now = datetime.now(UTC)
-        principal = Principal(
+        token = "test_token_12345"
+        principal = Principal.with_token(
+            token,
             tenant_id=sample_tenant["tenant_id"],
             principal_id="test_principal",
             name="Test Advertiser",
-            access_token="test_token_12345",
             # Include both kevel and mock mappings for compatibility
             platform_mappings={
                 "kevel": {"advertiser_id": "test_advertiser"},
@@ -457,16 +468,52 @@ def sample_principal(integration_db, sample_tenant):
         return {
             "principal_id": principal.principal_id,
             "name": principal.name,
-            "access_token": principal.access_token,
+            # The plaintext this fixture minted, not a column read: the row keeps
+            # only sha256(token), so there is nothing on `principal` to read back.
+            "access_token": token,
         }
+
+
+@pytest.fixture
+def sample_account(integration_db, factory_session, sample_tenant, sample_principal):
+    """A real Account row the sample principal may act on.
+
+    AdCP 3.1.1 makes `account` REQUIRED on sync-creatives-request and
+    update-media-buy-request (/required), and production RESOLVES the reference against the
+    database -- a fabricated id satisfies model construction and then earns
+    ACCOUNT_NOT_FOUND at the wire. So a wire-level test needs a seeded account, not a
+    plausible string. A test that only CONSTRUCTS models never reaches resolution and should
+    keep using a literal.
+
+    Built with factories, not session.add(): the repository-pattern guard forbids new inline
+    session writes in tests, and it caught the first version of this fixture doing exactly
+    that. The sibling sample_tenant/sample_principal fixtures predate that rule and are
+    allowlisted; new code does not get to match them.
+
+    Requests ``factory_session``, which binds the shared session onto every factory; the
+    factories declare ``sqlalchemy_session = None`` and raise "No session provided" without it.
+
+    Returns the AccountReference shape a request carries.
+    """
+    from tests.factories import AccountFactory, AgentAccountAccessFactory
+
+    account = AccountFactory(tenant_id=sample_tenant["tenant_id"], account_id="acc_test_0001")
+    # Resolution checks the calling agent's ACCESS, not merely that the row exists -- seeding
+    # only the account fails in a way indistinguishable from not seeding at all.
+    AgentAccountAccessFactory(
+        tenant_id=sample_tenant["tenant_id"],
+        principal_id=sample_principal["principal_id"],
+        account_id=account.account_id,
+    )
+    return {"account_id": account.account_id}
 
 
 @pytest.fixture
 def sample_products(integration_db, sample_tenant):
     """Create sample products that comply with AdCP protocol."""
     from src.core.database.database_session import get_db_session
-    from src.core.database.models import PricingOption as PricingOptionModel
     from src.core.database.models import Product
+    from tests.factories import PricingOptionFactory
 
     with get_db_session() as session:
         products = [
@@ -544,9 +591,8 @@ def sample_products(integration_db, sample_tenant):
         session.commit()
 
         # Create pricing_options for each product (required per AdCP PR #88)
-        # Note: Database model uses auto-increment 'id', not 'pricing_option_id'
         pricing_options = [
-            PricingOptionModel(
+            PricingOptionFactory.build(
                 tenant_id=sample_tenant["tenant_id"],
                 product_id="guaranteed_display",
                 pricing_model="cpm",
@@ -555,7 +601,7 @@ def sample_products(integration_db, sample_tenant):
                 is_fixed=True,
                 price_guidance=None,  # Not used for fixed pricing
             ),
-            PricingOptionModel(
+            PricingOptionFactory.build(
                 tenant_id=sample_tenant["tenant_id"],
                 product_id="non_guaranteed_video",
                 pricing_model="cpm",
@@ -634,11 +680,13 @@ mcp.run(transport='http', host='0.0.0.0', port={port})
 """
 
     # The server's output goes to FILES, never PIPEs. A PIPE nobody drains caps
-    # at 64KB; once server logging fills it, the server blocks on a log write
-    # INSIDE a request handler and the calling test awaits forever — this wedged
-    # every full CI run at integration's quiet tail until the >1h run reaper
-    # killed it (#1868 review). Files keep the error-path diagnostics below
-    # without needing a drainer thread.
+    # at 64KB; once server logging fills it (uvicorn access lines + app INFO +
+    # rich console output), the server blocks on a log write INSIDE a request
+    # handler and the calling test awaits forever — py-spy showed the server
+    # MainThread parked in logging emit while create_media_buy hung for four
+    # consecutive runs, and this wedged every full CI run at integration's quiet
+    # tail until the >1h run reaper killed it (#1868 review). Files keep the
+    # error-path diagnostics below without needing a drainer thread.
     output_dir = Path(tempfile.mkdtemp(prefix=f"mcp-server-{port}-"))
     stdout_path = output_dir / "stdout.log"
     stderr_path = output_dir / "stderr.log"
@@ -656,11 +704,16 @@ mcp.run(transport='http', host='0.0.0.0', port={port})
         stdout_f.close()
         stderr_f.close()
 
+    def _tail(path: Path, limit: int = 8000) -> str:
+        """Last `limit` bytes of a log file — a chatty server writes far more than a failure message needs."""
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return "N/A (log unreadable)"
+        return data[-limit:].decode(errors="replace") if data else "N/A"
+
     def _server_output() -> str:
-        return (
-            f"STDOUT: {stdout_path.read_text(errors='replace') or 'N/A'}\n"
-            f"STDERR: {stderr_path.read_text(errors='replace') or 'N/A'}"
-        )
+        return f"STDOUT: {_tail(stdout_path)}\nSTDERR: {_tail(stderr_path)}"
 
     # Wait for server to be ready.
     # Server startup is dominated by Python imports (fastmcp + adcp SDK + project)
@@ -763,55 +816,12 @@ def authenticated_admin_client(test_admin_app):
         del os.environ["ADCP_AUTH_TEST_MODE"]
 
 
-@pytest.fixture
-def test_media_buy_workflow(populated_db):
-    """Provide complete media buy workflow test setup."""
-    from src.core.database.database_session import get_db_session
-    from src.core.database.models import Creative, MediaBuy
-    from tests.fixtures import CreativeFactory, MediaBuyFactory
-
-    data = populated_db
-
-    # Create media buy
-    media_buy_data = MediaBuyFactory.create(
-        tenant_id=data["tenant"]["tenant_id"],
-        principal_id=data["principal"]["principal_id"],
-        status="draft",
-    )
-
-    # Create creatives
-    creatives_data = CreativeFactory.create_batch(
-        2,
-        tenant_id=data["tenant"]["tenant_id"],
-        principal_id=data["principal"]["principal_id"],
-    )
-
-    # Insert into database using ORM
-    with get_db_session() as db_session:
-        media_buy = MediaBuy(
-            tenant_id=media_buy_data["tenant_id"],
-            media_buy_id=media_buy_data["media_buy_id"],
-            principal_id=media_buy_data["principal_id"],
-            status=media_buy_data["status"],
-            config=media_buy_data["config"],
-            total_budget=media_buy_data["total_budget"],
-        )
-        db_session.add(media_buy)
-
-        for creative_data in creatives_data:
-            creative = Creative(
-                tenant_id=creative_data["tenant_id"],
-                creative_id=creative_data["creative_id"],
-                principal_id=creative_data["principal_id"],
-                format_id=creative_data["format_id"],
-                status=creative_data["status"],
-                content=creative_data["content"],
-            )
-            db_session.add(creative)
-
-        db_session.commit()
-
-    return {**data, "media_buy": media_buy_data, "creatives": creatives_data}
+# ``test_media_buy_workflow`` was here and is DELETED along with the dict
+# ``CreativeFactory`` it seeded from (tests/fixtures/factories.py). It had zero consumers
+# and could not have run for any of them: ``CreativeFactory.create_batch`` was never
+# defined on that class, and the ORM ``Creative`` it then constructed has no ``format_id``
+# or ``content`` column (they are ``format`` / ``agent_url`` / ``data``). Seed a media buy
+# with ``MediaBuyFactory`` and creatives with ``CreativeFactory`` from tests/factories/.
 
 
 @pytest.fixture
@@ -874,27 +884,6 @@ def migration_db():
         pass
 
 
-@pytest.fixture
-def mock_identity(sample_tenant, sample_principal):
-    """Build a ResolvedIdentity from real test DB fixtures.
-
-    Use this with: patch("src.core.resolved_identity.resolve_identity", return_value=mock_identity)
-
-    Uses LazyTenantContext so the tenant dict is always read from the DB,
-    matching production behavior (where resolve_identity → LazyTenantContext
-    defers DB load until a field is accessed).
-    """
-    from src.core.resolved_identity import ResolvedIdentity
-    from src.core.tenant_context import LazyTenantContext
-
-    return ResolvedIdentity(
-        principal_id=sample_principal["principal_id"],
-        tenant_id=sample_tenant["tenant_id"],
-        tenant=LazyTenantContext(sample_tenant["tenant_id"]),
-        protocol="a2a",
-    )
-
-
 # ============================================================================
 # Pricing Helper Functions (merged from integration_v2)
 # ============================================================================
@@ -944,7 +933,8 @@ def create_test_product_with_pricing(
     import uuid
     from decimal import Decimal
 
-    from src.core.database.models import PricingOption, Product
+    from src.core.database.models import Product
+    from tests.factories import PricingOptionFactory
 
     if product_id is None:
         product_id = f"test_product_{uuid.uuid4().hex[:8]}"
@@ -1026,7 +1016,7 @@ def create_test_product_with_pricing(
     session.flush()
 
     pricing_model_lower = pricing_model.lower() if isinstance(pricing_model, str) else pricing_model
-    pricing_option = PricingOption(
+    pricing_option = PricingOptionFactory.build(
         tenant_id=tenant_id,
         product_id=product_id,
         pricing_model=pricing_model_lower,
@@ -1200,11 +1190,11 @@ def add_required_setup_data(session, tenant_id: str):
     stmt_principal = select(Principal).filter_by(tenant_id=tenant_id)
     existing_principal = session.scalars(stmt_principal).first()
     if not existing_principal:
-        principal = Principal(
+        principal = Principal.with_token(
+            f"{tenant_id}_default_token",
             tenant_id=tenant_id,
             principal_id=f"{tenant_id}_default_principal",
             name="Default Test Principal",
-            access_token=f"{tenant_id}_default_token",
             platform_mappings={
                 "kevel": {"advertiser_id": f"kevel_adv_{tenant_id}"},
                 "mock": {"advertiser_id": f"mock_adv_{tenant_id}"},
@@ -1264,32 +1254,40 @@ def seed_error_test_tenant(
     ``PricingOptionFactory`` defaults (cpm/USD/fixed) derive the synthetic
     ``cpm_usd_fixed`` pricing option id the budget pins reference.
 
-    Returns a dict with ``tenant_dict`` (ready for ``set_current_tenant``), the seeded
-    ``identity`` (``ResolvedIdentity`` bound to the principal), and ``principal_id`` /
-    ``access_token`` for callers that need them separately.
+    Returns the seeded ``tenant`` / ``principal`` / ``product`` rows, the ``identity``
+    (``ResolvedIdentity`` bound to the principal, carrying the tenant derived from its own
+    row), and ``principal_id`` / ``access_token`` for callers that need them separately.
     """
-    from src.core.config_loader import set_current_tenant
+    from src.core.tenant_context import TenantContext
     from tests.factories import (
         PricingOptionFactory,
         PrincipalFactory,
         ProductFactory,
         TenantFactory,
     )
+    from tests.factories.principal import plaintext_token_for
 
-    tenant_dict = {
-        "tenant_id": tenant_id,
-        "name": tenant_name,
-        "subdomain": subdomain,
-        "ad_server": "mock",
-        "human_review_required": False,
-    }
-    tenant = TenantFactory(**tenant_dict, is_active=True)
+    # Keyword arguments on the factory, not a dict. There was a ``tenant_dict`` here that got
+    # splatted into the factory AND, separately, into ``make_tenant`` for the identity's
+    # tenant -- two independent constructions of one tenant, free to drift, from a second
+    # representation nothing owns. The factory owns the row's field values.
+    tenant = TenantFactory(
+        tenant_id=tenant_id,
+        name=tenant_name,
+        subdomain=subdomain,
+        ad_server="mock",
+        human_review_required=False,
+        is_active=True,
+    )
     product = ProductFactory(tenant=tenant, product_id=product_id, property_tags=["all_inventory"])
     PricingOptionFactory(product=product)
+    # No access_token=: the row keeps sha256 plus a display prefix, and the factory
+    # derives both from ``plaintext_token_for(principal_id)``. The token a caller
+    # PRESENTS is therefore derived, not chosen — which is why the returned
+    # ``access_token`` below is that derived value rather than the argument.
     principal = PrincipalFactory(
         tenant=tenant,
         principal_id=principal_id,
-        access_token=access_token,
         platform_mappings={"mock": {"advertiser_id": advertiser_id}},
     )
 
@@ -1299,23 +1297,36 @@ def seed_error_test_tenant(
     add_required_setup_data(session, tenant_id)
     session.commit()
 
-    set_current_tenant(tenant_dict)
+    # No set_current_tenant. The ambient-tenant ContextVar and its setter were deleted with
+    # the file-based config loader (76c2a96fb) -- tests/smoke/test_smoke_basic.py records it --
+    # so this import raised at collection and took every test in this helper's one consumer
+    # with it. The identity built below CARRIES the tenant, which is what production reads.
 
+    # make_identity takes the principal and the tenant and nothing else. It refuses
+    # unknown keywords by design rather than dropping them, so auth_token= and
+    # protocol= are removed here instead of being silently ignored: the credential is
+    # presented in a header the harness builds, and the transport is the harness's
+    # choice, so neither is a property of the resolved identity.
+    # The tenant context DERIVED from the row, through production's own constructor, so the
+    # identity cannot describe a tenant the database disagrees with. It used to be built by
+    # ``make_tenant(**tenant_dict)`` from the same dict that made the row -- a second
+    # construction with its own defaults for every field the dict omitted.
     identity = PrincipalFactory.make_identity(
         principal_id=principal_id,
         tenant_id=tenant_id,
-        tenant=tenant_dict,
-        auth_token=access_token,
-        protocol=protocol,
+        tenant=TenantContext.from_orm_model(tenant),
     )
     return {
         "tenant": tenant,
         "principal": principal,
         "product": product,
-        "tenant_dict": tenant_dict,
         "identity": identity,
         "principal_id": principal_id,
-        "access_token": access_token,
+        # The token that actually authenticates this principal, derived the one way
+        # the resolver can match. The ``access_token`` parameter is kept in the
+        # signature so existing callers still pass, but it cannot select the
+        # credential any more — the hash in the row comes from the principal id.
+        "access_token": plaintext_token_for(principal_id),
     }
 
 
@@ -1378,14 +1389,40 @@ def bound_factory_session(integration_db):
     because a caller that only borrowed the binding would still have to manage the
     SASession itself and that is where the hand-rolled versions diverge.
     """
-    from sqlalchemy.orm import Session as SASession
+    from tests.utils.database_helpers import bound_factory_session as bound
 
-    from src.core.database.database_session import get_engine
-    from tests.utils.database_helpers import bind_factories_to_session
+    with bound() as session:
+        yield session
 
-    session = SASession(bind=get_engine())
-    try:
-        with bind_factories_to_session(session):
-            yield session
-    finally:
-        session.close()
+
+#: Integration tests ledgered pending rewrite — see ``known_failures.txt`` next to this
+#: file for why each is listed and which issue owns it. Read through the SHARED loader the
+#: bdd and storyboard ledgers use, so there is one parse of a nodeid ledger rather than a
+#: third copy free to disagree with the other two about comments and blank lines.
+_LEDGERED_NODEIDS: frozenset[str] = load_ledger_nodeids(Path(__file__).parent / "known_failures.txt")
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """xfail(strict=True) exactly the ledgered nodeids.
+
+    STRICT, unlike the e2e_rest ledger. That one is deliberately non-strict because e2e
+    dispatches over real HTTP to a separate server and "an environment-dependent xpass
+    must not fail CI" (its own comment). These run in-process against the same real
+    Postgres on every run, so there is no environment to be dependent on -- which means a
+    ledgered test that starts passing must FAIL, or the ledger stops being a shrinking
+    work-list and becomes a place where coverage goes quiet. That is the dormancy this
+    repo has been bitten by often enough to have a graduation workflow for it
+    (.claude/rules/workflows/xpass-graduation.md).
+
+    An unmatched ledger entry is caught by ``tests/unit/test_integration_ledger_state.py``
+    rather than here: this hook sees only the items the current selection collected, so a
+    stale nodeid looks identical to one that was simply not selected.
+    """
+    for item in items:
+        if item.nodeid in _LEDGERED_NODEIDS:
+            item.add_marker(
+                pytest.mark.xfail(
+                    reason="ledgered pending rewrite (tests/integration/known_failures.txt)",
+                    strict=True,
+                )
+            )

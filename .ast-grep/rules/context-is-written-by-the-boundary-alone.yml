@@ -1,0 +1,36 @@
+# The buyer's context object is written by the boundary alone (salesagent-3cs7o.3).
+#
+# `src/core/tools/_boundary._served` stamps `context` onto every outcome -- a success, a
+# replay, a failure -- so a `context=` keyword anywhere else is a second writer: a response
+# built with the echo in business logic, or an error carrying it to a raise site, which is the
+# plumbing salesagent-3cs7o.2 deleted (103 `context=req.context` call sites, 16 forwarding
+# signatures). This rule is what keeps it deleted.
+#
+# WHY AST-GREP AND NOT RUFF. Ruff cannot express a keyword-argument ban; TID251 bans a NAME,
+# and the name here (`context`) is also a pydantic serializer argument and a request field the
+# schemas legitimately declare. The ban has to fall on the CALL SITE, which is a structural
+# fact only a syntax rule can state. Same reasoning as the two identity rules beside this one.
+#
+# The boundary module is excluded by path, never by a suppression comment. Nothing else is:
+# pydantic's `model_dump(context=...)` serializer switch is a `context=` keyword too, and the
+# one use this tree had (a `model_dump_internal` that revealed internal-only fields) had no
+# caller and is deleted, so a serializer context under src/ is as much a finding as any other.
+# `context_id` is a different field and does not match: the regex is anchored.
+id: context-is-written-by-the-boundary-alone
+language: Python
+severity: error
+message: >-
+  The buyer's context object is stamped by src/core/tools/_boundary._served onto every outcome.
+  Nothing else passes context=: a response gets it from the boundary, and an error carries none
+  (salesagent-3cs7o).
+files:
+  # src/ only: scripts/ builds no response and raises no buyer-facing error, and a scanner
+  # there labels its own findings "context".
+  - "src/**/*.py"
+ignores:
+  - "src/core/tools/_boundary.py"
+rule:
+  kind: keyword_argument
+  has:
+    field: name
+    regex: "^context$"

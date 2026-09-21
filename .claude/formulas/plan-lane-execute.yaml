@@ -46,15 +46,15 @@ labels:
 
 setup:
   - id: "baseline"
-    title: "Establish baseline — zero failures on the box"
+    title: "Record the baseline on the box — counts and failing nodeids"
     description: |
       Run the full suite on the CI box BEFORE any change and record per-suite
       counts (passed / xfailed / xpassed / skipped / failed) from the JSON
       reports, not the summary line.
 
       ```bash
-      saci run    # detaches; poll with `saci status`
-      # when exit=0, read test-results/<latest>/ *.json — 0 failed/error in EVERY suite
+      cassini run    # detaches; poll with `cassini status`
+      # when it reaches a terminal state, read test-results/<latest>/*.json
       ```
 
       Record in the epic notes: the run id, the per-suite table, AND the frozen
@@ -67,10 +67,24 @@ setup:
       This table is the layer-5 baseline the final verify compares against
       (pass-count + xpass-IDENTITY, per the semantic-merge discipline).
 
+      ## This atom does NOT gate on green
+      Record what is failing NOW. A red baseline is the premise, not a blocker:
+      this tree carries known failures, and the lanes are graded by the DELTA
+      against this table, which is what the finalize atom compares. Record the
+      failing nodeid list alongside the counts — a pass-count table alone cannot
+      answer "is this the same failure or a new one" later.
+
+      BEFORE and AFTER must come from the SAME environment. A box baseline
+      compared against a local run is not a weak comparison, it is not a
+      comparison — the host and the box fail different populations.
+
       ## Gate — HARD STOP
-      If ANY suite has failures/errors, stop. The lanes cannot be graded against
-      a red baseline. If PLAN_DOC is untracked, stop — commit it first.
-    acceptance: "Green baseline (run id + per-suite table) recorded; PLAN_DOC confirmed git-tracked and its blob SHA recorded in epic notes."
+      Two conditions, neither of them green:
+      - PLAN_DOC is untracked. Stop and commit it first; an untracked plan is
+        not a frozen authority.
+      - The run produced no suite reports, or they are unreadable. A run that
+        established no baseline cannot be compared against.
+    acceptance: "Baseline recorded (run id, per-suite counts, failing nodeid list) — green NOT required; PLAN_DOC confirmed git-tracked and its blob SHA recorded in epic notes."
     labels: ["atom:baseline"]
 
 iterate:
@@ -281,7 +295,7 @@ iterate:
         - NO new tickets. NO codebase scan. NO plan amendment. An out-of-scope
           discovery gets ONE line under "## Out of scope (noted)" and you
           continue.
-        - Run the lane's own graders locally as you go (`saci test <slice>` —
+        - Run the lane's own graders locally as you go (`cassini test <slice>` —
           name FILES, never a dir).
 
         Record the resulting diff (files + net lines) in the bead.
@@ -363,7 +377,7 @@ iterate:
         wire or the reconstructed exception. Use **`ast-grep`** for structural
         queries (which helper a step calls, whether an assertion exists), never a
         text `grep` sweep; `grep` only for plain strings. Run lane slices with
-        `saci test <files>` (name FILES, never a dir).
+        `cassini test <files>` (name FILES, never a dir).
 
         ## Precondition
         ```bash
@@ -426,7 +440,7 @@ finalize:
       xpassed-set IDENTITY (a green suite cannot detect regression-to-xfail).
 
       ```bash
-      saci run   # detaches; poll saci status; read test-results/<latest>/*.json
+      cassini run   # detaches; poll cassini status; read test-results/<latest>/*.json
       ```
 
       Every pass-count drop is guilty until individually explained; every new or
@@ -436,5 +450,5 @@ finalize:
       ## PROHIBITION
       Do NOT file follow-up tickets from this run. Out-of-scope observations go in
       the epic notes as context; the owner decides whether they become work.
-    acceptance: "Full suite green AND layer-5 comparison vs baseline clean (every delta explained); recorded in epic notes."
+    acceptance: "Layer-5 comparison vs the recorded baseline is clean — no pass-count drop and no xpassed-set change, every delta individually explained; recorded in epic notes. Absolute green is NOT the bar; the baseline is."
     labels: ["atom:final-verify"]

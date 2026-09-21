@@ -148,9 +148,12 @@ _ALLOW_PRIVATE_FLAG = "ADCP_OUTBOUND_ALLOW_PRIVATE"
 # the same treatment rather than a looser one.
 _ALLOWED_ALLOW_PRIVATE_SITES: frozenset[str] = frozenset(
     {
-        # The ONE seam read site. Every outbound dial consults the address
-        # policy here and nowhere else, so this is where the flag is read.
-        "src/core/security/outbound_http.py",
+        # The seam no longer READS the variable, so it is no longer a
+        # declaration site: it consults ``limits.adcp_outbound_allow_private``
+        # on the settings object, and only the settings loader touches the
+        # environment ("Environment read once"). The comment naming the
+        # variable at outbound_http.py:182 is prose, which this detector skips
+        # on purpose -- explaining the hatch is not the hatch.
         # Every origin in the e2e compose stack is on a private bridge network
         # by construction, so the address gate would refuse all of them. TWO
         # immunities survive the open hatch, and the BDD egress scenarios pin

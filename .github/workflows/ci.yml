@@ -350,13 +350,22 @@ jobs:
         run: docker compose -f docker-compose.e2e.yml down -v 2>/dev/null || true
 
   bdd-in-network:
-    # The 5th BDD transport (e2e_rest: real HTTP through nginx to the live
-    # server, serial, BDD_E2E_ENABLED=true from docker-compose.e2e.yml) — the
-    # only job that grades the e2e_rest known-failures ledger. Without it a
-    # ledger graduation (or regression) is invisible to CI: the sharded BDD
-    # job runs in-process transports only (PR #1430 review). This job runs
-    # ONLY the bdd_e2e tox env (-k e2e_rest): re-running the in-process bulk
-    # here would duplicate the sharded job serially for no added grading.
+    # The in-network BDD transports (real HTTP through nginx to the live server,
+    # serial, BDD_E2E_ENABLED=true from docker-compose.e2e.yml): e2e_rest for the
+    # AdCP tool surfaces and e2e_admin for the admin UI scenarios — the only job
+    # that grades either. Without it a ledger graduation (or regression) is
+    # invisible to CI: the sharded BDD job runs in-process transports only
+    # (PR #1430 review). This job runs ONLY the bdd_e2e tox env
+    # (-k "e2e_rest or e2e_admin"): re-running the in-process bulk here would
+    # duplicate the sharded job serially for no added grading. Adding a new
+    # in-network transport means adding its id to that -k, or it is collected by
+    # no env at all and dies dormant while CI stays green (salesagent-jckl).
+    #
+    # The job NAME is deliberately NOT updated to list e2e_admin: branch
+    # protection matches required checks by rendered name ("CI / BDD In-Network
+    # (e2e_rest)"), so renaming silently de-requires this job until someone with
+    # repo-admin rights updates the setting out of band. Frozen by
+    # tests/unit/test_architecture_required_ci_checks_frozen.py.
     name: BDD In-Network (e2e_rest)
     runs-on: ubuntu-latest
     permissions:
@@ -459,8 +468,12 @@ jobs:
         uses: ./.github/actions/_adcp-bundle
       # No host Postgres / host ports: run_all_tests.sh builds the pinned
       # creative agent, brings the stack up, waits for health, and executes tox
-      # inside the compose network — the runner reaches the agent at proxy:8000
-      # by service name, which is tests/storyboard's own default. (_setup-env IS
+      # inside the compose network — the runner reaches the agent at
+      # adcp-server-storyboard:8080 by service name, which is tests/storyboard's own
+      # default. That is a SECOND server running the same anchored configuration with
+      # ENVIRONMENT=production, because a conformance storyboard grades a deployed
+      # seller; the shared adcp-server behind proxy:8000 stays on development
+      # strictness for the BDD In-Network job above. (_setup-env IS
       # present above, but only so the report-publishing step below has a venv;
       # the conformance run itself uses none of it.)
       # Identical shape to the BDD In-Network job above; hand-rolling a compose
@@ -476,6 +489,38 @@ jobs:
           # The dedicated Security Audit check owns the uv-secure scan, so it
           # is skipped here even though _setup-env now provides a host uv.
           RUN_ALL_SKIP_AUDIT: 1
+      # The runner's OWN score, which no pytest summary can show: a storyboard
+      # check that PASSES produces no pytest item, so the suite's item list is
+      # its failures. Reading the job as green therefore says the ledger covered
+      # every failure, and says nothing about how many checks passed — 30 per
+      # protocol over 72 storyboards, reproduced across six in-network runs, is
+      # the number this job exists to hold, and it was only ever legible by
+      # opening a local artifact. Printed here so a reviewer reads it off the run
+      # that produced it.
+      #
+      # Reporting only, deliberately: no floor asserted. A floor is worth adding
+      # once this has published the CI-side number often enough to know it is the
+      # same population as the box's, and comparing counts across environments
+      # before then is what manufactures a failure with no defect behind it.
+      - name: Publish the storyboard runner score
+        if: always()
+        # tee, not >>: the summary is readable by a person in the web UI and by
+        # nothing else — GitHub exposes no API for a step summary. Sending the
+        # table to stdout as well puts it in the job LOG, where `gh run view
+        # --job <id> --log` can find it, which is the difference between a human
+        # being able to see the figure and this repo being able to check it. The
+        # first version of this step wrote only to the summary and so left the
+        # number exactly as unverifiable as the memory it was meant to replace.
+        #
+        # `set -o pipefail` because a pipe hides the exit code of everything but
+        # its last command: without it the status is tee's, which is 0 whatever
+        # the script did, so a crashed report would read as a published one. An
+        # ABSENT artifact is not a crash and exits 0 by design — this catches the
+        # instrument breaking, which is the one thing a reporting step must not
+        # do quietly.
+        run: |
+          set -o pipefail
+          uv run python scripts/audit/storyboard_runner_score.py --repo . --markdown | tee -a "$GITHUB_STEP_SUMMARY"
       # Publish the machinery's OUTPUT, not a committed copy of it (#1858).
       # These three reports used to live in docs/test-obligations/; a committed
       # report obliges you to prove regeneration is byte-identical, and the
@@ -567,11 +612,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3, 4]
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 25
+    timeout-minutes: 40
     services:
       postgres:
         image: postgres:17-alpine

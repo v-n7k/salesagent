@@ -40,29 +40,14 @@ def mock_db_session():
         yield mock_db
 
 
-@pytest.fixture
-def mock_gam_client():
-    """Mock GAM client and managers."""
-    with (
-        patch("src.services.order_approval_service.GAMClientManager") as mock_client_mgr,
-        patch("src.services.order_approval_service.GAMOrdersManager") as mock_orders_mgr,
-        patch("src.services.order_approval_service.AdapterConfig") as mock_config,
-    ):
-        # Mock adapter config
-        mock_adapter_config = MagicMock()
-        mock_adapter_config.gam_network_code = "12345"
-
-        # Mock orders manager
-        mock_orders_instance = MagicMock()
-        mock_orders_instance.approve_order.return_value = True
-        mock_orders_mgr.return_value = mock_orders_instance
-
-        yield {
-            "client_manager": mock_client_mgr,
-            "orders_manager": mock_orders_mgr,
-            "orders_instance": mock_orders_instance,
-            "adapter_config": mock_adapter_config,
-        }
+# The mock_gam_client fixture lived here. It was already unused by every test in
+# this module, and its three patch targets no longer resolve: GAMClientManager and
+# GAMOrdersManager are imported INSIDE _run_approval_thread (never module-level
+# attributes to substitute), and `AdapterConfig` is not a name this service has at
+# all any more -- the adapter row is read through AdapterConfigRepository. Requesting
+# it would have raised AttributeError at patch time, so it is deleted rather than
+# left as a trap. The GAM approval path is graded against a real DB in
+# tests/integration/test_order_approval_background.py.
 
 
 # test_start_approval_creates_sync_job lived here. It asserted the SyncJob's fields off
@@ -232,7 +217,7 @@ def test_approval_webhook_rejects_metadata_url_without_post(caplog):
         patch("src.services.order_approval_service.get_db_session") as mock_db,
         # The seam call now lives one layer down, inside deliver_webhook
         # (src.core.security.webhook_egress) -- the shared delivery function every
-        # webhook sender routes through since #1802.
+        # webhook sender routes through since #1441.
         patch("src.core.security.webhook_egress.send", wraps=real_send) as spy_send,
         caplog.at_level(logging.WARNING, logger="src.services.order_approval_service"),
     ):
@@ -251,7 +236,7 @@ def test_approval_webhook_rejects_metadata_url_without_post(caplog):
 
     # content=, not json=: deliver_webhook serializes once (via
     # prepare_signed_request) and transmits those exact bytes via content=, never
-    # json= (#1802's Core Invariant -- no webhook sender may reach
+    # json= (#1441's Core Invariant -- no webhook sender may reach
     # json= on the egress seam).
     spy_send.assert_called_once_with(metadata_url, content=ANY, headers=ANY, timeout=10.0, max_attempts=3)
     assert "was refused by egress policy" in caplog.text

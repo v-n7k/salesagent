@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import importlib.util
 import os
 import re
 import subprocess
@@ -24,7 +25,7 @@ import sys
 import warnings
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import yaml
 
@@ -130,6 +131,277 @@ def _parse_cached(path_str: str, _mtime: float) -> ast.Module:
 def parse_module(path: Path) -> ast.Module:
     """Parse a Python file. Cache key is (path, mtime) so edits invalidate."""
     return _parse_cached(str(path), path.stat().st_mtime)
+
+
+# ---------------------------------------------------------------------------
+# ORM model inventory — the one parse of src/core/database/models.py
+# ---------------------------------------------------------------------------
+
+MODELS_MODULE = REPO_ROOT / "src" / "core" / "database" / "models.py"
+
+#: Bases that make a class an ORM model. ``Base`` itself is excluded.
+_ORM_MODEL_BASES = frozenset({"Base", "JSONValidatorMixin"})
+
+
+def models_module_tree() -> ast.Module:
+    """Parsed ``src/core/database/models.py``, shared by every guard that reads it.
+
+    Four guards independently parsed this file before this accessor existed. It is
+    the same mtime-keyed ``parse_module`` cache underneath, so the parse happens
+    once per session however many guards ask for it.
+    """
+    return parse_module(MODELS_MODULE)
+
+
+def orm_model_class_defs() -> Iterator[ast.ClassDef]:
+    """Yield the ``ClassDef`` of every ORM model declared in ``models.py``."""
+    for node in ast.walk(models_module_tree()):
+        if not isinstance(node, ast.ClassDef) or node.name == "Base":
+            continue
+        for base in node.bases:
+            base_name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
+            if base_name in _ORM_MODEL_BASES:
+                yield node
+                break
+
+
+class UniqueKey(NamedTuple):
+    """One declared uniqueness promise on an ORM model.
+
+    ``usable`` is False when the declaration cannot be expressed as a plain set of
+    column names — an expression index, or a partial index whose promise holds only
+    for the rows its ``WHERE`` admits. Such a key is RECORDED and excluded, never
+    truncated to the column subset it happens to mention: ``uq_accounts_natural_key``
+    reduced to ``{tenant_id, operator}`` would assert a uniqueness the database never
+    promised, and any pre-check on that pair would then look like a full key check.
+    """
+
+    model: str
+    name: str
+    columns: frozenset[str]
+    kind: str  # unique-constraint | unique-index | column-unique | composite-pk
+    usable: bool
+    reason: str  # why unusable; "" when usable
+
+
+def _true_kwarg(call: ast.Call, name: str) -> bool:
+    return any(kw.arg == name and isinstance(kw.value, ast.Constant) and kw.value.value is True for kw in call.keywords)
+
+
+def _has_kwarg(call: ast.Call, name: str) -> bool:
+    return any(kw.arg == name for kw in call.keywords)
+
+
+def _string_columns(args: list[ast.expr]) -> tuple[frozenset[str], int]:
+    """Split positional column args into literal names and a count of expression args."""
+    names = {a.value for a in args if isinstance(a, ast.Constant) and isinstance(a.value, str)}
+    return frozenset(names), len(args) - len(names)
+
+
+def _class_body_column_assignments(cls: ast.ClassDef) -> Iterator[tuple[str, ast.Call]]:
+    """Yield ``(column_name, mapped_column_call)`` for each column declared on *cls*."""
+    for stmt in cls.body:
+        target: str | None = None
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            target = stmt.target.id
+        elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            target = stmt.targets[0].id
+        if target is None:
+            continue
+        value = stmt.value
+        if not isinstance(value, ast.Call):
+            continue
+        func_name = value.func.attr if isinstance(value.func, ast.Attribute) else getattr(value.func, "id", None)
+        if func_name in {"mapped_column", "Column"}:
+            yield target, value
+
+
+def _table_args_calls(cls: ast.ClassDef) -> Iterator[ast.Call]:
+    """Yield each constraint/index call inside the class's ``__table_args__``."""
+    for stmt in cls.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "__table_args__" for t in stmt.targets):
+            continue
+        elements = stmt.value.elts if isinstance(stmt.value, ast.Tuple | ast.List) else [stmt.value]
+        for element in elements:
+            if isinstance(element, ast.Call):
+                yield element
+
+
+def _model_unique_keys(cls: ast.ClassDef) -> Iterator[UniqueKey]:
+    primary_key_columns: list[str] = []
+    for column, call in _class_body_column_assignments(cls):
+        if _true_kwarg(call, "primary_key"):
+            primary_key_columns.append(column)
+        if _true_kwarg(call, "unique"):
+            yield UniqueKey(cls.name, f"{cls.name}.{column}", frozenset({column}), "column-unique", True, "")
+
+    for call in _table_args_calls(cls):
+        func_name = call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, "id", None)
+        if func_name == "UniqueConstraint":
+            columns, expressions = _string_columns(list(call.args))
+            name = next(
+                (kw.value.value for kw in call.keywords if kw.arg == "name" and isinstance(kw.value, ast.Constant)),
+                f"<unnamed uq on {cls.name}>",
+            )
+            reason = "expression column(s)" if expressions else ""
+            yield UniqueKey(cls.name, name, columns, "unique-constraint", not reason, reason)
+        elif func_name == "Index" and _true_kwarg(call, "unique") and call.args:
+            first = call.args[0]
+            name = first.value if isinstance(first, ast.Constant) else f"<unnamed index on {cls.name}>"
+            columns, expressions = _string_columns(list(call.args[1:]))
+            reasons = []
+            if expressions:
+                reasons.append(f"{expressions} expression column(s)")
+            if _has_kwarg(call, "postgresql_where"):
+                reasons.append("partial (postgresql_where)")
+            reason = ", ".join(reasons)
+            yield UniqueKey(cls.name, name, columns, "unique-index", not reason, reason)
+
+    # A composite PRIMARY KEY is a unique index too — and it is the only uniqueness
+    # several models have (PropertyTag, AuthorizedProperty). Single-column primary
+    # keys are excluded: a pre-check on a surrogate id is a plain existence lookup,
+    # not the contested-write shape this inventory exists to describe.
+    if len(primary_key_columns) >= 2:
+        yield UniqueKey(cls.name, f"{cls.name.lower()}_pkey", frozenset(primary_key_columns), "composite-pk", True, "")
+
+
+@functools.lru_cache(maxsize=1)
+def _unique_key_constraints_cached(_mtime: float) -> tuple[UniqueKey, ...]:
+    return tuple(key for cls in orm_model_class_defs() for key in _model_unique_keys(cls))
+
+
+def unique_key_constraints() -> tuple[UniqueKey, ...]:
+    """Every uniqueness promise declared in ``models.py``, usable and not.
+
+    Covers all four declaration forms, because each is the ONLY form for at least
+    one model: ``UniqueConstraint`` in ``__table_args__``, ``Index(..., unique=True)``
+    (``ix_tenants_virtual_host``), column-level ``unique=True`` (``Tenant.subdomain``,
+    ``Principal.access_token``) and composite ``primary_key=True`` (``PropertyTag``,
+    ``AuthorizedProperty``). A ``UniqueConstraint``-only extractor sees none of the
+    tenant keys at all.
+    """
+    return _unique_key_constraints_cached(MODELS_MODULE.stat().st_mtime)
+
+
+def usable_unique_keys_by_model() -> dict[str, frozenset[frozenset[str]]]:
+    """Model name → the column-name tuples the database really enforces as unique."""
+    by_model: dict[str, set[frozenset[str]]] = {}
+    for key in unique_key_constraints():
+        if key.usable and key.columns:
+            by_model.setdefault(key.model, set()).add(key.columns)
+    return {model: frozenset(tuples) for model, tuples in by_model.items()}
+
+
+# ---------------------------------------------------------------------------
+# Shared guard predicates
+# ---------------------------------------------------------------------------
+
+
+def handles_integrity_error(handler: ast.ExceptHandler) -> bool:
+    """True when this except clause catches IntegrityError (alone or in a tuple)."""
+    node = handler.type
+    if node is None:
+        return False
+    candidates = node.elts if isinstance(node, ast.Tuple) else [node]
+    for candidate in candidates:
+        name = candidate.attr if isinstance(candidate, ast.Attribute) else getattr(candidate, "id", None)
+        if name == "IntegrityError":
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Whole-tree source indexing for import-resolving guards
+#
+# Guards that resolve a bare name to the function it refers to all need the same
+# three things: a repo-relative path -> dotted module name, a per-module
+# ``from x import y`` map, and one parse pass over a {relpath: source} dict.
+# They live here rather than in each guard so a resolution fix reaches every
+# guard at once (CLAUDE.md DRY invariant; pylint R0801 in
+# ``.pre-commit-hooks/check_code_duplication.py`` enforces it).
+# ---------------------------------------------------------------------------
+
+
+def module_name_for(relpath: str) -> str:
+    """``src/core/tools/creatives/_sync.py`` -> ``src.core.tools.creatives._sync``."""
+    return relpath[:-3].replace("/", ".").removesuffix(".__init__")
+
+
+def import_map(relpath: str, tree: ast.Module) -> dict[str, tuple[str, str]]:
+    """Local name -> (module, original name), for ``from x import y`` including relative."""
+    package = (
+        module_name_for(relpath) if relpath.endswith("__init__.py") else module_name_for(relpath).rsplit(".", 1)[0]
+    )
+    mapping: dict[str, tuple[str, str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.level:
+            base = package.rsplit(".", node.level - 1)[0] if node.level > 1 else package
+            target = f"{base}.{node.module}" if node.module else base
+        else:
+            target = node.module or ""
+        for alias in node.names:
+            mapping[alias.asname or alias.name] = (target, alias.name)
+    return mapping
+
+
+def parse_sources(sources: dict[str, str]) -> tuple[dict[str, ast.Module], dict[str, list[str]]]:
+    """Parse a {relpath: source} dict once, returning (trees, split lines).
+
+    Unparseable modules are dropped from both, so a guard never has lines without
+    a tree or the reverse.
+    """
+    trees: dict[str, ast.Module] = {}
+    lines: dict[str, list[str]] = {}
+    for relpath, text in sources.items():
+        try:
+            trees[relpath] = ast.parse(text, filename=relpath)
+        except SyntaxError:
+            continue
+        lines[relpath] = text.splitlines()
+    return trees, lines
+
+
+def collect_visitor_violations(trees: dict[str, ast.Module], make_visitor: Callable[[str], Any]) -> list[Any]:
+    """Run a FRESH visitor over every tree and concatenate its ``violations`` list.
+
+    ``make_visitor(relpath)`` builds the per-module visitor; it must expose
+    ``visit(tree)`` and a ``violations`` list. Every import-resolving guard needs
+    this same loop, and a fresh visitor per module is the part that is easy to get
+    wrong by hoisting it out and leaking state between modules.
+    """
+    found: list[Any] = []
+    for relpath, tree in trees.items():
+        visitor = make_visitor(relpath)
+        visitor.visit(tree)
+        found.extend(visitor.violations)
+    return found
+
+
+def read_source_roots(roots: Iterable[str]) -> dict[str, str]:
+    """{repo-relative path: source} for every ``.py`` under *roots*."""
+    sources: dict[str, str] = {}
+    for root in roots:
+        for path in sorted((REPO_ROOT / root).rglob("*.py")):
+            if "__pycache__" in str(path):
+                continue
+            sources[str(path.relative_to(REPO_ROOT))] = path.read_text(encoding="utf-8")
+    return sources
+
+
+def structural_guard_marker_re(guard_name: str) -> re.Pattern[str]:
+    """Regex for this repo's per-site opt-out comment, ``# structural-guard: <name> - <why>``.
+
+    The reason is REQUIRED — a bare marker is an opt-out, not a justification. The
+    marker is per-site rather than a central allowlist so the justification lives
+    where the next reader needs it, and so no shared list has to grow to admit a
+    legitimate case. It uses ``# structural-guard:`` rather than ``# noqa:``, which
+    ruff parses as a rule-code list and warns about.
+    """
+    return re.compile(re.escape(f"structural-guard: {guard_name}") + r"\s*[-—:]\s*\S+")
 
 
 def _base_expr_is_tenant(node: ast.expr) -> bool:
@@ -240,7 +512,7 @@ def _is_main_guard(node: ast.AST) -> bool:
 
 
 # Statement fields whose contents execute in the ENCLOSING scope at import time.
-# ``ast.Match`` keeps its arms under ``cases``, not ``body``.
+# ``ast.Match`` keeps its branches under ``cases``, not ``body``.
 _IMPORT_TIME_BODY_FIELDS = ("body", "orelse", "finalbody", "handlers", "cases")
 
 
@@ -491,9 +763,32 @@ def iter_architecture_guard_trees(
 # ---------------------------------------------------------------------------
 
 
+#: Third-party source copied into the tree. Excluded from every structural scan
+#: because these guards grade AUTHORSHIP decisions -- which repository to reach
+#: through, which error type to raise, whether a URL was rebuilt -- and nobody
+#: here made those decisions. ``src/vendor/__init__.py`` forbids editing the
+#: files, so a violation flagged in one could not be fixed anyway; the only
+#: honest response would be an allowlist entry, and these guards deliberately
+#: have none.
+#:
+#: This code was ALREADY in the dependency tree and already unscanned when it
+#: lived in site-packages. Copying it under ``src/`` for a version pin does not
+#: make it ours, and should not silently enrol it in checks it never passed.
+#: ``test_architecture_vendored_code.py`` keeps the exclusion from becoming a
+#: hiding place.
+VENDOR_DIR = "vendor"
+
+
 def src_python_files(repo: Path) -> Iterator[Path]:
-    """Every .py file under src/."""
-    yield from (repo / "src").rglob("*.py")
+    """Every .py file under src/, EXCEPT vendored third-party source.
+
+    See :data:`VENDOR_DIR`.
+    """
+    vendor_root = repo / "src" / VENDOR_DIR
+    for path in (repo / "src").rglob("*.py"):
+        if vendor_root in path.parents:
+            continue
+        yield path
 
 
 def iter_workflow_files(repo: Path) -> Iterator[Path]:
@@ -1131,12 +1426,36 @@ def format_failure(
     return "\n".join(parts)
 
 
+@functools.cache
+def load_hook_module(name: str) -> Any:
+    """Import a ``.pre-commit-hooks/<name>.py`` script as a module.
+
+    The hooks are standalone scripts, not an importable package, so a guard that
+    wants to RUN one (rather than read its source) has to load it by path.
+    Cached because several guards load the same hook and each load re-executes
+    the module body.
+    """
+    path = repo_root() / ".pre-commit-hooks" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load hook module {name} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    # The hooks import their shared driver as a top-level ``count_ratchet``.
+    hooks_dir = str(path.parent)
+    if hooks_dir not in sys.path:
+        sys.path.insert(0, hooks_dir)
+    spec.loader.exec_module(module)
+    return module
+
+
 # ---------------------------------------------------------------------------
 # BDD collection helper (e2e_rest transport fitness)
 # ---------------------------------------------------------------------------
 
 
-def collect_bdd_node_ids_with_e2e_enabled(target: str, *, timeout: int = 300) -> list[str]:
+def collect_bdd_node_ids_with_e2e_enabled(
+    target: str, *, randomly_seed: int | None = None, timeout: int = 300
+) -> list[str]:
     """Collect pytest node ids under *target* with BDD_E2E_ENABLED=true.
 
     Shared by the e2e_rest known-failures ledger fitness function and any
@@ -1144,7 +1463,16 @@ def collect_bdd_node_ids_with_e2e_enabled(target: str, *, timeout: int = 300) ->
     same subprocess invocation, same env, same flags (-n0 satisfies the
     BDD_E2E_ENABLED xdist guard; addopts is cleared so -q prints bare
     nodeids).
+
+    *randomly_seed* selects the collection ORDER. The default (``None``)
+    disables pytest-randomly, which is what a caller asserting "this scenario
+    is collected" wants: one stable order. A caller asserting that collection
+    does not DEPEND on order passes two different seeds and compares — the
+    suite runs with pytest-randomly live and a fresh seed per run
+    (``tox.ini`` [testenv:bdd_inprocess] does not pass ``-p no:randomly``), so
+    order-sensitive collection shows up there as a per-run flap.
     """
+    order = ["-p", "no:randomly"] if randomly_seed is None else ["-p", "randomly", f"--randomly-seed={randomly_seed}"]
     proc = subprocess.run(
         [
             sys.executable,
@@ -1155,8 +1483,7 @@ def collect_bdd_node_ids_with_e2e_enabled(target: str, *, timeout: int = 300) ->
             "-q",
             "-o",
             "addopts=",
-            "-p",
-            "no:randomly",
+            *order,
             "-n0",
         ],
         cwd=repo_root(),
@@ -1207,7 +1534,15 @@ def scan_src(
     suppressed_exempt: dict[str, list[int]] = {}
     suppressed_prefix: dict[str, list[int]] = {}
 
+    vendor_prefix = f"src/{VENDOR_DIR}/"
     for tree, rel_path in iter_module_trees(scan_dirs if scan_dirs is not None else [root]):
+        # Vendored third-party source is out of scope for EVERY src-scanning guard, for
+        # the reasons on VENDOR_DIR. Silent rather than a `skip_prefixes` entry: that axis
+        # raises when a prefix flags nothing, which would force each guard to declare a
+        # boundary only some of them actually need. Bounded by
+        # tests/unit/test_architecture_vendored_code.py.
+        if rel_path.replace("\\", "/").startswith(vendor_prefix):
+            continue
         lines = detector(tree)
         if not lines:
             continue

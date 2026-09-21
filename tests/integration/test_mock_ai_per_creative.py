@@ -11,6 +11,7 @@ import pytest
 from src.adapters.mock_ad_server import MockAdServer
 from src.core.database.database_session import get_db_session
 from src.core.database.models import Principal, Tenant
+from tests.factories.principal import plaintext_token_for
 
 pytestmark = [
     pytest.mark.integration,
@@ -32,11 +33,11 @@ def mock_adapter(integration_db):
         session.add(tenant)
 
         # Create test principal
-        principal = Principal(
+        principal = Principal.with_token(
+            plaintext_token_for("test_principal_ai"),
             tenant_id=tenant.tenant_id,
             principal_id="test_principal_ai",
             name="Test Principal AI",
-            access_token="test_token_ai",
             platform_mappings={"mock": {"account_id": "test_mock_account"}},
         )
         session.add(principal)
@@ -47,7 +48,6 @@ def mock_adapter(integration_db):
         adapter = MockAdServer(
             principal=principal,
             config=config,
-            dry_run=False,
             tenant_id=tenant.tenant_id,
         )
 

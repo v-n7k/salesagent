@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -11,19 +10,20 @@ from typing import Any
 from adcp.webhooks import GeneratedTaskStatus
 from pydantic import BaseModel
 from rich.console import Console
-from sqlalchemy import select
+from sqlalchemy import literal, select
+from sqlalchemy import update as sa_update
+from sqlalchemy.sql import func
 
 from src.core.async_utils import pin_task
 from src.core.database.database_session import DatabaseManager
+from src.core.database.jsonb_append import jsonb_list_append
 from src.core.database.models import Context, ObjectWorkflowMapping, WorkflowStep
 from src.core.database.models import Context as DBContext
-from src.core.exceptions import (
-    AdCPError,
-    AdCPValidationError,
-    build_two_layer_error_envelope,
-    normalize_to_adcp_error,
-)
+from src.core.database.repositories.workflow import append_step_comment, build_context, build_workflow_step
+from src.core.exceptions import AdCPValidationError, adcp_error_for
+from src.core.schemas._base import AdcpErrorResponse
 from src.core.security.outbound_http import OutboundError
+from src.core.tools._wire import to_wire
 from src.core.webhook_validator import (
     webhook_url_for_log,
 )
@@ -81,18 +81,19 @@ class ContextManager(DatabaseManager):
         Returns:
             The created Context object
         """
-        context_id = f"ctx_{uuid.uuid4().hex[:12]}"
-
-        context = Context(
-            context_id=context_id,
+        # Row construction lives in the repository layer so this manager and
+        # WorkflowRepository cannot drift apart (#2002). The
+        # commit/refresh/expunge behaviour below is unchanged for the callers
+        # that still hold a ContextManager.
+        context = build_context(
+            self.session,
             tenant_id=tenant_id,
             principal_id=principal_id,
-            conversation_history=initial_conversation or [],
-            last_activity_at=datetime.now(UTC),
+            initial_conversation=initial_conversation,
         )
+        context_id = context.context_id
 
         try:
-            self.session.add(context)
             self.session.commit()
             console.print(f"[green]Created context {context_id} for principal {principal_id}[/green]")
             # Refresh to get any database-generated values
@@ -206,54 +207,31 @@ class ContextManager(DatabaseManager):
         Returns:
             The created WorkflowStep object
         """
-        # Serialize Pydantic models at the DB boundary
-        from pydantic import BaseModel
-
-        if isinstance(request_data, BaseModel):
-            request_data = request_data.model_dump(mode="json")
-        if request_metadata and request_data is not None:
-            request_data.update(request_metadata)
-        step_id = f"step_{uuid.uuid4().hex[:12]}"
-
-        # Initialize comments array with initial comment if provided
-        comments = []
-        if initial_comment:
-            comments.append({"user": "system", "timestamp": datetime.now(UTC).isoformat(), "text": initial_comment})
-
-        step = WorkflowStep(
-            step_id=step_id,
-            context_id=context_id,
-            step_type=step_type,
-            owner=owner,
-            status=status,
-            tool_name=tool_name,
-            request_data=request_data if request_data is not None else {},
-            response_data=response_data if response_data is not None else {},
-            assigned_to=assigned_to,
-            error_message=error_message,
-            transaction_details=transaction_details if transaction_details is not None else {},
-            comments=comments,
-            created_at=datetime.now(UTC),
-        )
-
-        if status == "completed":
-            step.completed_at = datetime.now(UTC)
-
+        # Row construction (Pydantic boundary serialization, request_metadata
+        # merge, comments seeding, completed_at rule, object mappings) lives in
+        # the repository layer so this manager and WorkflowRepository cannot
+        # drift apart (#2002). The commit/refresh/expunge/close
+        # behaviour below is unchanged for the callers that still hold a
+        # ContextManager.
         session = self.session
         try:
-            session.add(step)
-
-            # Create object mappings if provided
-            if object_mappings:
-                for mapping in object_mappings:
-                    obj_mapping = ObjectWorkflowMapping(
-                        object_type=mapping["object_type"],
-                        object_id=mapping["object_id"],
-                        step_id=step_id,
-                        action=mapping.get("action", step_type),
-                        created_at=datetime.now(UTC),
-                    )
-                    session.add(obj_mapping)
+            step = build_workflow_step(
+                session,
+                context_id=context_id,
+                step_type=step_type,
+                owner=owner,
+                status=status,
+                tool_name=tool_name,
+                request_data=request_data,
+                response_data=response_data,
+                assigned_to=assigned_to,
+                error_message=error_message,
+                transaction_details=transaction_details,
+                object_mappings=object_mappings,
+                initial_comment=initial_comment,
+                request_metadata=request_metadata,
+            )
+            step_id = step.step_id
 
             session.commit()
             session.refresh(step)
@@ -272,7 +250,7 @@ class ContextManager(DatabaseManager):
         self,
         step_id: str,
         status: str | None = None,
-        response_data: dict[str, Any] | Any | None = None,
+        response_data: BaseModel | dict[str, Any] | None = None,
         error_message: str | None = None,
         transaction_details: dict[str, Any] | None = None,
         add_comment: dict[str, str] | None = None,
@@ -283,23 +261,19 @@ class ContextManager(DatabaseManager):
         Args:
             step_id: The step ID
             status: New status
-            response_data: Response/result data. Accepts Pydantic models (serialized
-                automatically) or plain dicts. Callers should NOT call .model_dump()
-                — pass the model directly.
+            response_data: Response/result data: the response MODEL, or a document a
+                caller composed (``record_step_result`` composes response plus request
+                into one; the approval services write small status documents). A caller
+                holding a model hands it over as is and never calls ``.model_dump()``.
             error_message: Error message if failed
             transaction_details: Actual API calls made
             add_comment: Optional comment to add {user, comment}
             tenant_id: Tenant scope — joins through Context for isolation.
                 If provided, the step must belong to this tenant or no update occurs.
         """
-        # Infrastructure-boundary serialization: _impl functions pass Pydantic
-        # models, this method serializes to dict for DB storage.
-        # MIGRATION IN PROGRESS: pre-refactor callers still pass pre-serialized
-        # dicts. As _impl callers migrate (tracked by the shrinking allowlist in
-        # test_architecture_no_model_dump_in_impl), the dict branch becomes dead.
-        # When allowlist hits zero, tighten the type to BaseModel-only and remove
-        # the isinstance branch.
-        if response_data is not None and hasattr(response_data, "model_dump"):
+        # The persistence edge: a model becomes the stored document HERE, by type, and
+        # nowhere upstream (CLAUDE.md pattern 4). A composed dict is stored as composed.
+        if isinstance(response_data, BaseModel):
             response_data = response_data.model_dump(mode="json")
         session = self.session
         try:
@@ -324,19 +298,18 @@ class ContextManager(DatabaseManager):
                     step.transaction_details = transaction_details
 
                 if add_comment:
-                    # Ensure comments is a list
-                    if not isinstance(step.comments, list):
-                        step.comments = []
-                    # Create a new list to trigger SQLAlchemy change detection
-                    new_comments = list(step.comments)
-                    new_comments.append(
-                        {
-                            "user": add_comment.get("user", "system"),
-                            "timestamp": datetime.now(UTC).isoformat(),
-                            "text": add_comment.get("text", add_comment.get("comment", "")),
-                        }
+                    # Single-statement atomic append (salesagent-pgqs): the
+                    # old whole-list write-back erased concurrent comments.
+                    # Autoflush pushes the pending field updates above first;
+                    # the instance's stale comments are expired below.
+                    append_step_comment(
+                        session,
+                        step_id,
+                        user=add_comment.get("user", "system"),
+                        text=add_comment.get("text", add_comment.get("comment", "")),
+                        tenant_id=tenant_id,
                     )
-                    step.comments = new_comments
+                    session.expire(step, ["comments"])
 
                 # DEBUG: Log the condition check values BEFORE commit
                 console.print("[magenta]🔍 PRE-COMMIT WEBHOOK DEBUG:[/magenta]")
@@ -376,42 +349,23 @@ class ContextManager(DatabaseManager):
         The webhook delivery path at ``_send_push_notifications`` emits
         ``step.response_data`` to push notification subscribers. Without
         structured payload, async subscribers receive ``status=failed`` with
-        an empty body. This helper builds the full two-layer envelope
-        (``adcp_error`` + ``errors[]``) via ``build_two_layer_error_envelope``
-        so async and sync paths see the same wire shape.
+        an empty body. This helper serializes the same ``AdcpErrorResponse`` the
+        boundary answers a synchronous failure with, so async and sync paths see
+        the same wire shape.
 
-        Untyped exceptions are normalized to ``AdCPError`` via
-        ``normalize_to_adcp_error``. Wire-code enforcement ensures webhook
-        subscribers only see codes in ``WIRE_STANDARD_CODES``.
+        Untyped exceptions are normalized to ``AdCPSalesAgentError`` via
+        ``adcp_error_for``. Wire-code enforcement ensures webhook
+        subscribers only see codes the pinned table classifies.
 
         Wraps the ``update_workflow_step`` call in ``try/except`` so a DB
         hiccup during audit doesn't replace the original exception that the
         caller is about to re-raise.
         """
-        from src.core.exceptions import WIRE_STANDARD_CODES
 
         try:
-            source = normalize_to_adcp_error(exc)
+            source = adcp_error_for(exc)
 
-            # Defensive wire-code enforcement: webhook subscribers must only
-            # see codes in ``WIRE_STANDARD_CODES``. If the wire code falls
-            # outside the standard set, override with SERVICE_UNAVAILABLE
-            # so async subscribers never receive an internal-only code.
-            # Structured fields (details/field/suggestion/context) carry
-            # forward so buyer agents and webhook subscribers retain
-            # machine-actionable correction context across the rewrite.
-            wire_code = source.wire_error_code
-            if wire_code not in WIRE_STANDARD_CODES:
-                source = AdCPError.synthesize(
-                    source.message or str(source),
-                    error_code="SERVICE_UNAVAILABLE",
-                    details=source.details,
-                    field=source.field,
-                    suggestion=source.suggestion,
-                    context=source.context,
-                )
-
-            response_data = build_two_layer_error_envelope(source)
+            response_data = to_wire(AdcpErrorResponse.of(source))
             error_message = source.message or str(source)
 
             self.update_workflow_step(
@@ -523,7 +477,6 @@ class ContextManager(DatabaseManager):
             request_data={
                 "reason": reason,
                 "details": clarification_details,
-                "protocol": "mcp",  # Default to MCP for internal system actions
             },
             initial_comment=reason,
         )
@@ -638,18 +591,28 @@ class ContextManager(DatabaseManager):
         """
         session = self.session
         try:
-            stmt = select(Context).filter_by(context_id=context_id)
-
-            context = session.scalars(stmt).first()
-            if context:
-                if not isinstance(context.conversation_history, list):
-                    context.conversation_history = []
-
-                context.conversation_history.append(
-                    {"role": role, "content": content, "timestamp": datetime.now(UTC).isoformat()}
+            # Single-statement atomic append: the old load-append-write-back
+            # lost concurrent messages (and an in-place append on an
+            # already-list history was never even flushed) — salesagent-pgqs.
+            entry = func.jsonb_build_object(
+                "role",
+                literal(role),
+                "content",
+                literal(content),
+                "timestamp",
+                literal(datetime.now(UTC).isoformat()),
+            )
+            stmt = (
+                sa_update(Context)
+                .where(Context.context_id == context_id)
+                .values(
+                    conversation_history=jsonb_list_append(Context.conversation_history, entry),
+                    last_activity_at=datetime.now(UTC),
                 )
-                context.last_activity_at = datetime.now(UTC)
-                session.commit()
+                .execution_options(synchronize_session=False)
+            )
+            session.execute(stmt)
+            session.commit()
         finally:
             session.close()
 
@@ -856,11 +819,39 @@ class ContextManager(DatabaseManager):
                         # ONLY SURFACE the refusal has, so it must be enumerable
                         # from the logs: an operator has to be able to list which
                         # buyers stopped receiving webhooks and why.
+                        #
+                        # ``internal_detail``, NOT ``message``, and that distinction is
+                        # what makes the paragraph above true rather than aspirational.
+                        # Post-ADR-010 an ``AdCPSalesAgentError``'s ``message`` is a
+                        # read-only property over ``CODE_TABLE`` — a function of the CODE,
+                        # not of the raise site — because it is the text that reaches a
+                        # BUYER over the wire. It therefore reads "Request validation
+                        # failed" for every stash refusal alike, while ``from_stash``'s own
+                        # diagnostic, the one that NAMES THE SCHEME so the affected rows
+                        # are enumerable (``webhooks/registration.py``, "NAME THE SCHEME"),
+                        # moved to ``internal_detail``. Reading ``message`` here did not
+                        # soften the sentence; it deleted the only actionable fact in it.
+                        #
+                        # Operator-only, and checked rather than assumed: nothing on a
+                        # buyer-wire path reads ``internal_detail``.
+                        # ``AdcpErrorResponse.of`` composes the response from
+                        # error_code/message/recovery/field/suggestion/retry_after/
+                        # details/issues/context and never this — and in any case the
+                        # exception is swallowed two lines below, so it never reaches a
+                        # transport boundary at all.
+                        #
+                        # Defensive by the same idiom as ``operator_mcp._operator_cause``:
+                        # a detail may be absent or blank, and may be an exception rather
+                        # than a ``str``, so it is stringified and falls back to the table
+                        # sentence. A cause-less refusal still logs a whole sentence, and
+                        # nothing here can raise inside an error-handling path.
+                        detail = exc.internal_detail
+                        cause = (str(detail).strip() if detail is not None else "") or exc.message
                         stash_context = getattr(step, "context", None)
                         logger.error(
                             "Stashed push notification config is not deliverable (%s); "
                             "skipping webhook (tenant=%s, principal=%s, step=%s)",
-                            exc.message,
+                            cause,
                             tenant_id or getattr(stash_context, "tenant_id", None),
                             getattr(stash_context, "principal_id", None),
                             getattr(step, "step_id", None),
@@ -885,17 +876,14 @@ class ContextManager(DatabaseManager):
                     # by the SDK fallback . wire_task_type is the
                     # validated COPY passed to the SDK payload builder.
                     task_type_str = step.tool_name or mapping.action or "unknown"
-                    protocol = (step.request_data or {}).get("protocol", "mcp")  # Default to MCP
                     try:
                         status_enum = GeneratedTaskStatus(new_status)
                     except ValueError:
                         status_enum = GeneratedTaskStatus.unknown
 
-                    # The dialect fork and the metadata dict both moved into
-                    # notify() (salesagent-pldmk.39). It keeps this site's
-                    # salesagent-yi3s invariant intact: the ORIGINAL task_type_str
-                    # reaches the metadata and the guards that key on it, while the
-                    # SDK payload gets validate_webhook_task_type's coerced COPY.
+                    # The ORIGINAL task_type_str reaches the context and the guards
+                    # that key on it; the SDK payload gets validate_webhook_task_type's
+                    # coerced COPY, inside notify() (salesagent-yi3s).
                     webhook_task = WebhookTaskContext(
                         task_id=step.step_id,
                         task_type=task_type_str,
@@ -916,8 +904,6 @@ class ContextManager(DatabaseManager):
                                     task=webhook_task,
                                     status=status_enum,
                                     result=step.response_data or {},
-                                    protocol=protocol,
-                                    context_id=step.context_id or "",
                                 )
                             )
 
@@ -946,8 +932,6 @@ class ContextManager(DatabaseManager):
                                     task=webhook_task,
                                     status=status_enum,
                                     result=step.response_data or {},
-                                    protocol=protocol,
-                                    context_id=step.context_id or "",
                                 )
                             )
                             _log_webhook_send_outcome(push_notification_config.url, sent)
@@ -955,7 +939,7 @@ class ContextManager(DatabaseManager):
                     except OutboundError as e:
                         # The seam's two failure classes (OutboundRequestBlocked /
                         # OutboundDeliveryFailed) replaced the requests exceptions
-                        # this used to catch — including the separate Timeout arm,
+                        # this used to catch — including the separate Timeout branch,
                         # which was a property of requests' taxonomy and has no
                         # counterpart here (a timeout arrives as
                         # OutboundDeliveryFailed with http_status=None, and its

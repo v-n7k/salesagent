@@ -16,6 +16,7 @@ from fastmcp.client.transports import StreamableHttpTransport
 
 from tests.factories.creative_asset import build_assets, image_spec
 from tests.helpers import assert_envelope_shape
+from tests.helpers.credentials import credential_headers
 
 
 @pytest.mark.integration
@@ -28,10 +29,16 @@ class TestMCPToolRoundtripMinimal:
     """
 
     @pytest.fixture
-    async def mcp_client(self, mcp_server, sample_tenant, sample_principal, sample_products):
+    async def mcp_client(self, mcp_server, sample_tenant, sample_principal, sample_account, sample_products):
         """Create MCP client for testing with test data."""
-        # Use the mcp_server fixture which provides port and manages lifecycle
-        headers = {"x-adcp-auth": sample_principal["access_token"]}
+        # Use the mcp_server fixture which provides port and manages lifecycle.
+        # The SELLER travels with the credential: these calls reach the server on
+        # localhost, so no host maps to a tenant and the resolver has no tenant to verify
+        # the token inside -- every tool answered AUTH_INVALID without it.
+        headers = credential_headers(
+            token=sample_principal["access_token"],
+            tenant=sample_tenant["tenant_id"],
+        )
         transport = StreamableHttpTransport(url=f"http://localhost:{mcp_server.port}/mcp/", headers=headers)
         client = Client(transport=transport)
 
@@ -56,7 +63,7 @@ class TestMCPToolRoundtripMinimal:
         assert text != json.dumps(result.structured_content)
         assert not text.strip().startswith("{")
 
-    async def test_create_media_buy_minimal(self, mcp_client):
+    async def test_create_media_buy_minimal(self, sample_account, mcp_client):
         """Test create_media_buy with minimal required parameters."""
         # Get a product first
         products_result = await mcp_client.call_tool(
@@ -73,13 +80,14 @@ class TestMCPToolRoundtripMinimal:
             result = await mcp_client.call_tool(
                 "create_media_buy",
                 {
+                    "account": sample_account,
                     "brand": {"domain": "testbrand.com"},
                     "idempotency_key": f"int-key-{uuid.uuid4().hex}",
                     "packages": [
                         {
                             "product_id": product_id,
                             "pricing_option_id": "cpm_usd_fixed",  # Format: {model}_{currency}_{fixed|auction}
-                            "budget": 1000.0,
+                            "budget": 5000.0,
                         }
                     ],
                     "start_time": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
@@ -91,11 +99,14 @@ class TestMCPToolRoundtripMinimal:
             content = result.structured_content if hasattr(result, "structured_content") else result
             assert "media_buy_id" in content or "status" in content
 
-    async def test_update_media_buy_minimal(self, mcp_client):
-        """Test update_media_buy with minimal parameters (no today field).
+    async def test_update_media_buy_minimal(self, sample_account, mcp_client):
+        """Test update_media_buy with minimal parameters.
 
-        This specifically tests the datetime.combine() bug fix where req.today
-        was accessed but didn't exist in the schema.
+        This started as the regression for a datetime.combine() bug where ``req.today``
+        was accessed and did not exist on the schema. The field was later declared, and is
+        now deleted again -- nothing ever set it, so the read always fell through to
+        ``date.today()``, which is what the impl says (docs/development/building-tools.md).
+        The roundtrip is still worth grading: a minimal update must survive the wire.
         """
         # Create a media buy first
         products_result = await mcp_client.call_tool(
@@ -111,13 +122,14 @@ class TestMCPToolRoundtripMinimal:
             create_result = await mcp_client.call_tool(
                 "create_media_buy",
                 {
+                    "account": sample_account,
                     "brand": {"domain": "testbrand.com"},
                     "idempotency_key": f"int-key-{uuid.uuid4().hex}",
                     "packages": [
                         {
                             "product_id": product_id,
                             "pricing_option_id": "cpm_usd_fixed",  # Format: {model}_{currency}_{fixed|auction}
-                            "budget": 1000.0,
+                            "budget": 5000.0,
                         }
                     ],
                     "start_time": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
@@ -133,8 +145,10 @@ class TestMCPToolRoundtripMinimal:
                 update_result = await mcp_client.call_tool(
                     "update_media_buy",
                     {
+                        "idempotency_key": "test-idem-key-0001",
+                        "account": sample_account,
                         "media_buy_id": create_content["media_buy_id"],
-                        "budget": 2000.0,  # update_budget is valid from pending_creatives
+                        "end_time": "2026-12-01T00:00:00Z",  # update_budget is valid from pending_creatives
                     },
                 )
 
@@ -176,7 +190,7 @@ class TestMCPToolRoundtripMinimal:
         envelope = json.loads(str(exc_info.value))
         assert_envelope_shape(envelope, "VALIDATION_ERROR", recovery="correctable")
 
-    async def test_sync_creatives_minimal(self, mcp_client):
+    async def test_sync_creatives_minimal(self, sample_account, mcp_client):
         """Test sync_creatives with minimal required parameters.
 
         Uses AdCP-compliant CreativeAsset schema which requires:
@@ -188,6 +202,8 @@ class TestMCPToolRoundtripMinimal:
         result = await mcp_client.call_tool(
             "sync_creatives",
             {
+                "idempotency_key": "test-idem-key-0001",
+                "account": sample_account,
                 "creatives": [
                     {
                         "creative_id": "test_creative_001",
@@ -200,7 +216,7 @@ class TestMCPToolRoundtripMinimal:
                         },
                         "assets": build_assets(image_spec("image", url="https://example.com/preview.jpg")),
                     }
-                ]
+                ],
             },
         )
 
@@ -216,78 +232,6 @@ class TestMCPToolRoundtripMinimal:
         content = result.structured_content if hasattr(result, "structured_content") else result
         assert "creatives" in content
 
-    async def test_list_authorized_properties_minimal(self, mcp_client):
-        """Test list_authorized_properties with no req parameter."""
-        try:
-            result = await mcp_client.call_tool("list_authorized_properties", {})  # req parameter is optional
-
-            assert result is not None
-            content = result.structured_content if hasattr(result, "structured_content") else result
-            # May return error if no properties configured - that's expected
-            # Just check we got some content back
-            assert content is not None
-        except Exception as e:
-            # Expected error when no properties configured
-            error_msg = str(e).lower()
-            assert "no_properties_configured" in error_msg or "properties" in error_msg
-
-    async def test_update_performance_index_minimal(self, mcp_client):
-        """Test update_performance_index with required parameters."""
-        # First, create a media buy to update
-        products_result = await mcp_client.call_tool(
-            "get_products", {"brand": {"domain": "testbrand.com"}, "brief": "test"}
-        )
-
-        products = (
-            products_result.structured_content if hasattr(products_result, "structured_content") else products_result
-        )
-        if products and len(products.get("products", [])) > 0:
-            product_id = products["products"][0]["product_id"]
-
-            # Create media buy
-            create_result = await mcp_client.call_tool(
-                "create_media_buy",
-                {
-                    "brand": {"domain": "testbrand.com"},
-                    "idempotency_key": f"int-key-{uuid.uuid4().hex}",
-                    "packages": [
-                        {
-                            "product_id": product_id,
-                            "pricing_option_id": "cpm_usd_fixed",  # Format: {model}_{currency}_{fixed|auction}
-                            "budget": 1000.0,
-                        }
-                    ],
-                    "start_time": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
-                    "end_time": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
-                },
-            )
-
-            create_content = (
-                create_result.structured_content if hasattr(create_result, "structured_content") else create_result
-            )
-            if "media_buy_id" in create_content:
-                media_buy_id = create_content["media_buy_id"]
-
-                # Now update performance index
-                result = await mcp_client.call_tool(
-                    "update_performance_index",
-                    {
-                        "media_buy_id": media_buy_id,
-                        "performance_data": [
-                            {
-                                "product_id": product_id,
-                                "performance_index": 1.2,  # 20% better than baseline
-                            }
-                        ],
-                    },
-                )
-
-                assert result is not None
-                content = result.structured_content if hasattr(result, "structured_content") else result
-                assert content is not None
-                # Should not crash - may return success or error status
-                assert "status" in content or "error" in content or "performance_data" in content
-
 
 @pytest.mark.unit  # Changed from integration - these don't require server
 class TestSchemaConstructionValidation:
@@ -298,27 +242,43 @@ class TestSchemaConstructionValidation:
         from src.core.schemas import UpdateMediaBuyRequest
 
         # Test with only media_buy_id (required via oneOf constraint)
-        req = UpdateMediaBuyRequest(media_buy_id="test_buy_123")
+        req = UpdateMediaBuyRequest(
+            account={"account_id": "acct_test"}, idempotency_key="test-idem-key-0001", media_buy_id="test_buy_123"
+        )
 
         assert req.media_buy_id == "test_buy_123"
         assert req.paused is None  # adcp 2.12.0+: replaced 'active' with 'paused'
-        assert req.today is None  # Should exist and be None, not raise AttributeError
 
-        # Test that today field is accessible even though it's excluded from serialization
-        assert hasattr(req, "today")
-        assert "today" not in req.model_dump()  # Excluded from output
+        # No internal field survives on this DTO. ``today`` used to be asserted here, both
+        # for its presence and for its absence from model_dump(); it is deleted, so the
+        # question the assertions answered no longer has a subject. The rule that keeps it
+        # that way is graded in
+        assert not [f for f, info in req.model_fields.items() if info.exclude]
 
     def test_all_request_schemas_have_optional_or_default_fields(self):
-        """Verify that all request schemas can be constructed without all fields."""
+        """Every request schema constructs from its REQUIRED fields alone.
+
+        "Minimal" means the spec's own /required set, not the empty set. UpdateMediaBuyRequest
+        used to appear here with only media_buy_id, which worked while account and
+        idempotency_key were wrongly overridden to optional; AdCP 3.1.1 lists both in
+        /required, so a request without them is not minimal, it is invalid. The obligation
+        that still matters -- no schema demands MORE than the spec does -- is unchanged.
+        """
         from src.core import schemas
 
         # Test schemas that should work with minimal params
         test_cases = [
             (schemas.GetProductsRequest, {"brand": {"domain": "testbrand.com"}}),
-            (schemas.UpdateMediaBuyRequest, {"media_buy_id": "test"}),
+            (
+                schemas.UpdateMediaBuyRequest,
+                {
+                    "media_buy_id": "test",
+                    "account": {"account_id": "acct_test"},
+                    "idempotency_key": "test-idem-key-0001",
+                },
+            ),
             (schemas.GetMediaBuyDeliveryRequest, {}),
             (schemas.ListCreativesRequest, {}),
-            (schemas.ListAuthorizedPropertiesRequest, {}),
         ]
 
         for schema_class, minimal_params in test_cases:
@@ -346,7 +306,9 @@ class TestParameterToSchemaMapping:
         }
 
         # Create request with valid fields only
-        req = UpdateMediaBuyRequest(**tool_params)
+        req = UpdateMediaBuyRequest(
+            account={"account_id": "acct_test"}, idempotency_key="test-idem-key-0001", **tool_params
+        )
 
         # Valid fields should be set
         assert req.media_buy_id == "test_buy_123"
@@ -356,5 +318,7 @@ class TestParameterToSchemaMapping:
         assert req.start_time is None
         assert req.end_time is None
 
-        # budget field should be None since not provided
-        assert req.budget is None
+        # No top-level budget to assert: AdCP 3.1.1 does not define one on
+        # update-media-buy-request.json (budget is package-level), so the field was removed
+        # rather than left as a convenience. `packages` is where a budget update lives.
+        assert req.packages is None

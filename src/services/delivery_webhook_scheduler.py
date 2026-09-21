@@ -7,7 +7,6 @@ This runs as a background task and sends reports when GAM data is fresh (after 4
 
 import asyncio
 import logging
-import os
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -17,23 +16,20 @@ from adcp.types.generated_poc.media_buy.get_media_buy_delivery_response import (
 )  # TODO: no stable alias — response-level NotificationType differs from top-level
 from sqlalchemy import func, select
 
+from src.core.config import get_settings
 from src.core.database.database_session import get_db_session
 from src.core.database.models import PersistedMediaBuyStatus, WebhookDeliveryLog
 from src.core.database.models import PushNotificationConfig as DBPushNotificationConfig
 from src.core.database.repositories import MediaBuyRepository
 from src.core.exceptions import AdCPValidationError
-from src.core.schemas import GetMediaBuyDeliveryRequest, GetMediaBuyDeliveryResponse
-from src.core.tools.media_buy_delivery import _get_media_buy_delivery_impl
+from src.core.schemas import GetMediaBuyDeliveryResponse
+from src.core.tools.media_buy_delivery import delivery_for_media_buy
 from src.core.utils import utc_flight_start
 from src.core.webhooks.delivery import WebhookTaskContext
 from src.core.webhooks.registration import accept_push_notification_config
 from src.services.protocol_webhook_service import get_protocol_webhook_service
 
 logger = logging.getLogger(__name__)
-
-# 1 hour because AdCP protocol has frequency options hourly, daily and monthly
-# Configurable via env var for testing
-SLEEP_INTERVAL_SECONDS = int(os.getenv("DELIVERY_WEBHOOK_INTERVAL") or "3600")
 
 
 class DeliveryWebhookScheduler:
@@ -44,6 +40,9 @@ class DeliveryWebhookScheduler:
         self.is_running = False
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        # 1 hour because AdCP protocol has frequency options hourly, daily and monthly;
+        # DELIVERY_WEBHOOK_INTERVAL shortens it for testing. Read when the scheduler starts.
+        self._sleep_interval_seconds = 3600
 
     async def start(self) -> None:
         """Start the scheduler background task."""
@@ -52,6 +51,7 @@ class DeliveryWebhookScheduler:
                 logger.warning("Delivery webhook scheduler is already running")
                 return
 
+            self._sleep_interval_seconds = get_settings().limits.delivery_webhook_interval
             self.is_running = True
             self._task = asyncio.create_task(self._run_scheduler())
             logger.info("Delivery webhook scheduler started")
@@ -86,7 +86,7 @@ class DeliveryWebhookScheduler:
                 logger.error(f"Error in delivery webhook scheduler: {e}", exc_info=True)
             finally:
                 # Wait before next batch
-                await asyncio.sleep(SLEEP_INTERVAL_SECONDS)
+                await asyncio.sleep(self._sleep_interval_seconds)
 
     async def _send_reports(self) -> None:
         """Send reports for all active media buys with configured webhooks."""
@@ -209,44 +209,21 @@ class DeliveryWebhookScheduler:
                     )
                     return
 
-            # Fetch delivery metrics
-            # Create a ResolvedIdentity for the delivery call
-            from src.core.resolved_identity import ResolvedIdentity
-
-            identity = ResolvedIdentity(
-                principal_id=media_buy.principal_id,
-                tenant_id=media_buy.tenant_id,
-                tenant={"tenant_id": media_buy.tenant_id},
-                protocol="rest",
-            )
-
-            # Include active + completed statuses: the scheduler already filters
-            # by DB status (active/approved) at query time, so the delivery impl
-            # should include ended campaigns (dynamic status=completed) rather
-            # than filtering them out and reporting "not found" errors.
-            # We exclude "pending_start" (ready) to avoid returning delivery
-            # data for future-dated campaigns that haven't started yet.
-            from adcp.types import MediaBuyStatus
-
-            req = GetMediaBuyDeliveryRequest(
-                media_buy_ids=[media_buy.media_buy_id],
-                status_filter=[MediaBuyStatus.active, MediaBuyStatus.completed],
+            delivery_response = delivery_for_media_buy(
+                media_buy,
                 start_date=start_date_obj.strftime("%Y-%m-%d"),
                 end_date=end_date_obj.strftime("%Y-%m-%d"),
-                context=None,
             )
-
-            delivery_response = _get_media_buy_delivery_impl(req, identity)
 
             if not isinstance(delivery_response, GetMediaBuyDeliveryResponse):
                 logger.warning(
-                    f"`Couldn't get media_delivery` for {media_buy.media_buy_id}. Result is {delivery_response.model_dump()}"
+                    f"`Couldn't get media_delivery` for {media_buy.media_buy_id}. Result is {delivery_response!r}"
                 )
                 return
 
             if delivery_response.errors is not None:
                 logger.warning(
-                    f"`Couldn't get media_delivery` for {media_buy.media_buy_id}. We have recieved error in the result. Result is {delivery_response.model_dump()}"
+                    f"`Couldn't get media_delivery` for {media_buy.media_buy_id}. We have received an error in the result. Result is {delivery_response!r}"
                 )
                 return
 
@@ -357,18 +334,6 @@ class DeliveryWebhookScheduler:
                 else None,
             )
 
-            # The dialect comes from the REGISTRATION, not from a hardcoded builder.
-            # This job used to call create_mcp_webhook_payload unconditionally, so a
-            # buyer that registered over A2A received an MCP-shaped delivery report.
-            # It had no way to do better until push_notification_configs recorded the
-            # protocol: this job fires long after the request and carries no identity
-            # (salesagent-pldmk.39).
-            #
-            # NULL means a row written before that column existed. Falling back to
-            # "mcp" reproduces exactly the previous behaviour for those rows rather
-            # than guessing a dialect the data never stated.
-            protocol = getattr(push_notification_config, "protocol", None) or "mcp"
-
             # Send webhook notification OUTSIDE the session context
             # This ensures the session is closed before async webhook call
             await self.webhook_service.notify(
@@ -380,7 +345,6 @@ class DeliveryWebhookScheduler:
                 # delivery-log column.
                 status=AdcpTaskStatus.completed,
                 result=delivery_response,
-                protocol=protocol,
             )
 
             logger.info(f"Sent delivery report webhook for media buy {media_buy.media_buy_id}")

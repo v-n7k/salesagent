@@ -14,7 +14,7 @@ Subclasses override:
     call_impl(**kwargs): Any           -- call production function
 
 Multi-transport support (subclasses may also override):
-    call_a2a(**kwargs): Any            -- call _raw() A2A wrapper
+    call_a2a(**kwargs): Any            -- dispatch through the A2A handler
     REST_ENDPOINT: str                 -- POST endpoint path for REST dispatch
     build_rest_body(**kwargs): dict    -- convert kwargs to REST body
     parse_rest_response(data): model  -- parse JSON dict to Pydantic model
@@ -25,8 +25,10 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Self, cast, get_type_hints
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from tests.harness._realize import e2e_unsupported, realize_e2e
 
 # The MCP transport boots the real FastMCP app lifespan, which starts the
 # background schedulers. Those run a batch immediately on the *real* wall clock
@@ -36,282 +38,196 @@ from unittest.mock import AsyncMock, MagicMock, patch
 # (src.core.main._background_schedulers_enabled reads this at lifespan runtime.)
 os.environ.setdefault("ADCP_RUN_BACKGROUND_SCHEDULERS", "false")
 
-# Runtime import: DeliverResult is CONSTRUCTED here (the dispatch return contract),
-# not merely annotated, so it cannot live in the TYPE_CHECKING block below.
-from tests.harness.transport import DeliverResult, strip_a2a_protocol_fields
+# RUNTIME imports, not TYPE_CHECKING ones. json_safe does isinstance() checks against
+# these at call time, and DeliverResult is CONSTRUCTED here (the dispatch return
+# contract) -- a TYPE_CHECKING-only import would be a NameError, not a type-checker
+# convenience.
+from datetime import date, datetime  # noqa: E402
+from decimal import Decimal  # noqa: E402
+from enum import Enum  # noqa: E402
+
+from pydantic import BaseModel  # noqa: E402
+
+from tests.factories.account import DEFAULT_TEST_ACCOUNT_ID  # noqa: E402  (re-export)
+from tests.harness.transport import DeliverResult  # noqa: E402
+from tests.helpers.credentials import credential_headers  # noqa: E402
+
+#: The token the harness presents when a scenario wants a credential that is presented and
+#: rejected: it matches no Principal row, so the resolver answers AUTH_INVALID on a protected
+#: tool and treats it as absent on a public one.
+INVALID_TOKEN = "invalid-token-harness"
 
 if TYPE_CHECKING:
-    from pydantic import BaseModel
     from sqlalchemy.orm import Session
 
-    from src.core.resolved_identity import ResolvedIdentity
+    from src.core.resolved_identity import PublicIdentity, ResolvedIdentity
     from tests.harness.transport import E2EConfig, Transport, TransportResult
 
 
-def _adcp_error_from_code(
-    error_code: str,
-    message: str,
-    recovery: str | None = None,
-    details: dict | None = None,
-    suggestion: str | None = None,
-    field: str | None = None,
-) -> Exception:
-    """Reconstruct the exact AdCPError subclass from an error_code string.
+def json_safe(value: Any) -> Any:
+    """Recursively convert pydantic models into the JSON forms a wire body carries.
 
-    Shared by MCP and A2A unwrappers. Maps error codes like 'NOT_FOUND'
-    to AdCPNotFoundError, 'VALIDATION_ERROR' to AdCPValidationError, etc.
-    Falls back to base AdCPError for unknown codes.
+    A REST body is JSON. When a step dispatches a RAW parameter bag rather than a built
+    request -- which is what lets a schema-invalid payload actually reach the transport and
+    be graded on the wire -- that bag can hold typed objects a scenario constructed for
+    setup (an AccountReference, a Budget). ``req.model_dump(mode="json")`` used to convert
+    them on the way out; the raw path has to do the same or serialization fails with
+    "Object of type X is not JSON serializable" and the scenario grades a TypeError instead
+    of the server's answer.
+
+    Leaves everything else untouched, so a deliberately-malformed value still reaches the
+    wire malformed -- which is the entire point of dispatching raw.
     """
-    from src.core.exceptions import (
-        AdCPAccountAmbiguousError,
-        AdCPAccountNotFoundError,
-        AdCPAccountPaymentRequiredError,
-        AdCPAccountSetupRequiredError,
-        AdCPAccountSuspendedError,
-        AdCPAdapterError,
-        AdCPAuthenticationError,
-        AdCPBudgetExhaustedError,
-        AdCPBudgetTooLowError,
-        AdCPCapabilityNotSupportedError,
-        AdCPConflictError,
-        AdCPError,
-        AdCPIdempotencyConflictError,
-        AdCPIdempotencyExpiredError,
-        AdCPMediaBuyNotFoundError,
-        AdCPNotFoundError,
-        AdCPPackageNotFoundError,
-        AdCPRateLimitError,
-        AdCPServiceUnavailableError,
-        AdCPValidationError,
-    )
-
-    # Read class-level identity from the _default_error_code ClassVar slot
-    # error_code is an instance
-    # attribute set in __init__; reading it off the class would return the
-    # descriptor, not the wire code string.
-    _CODE_TO_CLASS: dict[str, type[AdCPError]] = {
-        cls._default_error_code: cls
-        for cls in (
-            AdCPValidationError,
-            AdCPAuthenticationError,
-            AdCPNotFoundError,
-            AdCPAccountNotFoundError,
-            AdCPAccountSetupRequiredError,
-            AdCPAccountSuspendedError,
-            AdCPAccountPaymentRequiredError,
-            AdCPConflictError,
-            AdCPAccountAmbiguousError,
-            AdCPBudgetExhaustedError,
-            AdCPRateLimitError,
-            AdCPAdapterError,
-            AdCPServiceUnavailableError,
-            # Substrate subclasses with production raise sites — the harness
-            # reconstructs the specific subclass after a roundtrip (preserves
-            # type for isinstance() checks in tests). Codes with only
-            # advisory-on-success Pattern A construction (BUDGET_EXCEEDED,
-            # CREATIVE_REJECTED, PRODUCT_UNAVAILABLE) round-trip via the
-            # base AdCPError fallback below and don't need a dedicated class.
-            AdCPMediaBuyNotFoundError,
-            AdCPPackageNotFoundError,
-            AdCPBudgetTooLowError,
-            AdCPCapabilityNotSupportedError,
-            AdCPIdempotencyConflictError,
-            AdCPIdempotencyExpiredError,
-        )
-    }
-    # AdCPAuthenticationError and AdCPAuthorizationError share the AUTH_REQUIRED
-    # wire code — we can't disambiguate auth-missing from auth-insufficient at
-    # the wire, and Authentication (missing token/tenant) is the more common
-    # buyer-facing case. Pin Authentication explicitly here so the mapping
-    # doesn't depend on dict-comprehension insertion order.
-    _CODE_TO_CLASS[AdCPAuthenticationError._default_error_code] = AdCPAuthenticationError
-    from src.core.exceptions import INTERNAL_CODES
-
-    assert error_code not in INTERNAL_CODES, (
-        f"INTERNAL code {error_code!r} reached harness reconstruction — production wire leaked an internal-only code"
-    )
-    exc_cls = _CODE_TO_CLASS.get(error_code, AdCPError)
-    # ``recovery`` is deliberately NOT passed: it is a read-only property derived
-    # from the wire code, so the reconstruction reports the same classification
-    # production does. The value actually observed on the wire is not lost — the
-    # caller stashes the whole real envelope as ``_wire_error_envelope`` (surfaced
-    # as ``result.wire_error_envelope``), which is where a test that wants to grade
-    # the wire's own recovery must read it. Asserting ``.recovery`` on this object
-    # would compare the derivation against itself and pass under any wire value.
-    reconstructed = exc_cls(
-        message=message,
-        details=details,
-        suggestion=suggestion,
-        field=field,
-    )
-    if exc_cls is AdCPError:
-        reconstructed.error_code = error_code
-    return reconstructed
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json", exclude_none=True)
+    if isinstance(value, Enum):
+        return value.value
+    # datetime/date/Decimal are what model_dump(mode="json") converts and a raw bag does
+    # not: a step that stashed a real datetime for setup would otherwise reach the wire as
+    # a Python object and be rejected for the WRONG reason -- the scenario would grade a
+    # serialization artefact instead of the server's answer.
+    if isinstance(value, datetime | date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [json_safe(v) for v in value]
+    return value
 
 
-def _unwrap_mcp_tool_error(exc: Exception) -> Exception:
-    """Translate FastMCP ToolError back to the corresponding AdCPError.
+class WireError(Exception):
+    """A transport failure carrying the envelope the buyer received, VERBATIM.
 
-    The MCP boundary translator raises ``AdCPToolError`` (single-arg JSON
-    envelope) so FastMCP serializes ``str(exc)`` as the JSON-encoded two-layer
-    error envelope. This unwrapper parses that JSON and reconstructs the
-    matching AdCPError subclass.
+    Deliberately NOT an ``AdCPSalesAgentError`` subclass. The harness used to rebuild the
+    matching production exception from wire bytes so a test could write
+    ``pytest.raises(AdCPNotFoundError)`` through a transport; that map covered 20 of
+    43 classes, was silent about the other 23, and its own docstring conceded the
+    reconstruction was lossy. Grading OUR class hierarchy through a lossy copy of
+    production's constructor is not the same as grading the buyer's contract.
 
-    Falls back to legacy tuple-string parsing for any plain ``ToolError`` that
-    might be raised by code paths outside the MCP boundary translator (these
-    are rare and shrink over time per the architecture cleanup).
-
-    If the exception is not a ToolError or can't be parsed, returns it unchanged.
+    This type carries no code-to-class knowledge at all. It exists so a failed wire
+    dispatch can still raise -- callers up the stack expect an exception -- while the
+    thing being asserted stays the envelope, reachable as ``.envelope`` and published
+    by the dispatchers as ``TransportResult.wire_error_envelope``.
     """
-    import ast
+
+    def __init__(self, envelope: dict) -> None:
+        self.envelope = envelope
+        errors = envelope.get("errors") or [{}]
+        code = errors[0].get("code") if isinstance(errors[0], dict) else None
+        super().__init__(f"wire error {code or '(no code)'}")
+
+
+def _mcp_wire_envelope(exc: Exception) -> dict | None:
+    """The two-layer envelope inside a FastMCP ``ToolError``, or ``None``.
+
+    The MCP boundary translator raises ``AdCPToolError`` (single-arg JSON envelope)
+    so FastMCP serializes ``str(exc)`` as the JSON-encoded envelope. This parses that
+    JSON and RETURNS IT. It does not rebuild an exception: the envelope is what the
+    buyer received, and it already carries code, message, recovery, suggestion, field
+    and details.
+
+    Falls back to the legacy tuple-string shape for any plain ``ToolError`` raised
+    outside the boundary translator; anything else carries no envelope.
+    """
+    import ast as _ast
     import json
 
     from fastmcp.exceptions import ToolError
 
     if not isinstance(exc, ToolError):
-        return exc
+        return None
 
     error_str = str(exc)
 
-    # New shape: single-arg JSON envelope — delegate to shared helper.
     try:
-        envelope = json.loads(error_str)
-        if isinstance(envelope, dict):
-            reconstructed = _envelope_to_adcp_error(envelope)
-            if reconstructed is not None:
-                return reconstructed
+        parsed = json.loads(error_str)
+        if isinstance(parsed, dict):
+            envelope = _wire_envelope(parsed)
+            if envelope is not None:
+                return envelope
     except (json.JSONDecodeError, TypeError):
         pass
 
     # Legacy shape (test fixtures that mock ToolError directly):
     # tuple-stringified `('CODE', 'message', 'recovery', '{"details": ...}')`.
-    # Deprecated: legacy ToolError tuple-string parsing — remove when no test fixtures depend on raw ToolError raises.
     try:
-        parsed = ast.literal_eval(error_str)
-        if isinstance(parsed, tuple) and len(parsed) >= 2:
-            error_code = str(parsed[0])
-            message = str(parsed[1])
-            recovery = str(parsed[2]) if len(parsed) > 2 else None
-
-            # 4th element is a JSON-serialized extra blob that may contain
-            # "details", "suggestion", and "field" as separate top-level keys
-            # (packed by tool_error_logging._translate_to_tool_error).
-            details = None
-            suggestion = None
-            field = None
-            if len(parsed) > 3 and parsed[3] is not None:
+        tup = _ast.literal_eval(error_str)
+        if isinstance(tup, tuple) and len(tup) >= 2:
+            entry: dict = {"code": str(tup[0])}
+            if len(tup) > 3 and tup[3] is not None:
                 try:
-                    extra = json.loads(str(parsed[3]))
+                    extra = json.loads(str(tup[3]))
                     if isinstance(extra, dict):
-                        details = extra.get("details")
-                        suggestion = extra.get("suggestion")
-                        field = extra.get("field")
+                        if extra.get("details") is not None:
+                            entry["details"] = extra["details"]
+                        if extra.get("field") is not None:
+                            entry["field"] = extra["field"]
                 except (json.JSONDecodeError, TypeError):
                     pass
-
-            return _adcp_error_from_code(error_code, message, recovery, details, suggestion, field)
+            return {"adcp_error": dict(entry), "errors": [entry]}
     except (ValueError, SyntaxError):
         pass
 
-    # Fallback: try extract_error_info (handles ToolError("message") single-arg form)
-    from src.core.tool_error_logging import extract_error_info
-
-    error_code, message, recovery = extract_error_info(exc)
-    if error_code != "TOOL_ERROR":
-        return _adcp_error_from_code(error_code, message, recovery)
-
-    return exc
+    return None
 
 
-def _envelope_to_adcp_error(envelope: dict, fallback_message: str = "") -> Exception | None:
-    """Reconstruct an AdCPError subclass from a two-layer envelope dict.
+def _wire_envelope(envelope: dict) -> dict | None:
+    """Normalise a captured error body into the two-layer envelope shape, or ``None``.
 
-    Accepts the envelope shape produced by ``build_two_layer_error_envelope``:
-    ``{"adcp_error": {code, message, recovery, details, ...}, "errors": [...], ...}``.
-    Also accepts the legacy flat shape ``{"error_code": ..., "recovery": ...}``
-    for tests that predate the envelope.
+    Accepts what ``to_wire(AdcpErrorResponse.of(exc))`` produces
+    (``{"adcp_error": {...}, "errors": [...]}``) and the legacy flat shape
+    (``{"error_code": ..., "recovery": ...}``), and RETURNS THE ENVELOPE.
 
-    Single source of truth for envelope→exception reconstruction — called by
-    ``_unwrap_a2a_server_error`` (A2AError.data path) and
-    ``BaseTestEnv.parse_rest_error`` (REST response body path). Returns the
-    reconstructed ``AdCPError`` subclass, or ``None`` if no ``error_code`` can
-    be extracted (caller picks a fallback).
+    It used to return a reconstructed ``AdCPSalesAgentError`` built from those bytes, with a
+    hand-maintained code-to-class map. That map covered 20 of 43 classes and was
+    silent about the rest, so type identity was already lost for most codes; its own
+    docstring conceded the reconstruction was "lossy by construction"; and it was the
+    only place outside production that called an ``AdCPSalesAgentError`` constructor, which made
+    it the only place that could drift from a signature change -- and it did, twice,
+    the second time costing 469 tests.
+
+    Arming a fault still needs a real typed exception; the adapter genuinely raises
+    one. ASSERTING an outcome never does: the envelope IS what the buyer received.
     """
     if not isinstance(envelope, dict):
         return None
-    error_code: str | None = None
-    message = fallback_message
-    recovery: str | None = None
-    details: dict | None = None
-    suggestion: str | None = None
-    field: str | None = None
-    adcp_err = envelope.get("adcp_error")
-    if isinstance(adcp_err, dict):
-        error_code = adcp_err.get("code")
-        message = adcp_err.get("message", message) or message
-        recovery = adcp_err.get("recovery")
-        details = adcp_err.get("details")
-        suggestion = adcp_err.get("suggestion")
-        field = adcp_err.get("field")
-    errors = envelope.get("errors")
-    if isinstance(errors, list) and errors and isinstance(errors[0], dict):
-        first = errors[0]
-        error_code = error_code or first.get("code")
-        message = first.get("message", message) or message
-        recovery = recovery or first.get("recovery")
-        details = details or first.get("details")
-        suggestion = suggestion or first.get("suggestion")
-        field = field or first.get("field")
-    if not error_code:
+    if isinstance(envelope.get("errors"), list) and envelope["errors"]:
+        return envelope
+    if isinstance(envelope.get("adcp_error"), dict):
+        entry = dict(envelope["adcp_error"])
+        return {**envelope, "errors": [entry]}
+    # Legacy flat shape from tests that predate the envelope.
+    code = envelope.get("error_code") or envelope.get("code")
+    if not code:
         return None
-    reconstructed = _adcp_error_from_code(error_code, message, recovery, details, suggestion, field)
-    if reconstructed is not None:
-        # Stash the REAL wire envelope on the reconstructed exception so the
-        # A2A/REST dispatchers can capture the actual wire bytes (artifact
-        # DataPart for A2A, HTTP body for REST) rather than re-synthesizing
-        # via build_two_layer_error_envelope — re-synthesis would just
-        # regenerate from the lossy reconstructed exception. Read by
-        # ``A2ADispatcher.dispatch`` via ``getattr(exc, '_wire_error_envelope', None)``.
-        reconstructed._wire_error_envelope = envelope  # type: ignore[attr-defined]
-    return reconstructed
+    entry = {"code": code}
+    for key in ("message", "recovery", "suggestion", "field", "details"):
+        if envelope.get(key) is not None:
+            entry[key] = envelope[key]
+    return {"adcp_error": dict(entry), "errors": [entry]}
 
 
-def _unwrap_a2a_server_error(exc: Exception) -> Exception:
-    """Translate a2a A2AError back to the corresponding AdCPError.
+def _a2a_wire_envelope(exc: Exception) -> dict | None:
+    """The two-layer envelope inside an a2a ``A2AError``'s ``data``, or ``None``.
 
-    The A2A dispatcher wraps AdCPError into a failed Task whose artifact
-    carries the two-layer envelope. If the exception is a JSON-RPC-level
-    A2AError (e.g., from the dispatcher's own catch-all), the ``data``
-    field carries the envelope.
+    The A2A dispatcher wraps an ``AdCPSalesAgentError`` into a failed Task whose artifact
+    carries the envelope; a JSON-RPC-level ``A2AError`` carries it in ``data``.
 
-    If the exception is not an A2AError or lacks enough info, returns it unchanged.
+    Returns the ENVELOPE. The three-way fallback ladder that used to sit here --
+    ``InvalidRequestError`` -> AdCPAuthenticationError, ``InvalidParamsError`` ->
+    AdCPValidationError, ``InternalError`` -> RuntimeError -- is gone with it: those
+    were hand-maintained guesses at what the wire meant, and a guess is not evidence
+    of what the buyer received.
     """
-    from a2a.types import InternalError, InvalidParamsError, InvalidRequestError
     from a2a.utils.errors import A2AError
 
     if not isinstance(exc, A2AError):
-        return exc
-
-    # a2a-sdk 1.0: the exception itself carries message/data (no .error wrapper)
-    message = getattr(exc, "message", str(exc))
-    data = getattr(exc, "data", None) or {}
-
-    reconstructed = _envelope_to_adcp_error(data, fallback_message=message) if isinstance(data, dict) else None
-    if reconstructed is not None:
-        return reconstructed
-
-    from src.core.exceptions import (
-        AdCPAuthenticationError,
-        AdCPValidationError,
-    )
-
-    if isinstance(exc, InvalidRequestError):
-        return AdCPAuthenticationError(message)
-    if isinstance(exc, InvalidParamsError):
-        return AdCPValidationError(message)
-    if isinstance(exc, InternalError):
-        return RuntimeError(message)
-    return exc
+        return None
+    data = getattr(exc, "data", None)
+    return _wire_envelope(data) if isinstance(data, dict) else None
 
 
 def _a2a_send_message_configuration(spec: dict[str, Any]) -> Any:
@@ -344,6 +260,27 @@ def _a2a_send_message_configuration(spec: dict[str, Any]) -> Any:
     return SendMessageConfiguration(task_push_notification_config=TaskPushNotificationConfig(**fields))
 
 
+def _a2a_call_context(credential: dict[str, str]) -> Any:
+    """The ``ServerCallContext`` an in-process A2A dispatch presents *credential* on.
+
+    Carries the request headers where the SDK's own ``DefaultServerCallContextBuilder``
+    places them, ``state["headers"]``, so ``AdCPRequestHandler`` reads them off its call
+    context and the real resolver parses the credential exactly as it does for a request
+    over HTTP. Shared by the harness's A2A leg and the raw-wire A2A sender.
+    """
+    from a2a.server.routes.common import ServerCallContext
+
+    return ServerCallContext(state={"headers": dict(credential)})
+
+
+def _addressed_tenant(credential: dict[str, str]) -> str | None:
+    """The tenant_id a credential addresses through ``x-adcp-tenant``, or ``None``."""
+    for name, value in credential.items():
+        if name.lower() == "x-adcp-tenant":
+            return value
+    return None
+
+
 class _TestClock:
     """Minimal clock for BDD relative date-token resolution.
 
@@ -355,7 +292,14 @@ class _TestClock:
 
     @staticmethod
     def _iso(dt: Any) -> str:
-        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # The ONE place all three accessors below format, so minting here records
+        # every clock-derived timestamp this mixin hands a scenario. They reach
+        # dispatched payloads as start_time/end_time, and a value read off the clock
+        # differs on every run — ``compare_payloads`` interns what the mint record
+        # names and diffs everything else verbatim (tests/factories/mint.py).
+        from tests.factories.mint import mint
+
+        return mint(dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
 
     def now_iso(self) -> str:
         from datetime import UTC, datetime
@@ -371,6 +315,24 @@ class _TestClock:
         from datetime import UTC, datetime, timedelta
 
         return self._iso(datetime.now(UTC) - timedelta(days=days))
+
+
+def _e2e_external_seams_exercised(self: IntegrationEnv) -> bool:
+    """Whether the SERVER did the work, read off the audit trail it wrote.
+
+    ``log_operation`` writes one ``audit_logs`` row per tool call and the database is the
+    audit authority (src/core/audit_logger.py), so that row is the live-stack counterpart
+    of the in-process ``audit_logger`` mock the other branch counts. Same claim on both
+    branches: the seller recorded this operation as it served it.
+
+    NOT VACUOUS, and that rests on a fact rather than on hope: ``_reset_e2e_db``
+    (tests/bdd/conftest.py) empties every data table BEFORE each e2e scenario builds its
+    env, so ``audit_logs`` starts this scenario empty, and the Givens write through
+    factories, which audit nothing. A row for this tenant therefore came from the request
+    under test. A response the server never actually served leaves the table empty and
+    this returns False.
+    """
+    return bool(self.get_audit_logs())
 
 
 class BaseTestEnv:
@@ -400,7 +362,7 @@ class BaseTestEnv:
 
     Usage (multi-transport)::
 
-        @pytest.mark.parametrize("transport", [Transport.IMPL, Transport.A2A, Transport.REST])
+        @pytest.mark.parametrize("transport", [Transport.A2A, Transport.MCP, Transport.REST])
         def test_something(self, integration_db, transport):
             with CreativeSyncEnv() as env:
                 result = env.call_via(transport, creatives=[...])
@@ -408,7 +370,13 @@ class BaseTestEnv:
 
     Attributes:
         mock: dict[str, MagicMock]  -- active mocks keyed by short name
-        identity: ResolvedIdentity  -- default identity (override via constructor)
+        identity: ResolvedIdentity  -- the caller ``call_impl`` hands the implementation
+
+    THE HARNESS PRESENTS A CREDENTIAL, NEVER AN IDENTITY. ``credential()`` builds the
+    headers dict a buyer would send; every wire leg injects that dict where its transport
+    reads headers, and the real resolver answers. There is no token-less identity and no
+    resolver patch: a scenario that needs a particular caller mints that caller's principal
+    and presents its token.
     """
 
     EXTERNAL_PATCHES: dict[str, str] = {}
@@ -433,14 +401,12 @@ class BaseTestEnv:
         self,
         principal_id: str = "test_principal",
         tenant_id: str = "test_tenant",
-        dry_run: bool = False,
         database_url: str | None = None,
         e2e_config: E2EConfig | None = None,
         **tenant_overrides: Any,
     ) -> None:
         self._principal_id = principal_id
         self._tenant_id = tenant_id
-        self._dry_run = dry_run
         # E2E mode: bind factories to the live server's DB so the HTTP-reached
         # server sees Given-step data. Explicit database_url wins; else the
         # e2e_config's postgres_url. None => normal cached/integration engine.
@@ -451,7 +417,10 @@ class BaseTestEnv:
         self.mock: dict[str, MagicMock] = {}
         self._enter_cleanups: list[tuple[str, Callable[[], None]]] = []
         self._session: Session | None = None
-        self._identity_cache: dict[str, ResolvedIdentity] = {}
+        # Unit mode has no Principal row to read a token from, so the env holds the
+        # principal the factory BUILT for it, keyed by the (principal, tenant) pair so a
+        # ``switch_principal`` mints a different token.
+        self._unit_principals: dict[tuple[str, str], Any] = {}
         self._rest_client: Any = None  # Lazy-created TestClient
         self.clock = _TestClock()  # BDD steps may use env.clock for date tokens
         # Raw A2A Task returned by the last _run_a2a_handler call. The submitted
@@ -474,117 +443,243 @@ class BaseTestEnv:
         """
         return self.e2e_config is not None
 
-    # -- Identity (one function, all transports) ----------------------------
+    @realize_e2e(
+        e2e_unsupported(
+            "no server fault-injection surface for a genuinely untyped exception on a live "
+            "remote process (same structural limitation prkv.8's own e2e-verify atom hit)"
+        )
+    )
+    def inject_untyped_exception(self, exception: Exception) -> None:
+        """Make the skill's business logic raise *exception* directly (prkv.18).
 
-    def identity_for(self, transport: Transport) -> ResolvedIdentity:
-        """Build ResolvedIdentity with the correct protocol for *transport*.
+        Substitutes the implementation at its REGISTRY ROW, so every transport reaches the
+        raising stand-in. It used to patch a dotted path to the ``_impl`` function, declared
+        per env as ``IMPL_TARGET``; that stopped working the day the transports began
+        dispatching through ``TOOLS``, because the row holds the function OBJECT and a
+        module attribute is no longer what anything calls. The env already names its tool
+        (``MCP_TOOL``), so the second declaration is gone with the mechanism that needed it.
 
-        This is the single source of truth for test identity across all
-        transports. The identity is cached per protocol so repeated calls
-        with the same transport return the same object.
+        Registers the patcher with the same ``_guard`` cleanup registry ``EXTERNAL_PATCHES``
+        uses, so both release paths (a normal ``__exit__`` and a failed ``__enter__``) stop
+        it and this needs no new cleanup path.
 
-        In integration mode (``use_real_db=True``), the identity carries
-        the real ``auth_token`` from the factory-created Principal row.
-        This enables full auth chain testing: header → token → DB lookup.
+        Skill-agnostic by design: any env that declares ``MCP_TOOL`` gets this capability for
+        free, rather than each domain mixin hand-rolling its own untyped-exception injector.
+
+        For a genuinely untyped exception, the REST boundary's catch-all
+        handler is reachable only through Starlette's ``ServerErrorMiddleware``
+        (see ``prkv.8``), which always re-raises after building its response —
+        the default ``TestClient(app)`` (``raise_server_exceptions=True``)
+        would surface that re-raise as a test error instead of the wire
+        response. Setting the INSTANCE attribute here (not a class-level
+        default on ``IntegrationEnv``) scopes the opt-out to exactly this
+        call, on this env instance — ``get_rest_client()`` is lazy, so a
+        Given-time set is honored at dispatch time.
         """
-        from tests.harness.transport import TRANSPORT_PROTOCOL
+        from dataclasses import replace
 
-        protocol = TRANSPORT_PROTOCOL[transport]
-        if protocol not in self._identity_cache:
-            from tests.factories.principal import PrincipalFactory
+        from src.core.tools.registry import _TOOLS
 
-            # In integration mode, commit factory data first so the token
-            # is visible to other sessions (e.g., get_principal_from_token
-            # in the MCP auth chain uses a separate get_db_session() call).
-            auth_token = None
-            if self.use_real_db:
-                self._commit_factory_data()
-                auth_token = self._resolve_auth_token()
-
-            self._identity_cache[protocol] = PrincipalFactory.make_identity(
-                principal_id=self._principal_id,
-                tenant_id=self._tenant_id,
-                protocol=protocol,
-                dry_run=self._dry_run,
-                auth_token=auth_token,
-                **self._tenant_overrides,
+        if not self.MCP_TOOL:
+            raise ValueError(
+                f"{type(self).__name__} declares no MCP_TOOL — set it to the tool's registry "
+                "name before calling inject_untyped_exception()"
             )
-        return self._identity_cache[protocol]
+        # A REAL async function, annotated like the implementation it replaces -- not an
+        # AsyncMock. ToolSpec.__post_init__ derives the row's credential policy from the
+        # impl's `identity` annotation, so `replace(row, impl=AsyncMock())` raised
+        # "TypeError: <AsyncMock ...> is not a module, class, method, or function" out of
+        # get_type_hints before the scenario could dispatch anything. The annotations are
+        # the CLASS OBJECTS taken off the original, so get_type_hints returns them without
+        # re-resolving a string in this module's namespace, and the substituted row keeps
+        # the tool's own DTO and identity type.
+        spec = _TOOLS[self.MCP_TOOL]
+        declared = get_type_hints(spec.impl)
 
-    def _resolve_auth_token(self) -> str | None:
-        """Look up the real access_token from the session-bound Principal.
+        async def raising(*, req: Any, identity: Any) -> Any:
+            raise exception
 
-        Only called in integration mode where ``self._session`` is bound
-        to factory-created ORM models. Returns None if the principal
-        hasn't been created yet (identity built before Given steps run).
+        raising.__annotations__ = {"req": declared["req"], "identity": declared["identity"]}
+        patcher = patch.dict(_TOOLS, {self.MCP_TOOL: replace(spec, impl=raising)})
+        patcher.start()
+        self.mock["_untyped_exception"] = raising
+        self._guard("patch:_untyped_exception", patcher.stop)
+        self.REST_RAISE_SERVER_EXCEPTIONS = False
+
+    # -- Credential (one method, all legs) -----------------------------------
+
+    def credential(self, **overrides: Any) -> dict[str, str]:
+        """The headers this env's buyer presents: THE one way a wire leg authenticates.
+
+        ``credential_headers(token=<the env principal's token>, tenant=self._tenant_id)``
+        with *overrides* applied through the same two keywords.
+
+        - ``env.credential()``: the env's principal, valid token.
+        - ``env.credential(token=INVALID_TOKEN)``: presented and rejected.
+        - ``env.credential(token=None)``: nothing presented, tenant still addressed.
+        - ``{}``: no headers at all, which is what ``credential={}`` on a dispatch sends.
+
+        The token is read at DISPATCH time. In integration and e2e mode it comes from the
+        Principal row, so a row committed by a later Given is seen; no row means
+        ``token=None``, which the resolver answers AUTH_MISSING on a protected tool. In unit
+        mode it comes from the principal the factory built for this env, and the
+        substitutes ``__enter__`` installs make the resolver accept exactly that token.
+
+        ``x-adcp-tenant`` carries the tenant_id on every leg. ``_detect_tenant`` tries it as a
+        subdomain and then takes it as the literal id, so it resolves either way.
         """
-        if not self._session:
+        values: dict[str, Any] = {"tenant": self._tenant_id}
+        if "token" not in overrides:
+            values["token"] = self._principal_token()
+        unknown = set(overrides) - {"token", "tenant"}
+        if unknown:
+            raise TypeError(f"credential() takes token and tenant, not {sorted(unknown)}")
+        values.update(overrides)
+        return credential_headers(**values)
+
+    def _principal_token(self) -> str | None:
+        """The token the env principal presents, or ``None`` when no such principal exists.
+
+        The row holds only the hash, so the plaintext is DERIVED, the way the factory
+        derived it (``plaintext_token_for``); in DB mode the row must exist for the resolver
+        to find it, which is why the factory data is committed first.
+        """
+        from tests.factories.principal import plaintext_token_for
+
+        if self.use_real_db:
+            if not self._session:
+                return None
+            from sqlalchemy import select
+
+            from src.core.database.models import Principal
+
+            self._commit_factory_data()
+            row = self._session.scalars(
+                select(Principal.principal_id).filter_by(
+                    principal_id=self._principal_id,
+                    tenant_id=self._tenant_id,
+                )
+            ).first()
+            return plaintext_token_for(row) if row else None
+        return plaintext_token_for(self._unit_principal().principal_id)
+
+    def _unit_principal(self) -> Any:
+        """The Principal the factory BUILT for this env (unit mode: no row, no session)."""
+        from tests.factories.principal import PrincipalFactory
+
+        key = (self._principal_id, self._tenant_id)
+        if key not in self._unit_principals:
+            self._unit_principals[key] = PrincipalFactory.build(
+                principal_id=self._principal_id, tenant_id=self._tenant_id
+            )
+        return self._unit_principals[key]
+
+    def _install_unit_resolver_substitutes(self) -> None:
+        """Unit mode: substitute the resolver's three database reads, at their defining modules.
+
+        The resolver's own logic -- Bearer parse, tenant detection, the AUTH_MISSING /
+        AUTH_INVALID split, ``require_valid_token`` -- runs unmodified. Only the DATA is
+        substituted, here, once. Each target is the module that DEFINES the function, which
+        is what a function-local ``from x import y`` in production reads at call time:
+
+        - ``src.core.config_loader.tenant_id_for`` returns ``None``: no host rows, so the
+          ``x-adcp-tenant`` hint falls through to the literal id, as production does for an
+          unknown subdomain. Read by ``_detect_tenant``.
+        - ``src.core.auth_utils.get_principal_from_token`` answers the env principal for the
+          env principal's token, scoped to the env's tenant (or unscoped), and nothing for
+          anything else. Read by ``_resolve_identity``.
+        - ``src.core.config_loader.get_tenant_by_id`` serves ``TenantFactory.make_tenant``
+          with this env's overrides, so ``TenantContext.load`` builds the same tenant the
+          env used to hand over pre-built. Read by the resolver.
+        - ``src.core.resolved_identity._load_account`` answers an active schema Account
+          named by the request's reference (``tests.helpers.capture_wrapper_req.stub_account_for``),
+          so a request that names an account resolves without a database and the identity
+          the resolver builds still carries one.
+
+        Installed BEFORE ``EXTERNAL_PATCHES`` so an env that patches one of these itself
+        keeps its own answer. Not entered into ``self.mock``: that dict is the env's own
+        declared collaborators, the ones ``_configure_mocks`` wires; these are the harness's
+        stand-ins for the database and no test configures them. Released through the same
+        ``_guard`` registry as every patch, under ``resolver:`` labels.
+        """
+        from tests.factories import TenantFactory
+        from tests.helpers.capture_wrapper_req import stub_account_for
+
+        def _tenant_by_id(tenant_id: str) -> dict[str, Any]:
+            return TenantFactory.make_tenant(tenant_id=tenant_id, **self._tenant_overrides)
+
+        def _principal_from_token(token: str, tenant_id: str) -> Any:
+            # Scoped to the tenant addressed, as the real lookup is.
+            from src.core.credentials import hash_token
+            from src.core.schemas import Principal as SchemaPrincipal
+
+            principal = self._unit_principal()
+            if hash_token(token) == principal.token_hash and tenant_id == self._tenant_id:
+                return SchemaPrincipal.from_row(principal)
             return None
-        from sqlalchemy import select
 
-        from src.core.database.models import Principal
-
-        token = self._session.scalars(
-            select(Principal.access_token).filter_by(
-                principal_id=self._principal_id,
-                tenant_id=self._tenant_id,
-            )
-        ).first()
-        return token
+        for name, target, substitute in (
+            ("tenant_id_for", "src.core.config_loader.tenant_id_for", lambda **_kw: None),
+            ("get_principal_from_token", "src.core.auth_utils.get_principal_from_token", _principal_from_token),
+            ("get_tenant_by_id", "src.core.config_loader.get_tenant_by_id", _tenant_by_id),
+            ("_load_account", "src.core.resolved_identity._load_account", stub_account_for),
+        ):
+            patcher = patch(target, side_effect=substitute)
+            patcher.start()
+            self._guard(f"resolver:{name}", patcher.stop)
 
     def switch_principal(self, principal_id: str) -> None:
-        """Re-point the env at *principal_id*, clearing cached identity.
+        """Re-point the env at *principal_id*.
 
-        Public accessor for the principal-switch mutation (mirrors
-        ``get_session()``): step functions must not reach into the private
-        ``_identity_cache`` / ``_principal_id``. Clearing the cache forces the
-        next ``identity`` / ``identity_for`` access to re-resolve from scratch —
-        picking up a principal row committed after the env was created (in
-        integration mode this re-runs the auth-token lookup).
+        Public accessor for the principal-switch mutation (mirrors ``get_session()``):
+        step functions must not reach into the private ``_principal_id``. The next
+        ``credential()`` reads the new principal's token at dispatch time.
         """
-        self._identity_cache.clear()
         self._principal_id = principal_id
 
     def switch_tenant(self, tenant_id: str) -> None:
-        """Re-point the env at *tenant_id*, clearing cached identity.
+        """Re-point the env at *tenant_id*.
 
-        Sibling of ``switch_principal``: step functions that seed a scenario
-        into its own fresh tenant (isolation in the shared e2e_rest live DB)
-        must not reach into the private ``_identity_cache`` / ``_tenant_id``.
-        Clearing the cache forces the next identity build to resolve the auth
-        token against the new tenant's principal rows.
+        Sibling of ``switch_principal``: step functions that seed a scenario into its own
+        fresh tenant (isolation in the shared e2e_rest live DB) must not reach into the
+        private ``_tenant_id``.
         """
-        self._identity_cache.clear()
         self._tenant_id = tenant_id
 
     @property
-    def identity(self) -> ResolvedIdentity:
-        """Default identity (protocol='mcp'). Backward-compatible.
+    def identity(self) -> ResolvedIdentity | PublicIdentity:
+        """The caller ``call_impl`` hands the implementation. FOR ``call_impl`` ONLY.
 
-        Supports direct override via ``env._identity = ...`` for integration
-        tests that create tenants in the DB and need LazyTenantContext.
+        A direct ``_impl`` call takes an identity by definition; a wire leg has no
+        parameter to receive one, it presents ``credential()`` and the resolver builds the
+        identity. An env with a principal builds the ``ResolvedIdentity`` a protected tool
+        takes; an env constructed with ``principal_id=None`` (a public tool's anonymous
+        caller) builds a ``PublicIdentity``. Supports direct override via
+        ``env._identity = ...`` for integration tests that create tenants in the DB and
+        need a specific tenant context.
         """
-        # Backward compat: tests may set env._identity directly
         direct = self.__dict__.get("_identity")
         if direct is not None:
             return direct
-        from tests.harness.transport import Transport
+        from tests.harness._identity import make_identity
 
-        return self.identity_for(Transport.IMPL)
+        return make_identity(
+            principal_id=self._principal_id,
+            tenant_id=self._tenant_id,
+            **self._tenant_overrides,
+        )
 
     # -- Transport dispatch -------------------------------------------------
 
     def call_via(self, transport: Transport, **kwargs: Any) -> TransportResult:
         """Dispatch through *transport* and return normalized TransportResult.
 
-        Injects the correct identity for the transport into kwargs (unless
-        the caller explicitly provides one). Routes to the appropriate
-        dispatcher.
+        Presents this env's credential unless the caller passed ``credential=``
+        (``{}`` sends no headers at all). Routes to the appropriate dispatcher.
         """
         from tests.harness.dispatchers import DISPATCHERS
 
-        # Inject transport-correct identity
-        kwargs.setdefault("identity", self.identity_for(transport))
+        kwargs.setdefault("credential", self.credential())
 
         dispatcher = DISPATCHERS[transport]
         return dispatcher.dispatch(self, **kwargs)
@@ -703,11 +798,11 @@ class BaseTestEnv:
         (and the wire envelope stashed on it) flowing to the same handler.
         """
         from tests.harness.client import _dispatch_core
-        from tests.harness.transport import NO_IDENTITY_OVERRIDE, strip_a2a_protocol_fields
+        from tests.harness.transport import NO_IDENTITY_OVERRIDE
 
         payload = dict(kwargs)
-        identity = payload.pop("identity", NO_IDENTITY_OVERRIDE)
-        result = _dispatch_core(self, transport, tool, payload, identity)
+        credential = payload.pop("credential", NO_IDENTITY_OVERRIDE)
+        result = _dispatch_core(self, transport, tool, payload, credential)
         if result.error is not None:
             raise result.error
         wire = result.wire_response
@@ -716,8 +811,17 @@ class BaseTestEnv:
         # The captured wire is deliberately UNSTRIPPED so envelope assertions can
         # see message/success; the response model has not declared them, so they
         # come off before validation.
+        #
+        # Through ``revive`` when the parser is a response model, because a SERVED document
+        # carries the context the boundary stamped and the constructor refuses that field --
+        # ``AdcpResponse`` makes ``_boundary._served`` the only thing that can put one on a
+        # response, so ``parser(**wire)`` raised a ValidationError in the TEST process and the
+        # scenario reported "no response arrived" for a request the seller answered fine.
+        # ``revive`` is the reader-side door: it takes the field off the document, validates
+        # the rest through the same refusing constructor, and re-attaches the value.
         parser = self.response_parser(tool)
-        return DeliverResult(payload=parser(**strip_a2a_protocol_fields(wire)), wire_response=wire)
+        revive = getattr(parser, "revive", None)
+        return DeliverResult(payload=revive(wire) if revive is not None else parser(**wire), wire_response=wire)
 
     def call_mcp(self, **kwargs: Any) -> Any:
         """The parsed MCP payload. Defined ONCE; never override — override
@@ -733,46 +837,41 @@ class BaseTestEnv:
         """A2A dispatch via real AdCPRequestHandler — exercises full A2A pipeline.
 
         Dispatches through the real AdCPRequestHandler.on_message_send(), which
-        exercises: message parsing → skill routing → normalize_request_params →
-        handler dispatch → _serialize_for_a2a → Task/Artifact framing.
+        exercises: message parsing → skill routing → ``serve`` → ``to_wire`` →
+        Task/Artifact framing.
 
-        Identity is injected by monkey-patching ``_resolve_a2a_identity`` and
-        ``_get_auth_token`` on the handler instance — single mock point, same
-        as the MCP Client approach patches resolve_identity_from_context.
+        The credential is presented where this transport reads headers: on the call
+        context, the way the SDK's own context builder places the request headers. The
+        handler reads only that; the real resolver answers.
 
         Args:
             skill_name: A2A skill name (e.g., "get_products").
             response_cls: Pydantic model class to parse artifact data into.
-            **kwargs: Skill parameters. ``identity`` is popped and used for
-                the identity mock; ``a2a_push_notification_config`` is popped
-                and sent as the protocol-level ``SendMessageConfiguration``
-                (see :func:`_a2a_send_message_configuration`) rather than as a
-                skill parameter; remaining kwargs become skill parameters.
+            **kwargs: Skill parameters. ``credential`` is popped and presented on the
+                call context; ``a2a_push_notification_config`` is popped and sent as
+                the protocol-level ``SendMessageConfiguration`` (see
+                :func:`_a2a_send_message_configuration`) rather than as a skill
+                parameter; remaining kwargs become skill parameters.
         """
         import asyncio
 
-        from a2a.server.routes.common import ServerCallContext
         from a2a.types import SendMessageRequest, Task
 
         from src.a2a_server.adcp_a2a_server import AdCPRequestHandler
-        from tests.harness.transport import NO_IDENTITY_OVERRIDE, Transport
+        from tests.harness.transport import NO_IDENTITY_OVERRIDE
         from tests.utils.a2a_helpers import create_a2a_message_with_skill, extract_data_from_artifact
 
         self._commit_factory_data()
 
-        # Pop identity — used for the handler mock, not sent as a skill parameter.
-        identity = kwargs.pop("identity", NO_IDENTITY_OVERRIDE)
+        credential = kwargs.pop("credential", NO_IDENTITY_OVERRIDE)
+        if credential is NO_IDENTITY_OVERRIDE:
+            credential = self.credential()
         # Pop the protocol-level push config — it belongs on SendMessageRequest.
         # configuration, one level above the skill parameters (see
         # _a2a_send_message_configuration).
         protocol_push_config = kwargs.pop("a2a_push_notification_config", None)
-        a2a_identity = self.identity_for(Transport.A2A) if identity is NO_IDENTITY_OVERRIDE else identity
-
-        # The real A2A handler writes audit logs which require the tenant to exist
-        # in the DB. Ensure the tenant record exists (idempotent) so audit logging
-        # doesn't fail with FK violations on discovery endpoints.
-        if self.use_real_db and a2a_identity and a2a_identity.tenant_id:
-            self._ensure_tenant_for_audit(a2a_identity.tenant_id)
+        server_context = _a2a_call_context(credential)
+        self._seed_ambient_tenant(credential)
 
         # Unpack req object into flat parameters if present.
         # A2A skills accept a flat parameter dict, not a request model.
@@ -784,42 +883,6 @@ class BaseTestEnv:
             parameters = dict(kwargs)
 
         handler = AdCPRequestHandler()
-
-        # Auth strategy mirrors _run_mcp_client. When the identity carries a real
-        # auth_token (integration mode), populate the AuthContext that the SDK
-        # call-context builder would have built from the wire and run the REAL
-        # _get_auth_token + _resolve_a2a_identity (header → token → DB lookup →
-        # ResolvedIdentity). Only the transport's state injection is supplied here
-        # (the in-process equivalent of MCP's get_http_headers seam) — the auth
-        # chain itself is real. When no real token exists (unit mode), inject the
-        # identity directly via the single mock point (unchanged behavior).
-        auth_token = a2a_identity.auth_token if a2a_identity else None
-
-        if auth_token:
-            from src.core.auth_context import AUTH_CONTEXT_STATE_KEY, AuthContext
-
-            headers = {
-                "x-adcp-auth": auth_token,
-                "x-adcp-tenant": a2a_identity.tenant_id or "",
-            }
-            server_context = ServerCallContext(
-                state={AUTH_CONTEXT_STATE_KEY: AuthContext(auth_token=auth_token, headers=headers)}
-            )
-        else:
-            # _get_auth_token must return a non-None value when identity exists,
-            # otherwise the handler rejects the request before _resolve_a2a_identity
-            # is called. Use auth_token from identity, falling back to a sentinel.
-            handler._resolve_a2a_identity = lambda *args, **kw: a2a_identity  # type: ignore[assignment]
-            handler._get_auth_token = lambda *args, **kw: (  # type: ignore[assignment]
-                (a2a_identity.auth_token or "harness-test-token") if a2a_identity else None
-            )
-            server_context = ServerCallContext()
-
-        # Set tenant ContextVar so production code can read it
-        if a2a_identity and a2a_identity.tenant:
-            from src.core.config_loader import set_current_tenant
-
-            set_current_tenant(a2a_identity.tenant)
 
         message = create_a2a_message_with_skill(skill_name=skill_name, parameters=parameters)
         if protocol_push_config is None:
@@ -836,9 +899,15 @@ class BaseTestEnv:
         try:
             task_result = asyncio.run(_call())
         except Exception as exc:
-            # Translate A2AError back to AdCPError for callers that catch
-            # domain exceptions (e.g., pytest.raises(AdCPAuthenticationError)).
-            raise _unwrap_a2a_server_error(exc) from exc
+            # The ORIGINAL exception propagates. It used to be translated into a
+            # reconstructed AdCPSalesAgentError so callers could catch domain exceptions; the
+            # dispatcher now reads the envelope off the A2AError instead
+            # , and a genuine in-process production error --
+            # which is what the IMPL path raises -- is unaffected either way.
+            envelope = _a2a_wire_envelope(exc)
+            if envelope is not None:
+                raise WireError(envelope) from exc
+            raise
 
         # Parse Task.artifacts[0] into response_cls
         if not isinstance(task_result, Task):
@@ -849,21 +918,26 @@ class BaseTestEnv:
         self._last_a2a_task = task_result
 
         # AdCP-domain errors now surface as a failed Task with the two-layer
-        # envelope in the artifact DataPart. Reconstruct the AdCPError so
+        # envelope in the artifact DataPart. Reconstruct the AdCPSalesAgentError so
         # callers can catch domain exceptions instead of getting
         # a pydantic ValidationError from trying to parse the envelope as a
         # success response.
         from a2a.types import TaskState
 
-        if task_result.status.state == TaskState.TASK_STATE_FAILED:
-            from src.core.exceptions import AdCPError
+        from src.core.errors.codes import AppErrorCode
 
+        # Raised a few lines below and never imported -- the A2A-task-failed branch would
+        # have died with a NameError instead of the error it means to raise.
+        from src.core.exceptions import AdCPSalesAgentError
+
+        if task_result.status.state == TaskState.TASK_STATE_FAILED:
             if task_result.artifacts:
-                envelope = extract_data_from_artifact(task_result.artifacts[0])
-                reconstructed = _envelope_to_adcp_error(envelope, fallback_message="A2A skill failed")
-                if reconstructed is not None:
-                    raise reconstructed
-            raise AdCPError(f"A2A task failed: {task_result.status}")
+                envelope = _wire_envelope(extract_data_from_artifact(task_result.artifacts[0]))
+                if envelope is not None:
+                    raise WireError(envelope)
+            # A failed task with no envelope artifact: nothing was caught, so there is
+            # no exception to hand to ``internal_detail``; the code is the diagnosis.
+            raise AdCPSalesAgentError(error_code=AppErrorCode.INTERNAL_ERROR)
 
         if task_result.status.state == TaskState.TASK_STATE_SUBMITTED:
             # Async manual-approval path: the server returns a submitted Task with NO
@@ -881,14 +955,12 @@ class BaseTestEnv:
         # success-path assertions. Captured BEFORE stripping so siblings that need
         # the top-level envelope fields (message/success) still see them.
         wire_response = dict(artifact_data)
-        # Strip protocol fields added by _serialize_for_a2a (message, success).
+        # Strip protocol fields the A2A wire adds in _dispatch_skill → to_wire (message, success).
         # These are populated by the protocol layer per the pin's Protocol
-        # Envelope arm (see tests/helpers/adcp_schema_validator.py) — not
+        # Envelope branch (see tests/helpers/adcp_schema_validator.py) — not
         # declared on the Pydantic response model — and cause ValidationError
         # under extra="forbid" in non-production mode.
-        return DeliverResult(
-            payload=response_cls(**strip_a2a_protocol_fields(artifact_data)), wire_response=wire_response
-        )
+        return DeliverResult(payload=response_cls(**artifact_data), wire_response=wire_response)
 
     def _run_mcp_client(
         self,
@@ -901,19 +973,16 @@ class BaseTestEnv:
         Uses FastMCP's in-memory transport (FastMCPTransport) to go through the
         complete server path: middleware chain → TypeAdapter → tool function.
 
-        When the identity carries a real ``auth_token`` (integration mode),
-        patches ``get_http_headers`` so the full auth chain runs: header
-        extraction → tenant detection → token-to-principal DB lookup →
-        ResolvedIdentity from real data.
-
-        When no real token is available (unit mode), patches
-        ``resolve_identity_from_context`` directly.
+        The credential is presented where this transport reads headers:
+        ``get_http_headers`` is patched to return it, so the full chain runs on every
+        dispatch -- header extraction, tenant detection, token-to-principal lookup,
+        ResolvedIdentity built by the resolver.
 
         Args:
             tool_name: MCP tool name (e.g., "get_products").
             response_cls: Pydantic model class to parse structured_content into.
-            **kwargs: Tool arguments. ``identity`` is popped and used for the
-                auth mock; ``req`` is popped and its fields unpacked into the
+            **kwargs: Tool arguments. ``credential`` is popped and presented as the
+                request headers; ``req`` is popped and its fields unpacked into the
                 arguments dict.
         """
         import asyncio
@@ -922,187 +991,109 @@ class BaseTestEnv:
         from fastmcp import Client
 
         from src.core.main import mcp
-        from tests.harness.transport import NO_IDENTITY_OVERRIDE, Transport
+        from tests.harness.transport import NO_IDENTITY_OVERRIDE
 
         self._commit_factory_data()
 
-        # Pop identity — used for the auth mock, not sent as a tool argument.
-        identity = kwargs.pop("identity", NO_IDENTITY_OVERRIDE)
-        mcp_identity = self.identity_for(Transport.MCP) if identity is NO_IDENTITY_OVERRIDE else identity
+        credential = kwargs.pop("credential", NO_IDENTITY_OVERRIDE)
+        if credential is NO_IDENTITY_OVERRIDE:
+            credential = self.credential()
 
         # Unpack req object into flat arguments if present.
         # MCP tools accept individual params, not a request model.
         req = kwargs.pop("req", None)
         if req is not None and hasattr(req, "model_dump"):
+            # Narrowed to the tool's own parameters -- the same "DTO fields INTERSECT
+            # implementation arguments" rule production uses. The DTO is a SUPERSET of what
+            # a given tool implements (GetMediaBuysRequest declares include_history,
+            # pagination and more that get_media_buys does not take), so dumping it whole
+            # sends arguments the tool never advertised. In dev, extra="forbid" turns that
+            # into a VALIDATION_ERROR and the scenario fails for a reason it never intended
+            # to test; in production it would be silently ignored, which is worse -- the
+            # harness would be grading a request the buyer could not actually make.
+
             req_fields = req.model_dump(exclude_none=True)
+            # No narrowing. This filtered req fields down to a hand-written wrapper's
+            # parameter list -- "accepted = DTO fields INTERSECT wrapper parameters" -- which
+            # is exactly the intersection the registry removed. The DTO IS the accepted shape
+            # on every transport now, so a field the request carries is a field the tool
+            # takes, and filtering could only drop one.
             # kwargs override req fields (explicit > implicit)
             arguments = {**req_fields, **kwargs}
         else:
             arguments = dict(kwargs)
 
-        # Choose auth strategy based on whether we have a real DB token.
-        auth_token = mcp_identity.auth_token if mcp_identity else None
-
-        if auth_token:
-            # Real auth chain: header → token → DB lookup → identity.
-            # Patch get_http_headers in BOTH modules that import it:
-            # transport_helpers (called by resolve_identity_from_context) and
-            # mcp_auth_middleware (called for context_id extraction).
-            headers = {
-                "x-adcp-auth": auth_token,
-                "x-adcp-tenant": mcp_identity.tenant_id or "",
-            }
-
-            async def _call():
-                mock_th = patch("src.core.transport_helpers.get_http_headers", return_value=headers)
-                mock_mw = patch("src.core.mcp_auth_middleware.get_http_headers", return_value=headers)
-                with mock_th as patched_th, mock_mw as patched_mw:
-                    async with Client(mcp) as client:
-                        result = await client.call_tool(tool_name, arguments)
-                        # Guard: verify the header patches were called.
-                        # If a third module imports get_http_headers without being
-                        # patched, this won't catch it — but at least we verify
-                        # the known auth paths were exercised.
-                        assert patched_th.called or patched_mw.called, (
-                            f"Auth chain not exercised for {tool_name} — get_http_headers patches were not called"
-                        )
-                        return DeliverResult(
-                            payload=response_cls(**result.structured_content),
-                            wire_response=result.structured_content,
-                        )
-
-        else:
-            # Unit mode: inject identity directly.
-            async def _call():
-                with patch(
-                    "src.core.mcp_auth_middleware.resolve_identity_from_context",
-                    return_value=mcp_identity,
-                ):
-                    async with Client(mcp) as client:
-                        result = await client.call_tool(tool_name, arguments)
-                        return DeliverResult(
-                            payload=response_cls(**result.structured_content),
-                            wire_response=result.structured_content,
-                        )
+        # ONE patch, at the source. src/core/main.py imports get_http_headers from
+        # fastmcp.server.dependencies inside the call, so patching the DEFINING module is
+        # what a function-local import actually sees, and it covers any further importer
+        # for free. Patching an importing module instead named nothing once already.
+        async def _call():
+            with patch("fastmcp.server.dependencies.get_http_headers", return_value=dict(credential)) as patched:
+                async with Client(mcp) as client:
+                    result = await client.call_tool(tool_name, arguments)
+                    assert patched.called, (
+                        f"Auth chain not exercised for {tool_name} — get_http_headers was never called"
+                    )
+                    return DeliverResult(
+                        payload=response_cls(**result.structured_content),
+                        wire_response=result.structured_content,
+                    )
 
         try:
             return asyncio.run(_call())
         except Exception as exc:
-            raise _unwrap_mcp_tool_error(exc) from exc
+            envelope = _mcp_wire_envelope(exc)
+            if envelope is not None:
+                raise WireError(envelope) from exc
+            raise
 
-    def _run_mcp_wrapper(
-        self,
-        wrapper_fn: Any,
-        response_cls: type,
-        **kwargs: Any,
-    ) -> Any:
-        """Legacy MCP dispatch: mock Context → async wrapper → parse response.
+    def _pop_credential(self, kwargs: dict[str, Any]) -> dict[str, str]:
+        """Pop ``credential`` from dispatch kwargs, defaulting to this env's credential.
 
-        .. deprecated::
-            Use ``_run_mcp_client`` instead for full-pipeline dispatch.
-            This method bypasses FastMCP middleware and TypeAdapter validation.
-            Kept for unit-mode envs that cannot use the in-memory Client.
+        ``{}`` is a caller's explicit "no headers at all" and is returned as such; only
+        an ABSENT keyword falls back to ``credential()``.
         """
-        import asyncio
-        from unittest.mock import AsyncMock, MagicMock
+        from tests.harness.transport import NO_IDENTITY_OVERRIDE
 
-        from fastmcp.server.context import Context
-
-        from tests.harness.transport import NO_IDENTITY_OVERRIDE, Transport
-
-        self._commit_factory_data()
-
-        identity = kwargs.pop("identity", NO_IDENTITY_OVERRIDE)
-        mcp_identity = self.identity_for(Transport.MCP) if identity is NO_IDENTITY_OVERRIDE else identity
-
-        # Unpack req object into flat kwargs — MCP wrappers accept individual
-        # parameters, not a request model.
-        req = kwargs.pop("req", None)
-        if req is not None and hasattr(req, "model_dump"):
-            req_fields = req.model_dump(exclude_none=True)
-            # kwargs override req fields (explicit > implicit)
-            kwargs = {**req_fields, **kwargs}
-
-        mock_ctx = MagicMock(spec=Context)
-        mock_ctx.get_state = AsyncMock(return_value=mcp_identity)
-
-        tool_result = asyncio.run(wrapper_fn(ctx=mock_ctx, **kwargs))
-        return response_cls(**tool_result.structured_content)
+        credential = kwargs.pop("credential", NO_IDENTITY_OVERRIDE)
+        return self.credential() if credential is NO_IDENTITY_OVERRIDE else dict(credential)
 
     def _run_rest_request(self, endpoint: str, **kwargs: Any) -> Any:
-        """Shared REST dispatch: configure auth → build body → POST → return Response.
+        """Shared REST dispatch: pop the credential -> commit -> build body -> POST.
 
-        Symmetric with ``_run_mcp_wrapper``. Handles the full REST lifecycle:
-        1. Pop ``identity`` from kwargs and configure dep override for this request
-        2. Commit factory data
-        3. Build request body from remaining kwargs
-        4. POST via TestClient
-        5. Return raw httpx.Response
+        Symmetric with ``_run_mcp_client``. The credential rides the request as HTTP
+        headers, where the production middleware reads it, so in-process REST runs the
+        same chain as A2A, MCP and e2e_rest. There is no dependency override: a REST route
+        has no identity dependency, so nothing can express an identity the wire never
+        carried (GH #1886 was that seam disagreeing with the wire).
 
-        Identity handling (mirrors production auth middleware):
-        - identity is None → dep raises AUTH_REQUIRED (no token) with suggestion
-        - identity is ResolvedIdentity → dep returns it (valid token)
-        - identity absent → uses default self.identity_for(Transport.REST)
+        Envs whose route is not a body-carrying POST override this method and reuse
+        ``_pop_credential`` / ``get_rest_client``.
         """
-        client, identity = self._prepare_rest_request(kwargs)
-        body = self.build_rest_body(**kwargs)
-        return client.post(endpoint, json=body)
-
-    def _prepare_rest_request(self, kwargs: dict[str, Any]) -> tuple[Any, Any]:
-        """Resolve identity, commit factory data, get the client, and install auth.
-
-        Single source of truth for the REST request preamble every dispatcher
-        shares: pops ``identity`` from *kwargs* (defaulting to the REST identity),
-        commits pending factory rows, creates/returns the TestClient, and installs
-        the per-request auth-dep override (which must run AFTER ``get_rest_client``).
-        Returns ``(client, resolved_identity)``; the caller builds the body from the
-        now-identity-free *kwargs* and issues the HTTP verb.
-        """
-        from tests.harness.transport import NO_IDENTITY_OVERRIDE, Transport
-
-        identity = kwargs.pop("identity", NO_IDENTITY_OVERRIDE)
-        if identity is NO_IDENTITY_OVERRIDE:
-            identity = self.identity_for(Transport.REST)
-
+        credential = self._pop_credential(kwargs)
         self._commit_factory_data()
         client = self.get_rest_client()
-        self._configure_rest_auth_override(identity)
-        return client, identity
-
-    @staticmethod
-    def _configure_rest_auth_override(identity: Any) -> None:
-        """Install per-request FastAPI auth-dep overrides for the test app.
-
-        Single source of truth for the REST auth contract every dispatcher needs
-        (must run AFTER ``get_rest_client``). With ``identity=None`` the
-        ``_require_auth_dep`` override is REMOVED so the real production
-        dependency runs against the token-less request and raises the real
-        ``AUTH_REQUIRED`` error — the harness must not hand-copy the production
-        raise (a simulated raise drifted from production once already,
-        #1417/cx41); otherwise both deps return the identity.
-        """
-        from src.app import app
-        from src.core.auth_context import _require_auth_dep, _resolve_auth_dep
-
-        if identity is None:
-            app.dependency_overrides.pop(_require_auth_dep, None)
-            app.dependency_overrides[_resolve_auth_dep] = lambda: None
-        else:
-            app.dependency_overrides[_require_auth_dep] = lambda: identity
-            app.dependency_overrides[_resolve_auth_dep] = lambda: identity
+        body = self.build_rest_body(**kwargs)
+        return client.post(endpoint, json=body, headers=credential)
 
     def call_rest(self, **kwargs: Any) -> Any:
         """Call the REST endpoint and parse the response.
 
         Symmetric with ``call_impl``, ``call_a2a``, ``call_mcp``.
-        Pops identity, configures auth, POSTs, parses response.
+        Presents the credential, POSTs, parses response.
         Raises on HTTP errors (dispatcher catches and wraps in TransportResult).
         """
         endpoint = self.REST_ENDPOINT  # type: ignore[attr-defined]
         response = self._run_rest_request(endpoint, **kwargs)
 
         if response.status_code >= 400:
-            raise self.parse_rest_error(response.status_code, response.json())
+            envelope = self.parse_rest_error_envelope(response.status_code, response.json())
+            if envelope is not None:
+                raise WireError(envelope)
+            raise AssertionError(
+                f"REST returned HTTP {response.status_code} with a body carrying no AdCP error code: "
+                f"{response.text[:400]}"
+            )
 
         return self.parse_rest_response(response.json())
 
@@ -1133,57 +1124,54 @@ class BaseTestEnv:
         )
 
     def parse_rest_response(self, data: dict[str, Any]) -> BaseModel:
-        """Parse REST JSON response dict into the expected Pydantic model.
+        """Parse a REST body into this env's ``RESPONSE_MODEL``, through ``revive``.
 
-        Override in subclass.
+        Implemented here rather than refused here. This used to raise
+        NotImplementedError, and nine envs answered it with one line of their own --
+        ``SomeResponse(**data)`` -- which is the substituted-variable duplication the DRY
+        rule forbids, and which every one of them got WRONG in the same way: a served
+        document carries the ``context`` the boundary stamped, ``AdcpResponse`` refuses
+        that field on construction so the boundary is the only thing that can put one
+        there, and so every REST dispatch of a context-carrying request raised in the TEST
+        process. The scenario then reported "no response arrived" for a request the seller
+        had answered correctly. ``revive`` is the reader-side door for exactly that, and
+        ``MediaBuyCreateEnv`` was already using it for the branch-resolution half of the
+        same problem.
+
+        An env whose tool has no single pinned response model declares no
+        ``RESPONSE_MODEL`` and overrides this; the refusal below is what it used to be.
+
+        ``revive`` only when the model HAS one. Some envs name the LIBRARY response type
+        rather than a local subclass of ``AdcpResponse`` — ``CapabilitiesEnv`` does — and a
+        library model carries no context refusal to work around, so plain construction is
+        correct for it. Refusing instead cost 97 UC-010 failures in one run: measured as
+        NEW between two remote runs, every one of them this frame raising
+        NotImplementedError. The client-side twin (tests/harness/client.py
+        ``_parse_pinned_response``) already had this fallback; the two now agree.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not implement parse_rest_response(). "
-            "Override to enable Transport.REST dispatch."
-        )
+        model = self.RESPONSE_MODEL
+        if model is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} declares no RESPONSE_MODEL and does not override "
+                "parse_rest_response(). Do one or the other to enable Transport.REST."
+            )
+        revive = getattr(model, "revive", None)
+        return cast("BaseModel", revive(data) if revive is not None else model(**data))
 
-    def parse_rest_error(self, status_code: int, data: dict[str, Any]) -> Exception:
-        """Reconstruct an AdCPError from REST error response.
+    def parse_rest_error_envelope(self, status_code: int, data: dict[str, Any]) -> dict[str, Any] | None:
+        """The two-layer envelope from a REST error body, or ``None``.
 
-        Delegates envelope and legacy-flat parsing to the shared
-        ``_envelope_to_adcp_error`` helper (same path used by the A2A
-        unwrapper) so REST and A2A reconstruction stay byte-identical.
-        Falls back to HTTP status mapping only when no ``error_code`` is
-        recoverable from the body.
+        Shares ``_wire_envelope`` with the A2A and MCP paths so all three agree on
+        what an error body means.
+
+        The ``STATUS_TO_ERROR`` map that used to sit here -- 400 -> AdCPValidationError,
+        404 -> AdCPNotFoundError, and five more -- is DELETED. It was the same design
+        mistake as the code-to-class map in a second spelling: an HTTP status guessed
+        back into an AdCP class. A status is not a code, and a guess is not evidence of
+        what the buyer received. A body with no recoverable code
+        yields ``None``, and the dispatcher reports the raw HTTP failure instead.
         """
-        message = data.get("message", data.get("error", str(data)))
-        # FastAPI request-validation failures use a {"detail": [...]} envelope
-        # with no error_code; surface a readable message from the first detail.
-        if "message" not in data and "error" not in data and isinstance(data.get("detail"), list) and data["detail"]:
-            first = data["detail"][0]
-            if isinstance(first, dict) and first.get("msg"):
-                message = first["msg"]
-
-        reconstructed = _envelope_to_adcp_error(data, fallback_message=message)
-        if reconstructed is not None:
-            return reconstructed
-
-        # Fallback: map HTTP status to exception class
-        from src.core.exceptions import (
-            AdCPAdapterError,
-            AdCPAuthenticationError,
-            AdCPAuthorizationError,
-            AdCPNotFoundError,
-            AdCPRateLimitError,
-            AdCPValidationError,
-        )
-
-        STATUS_TO_ERROR: dict[int, type[Exception]] = {
-            400: AdCPValidationError,
-            401: AdCPAuthenticationError,
-            403: AdCPAuthorizationError,
-            404: AdCPNotFoundError,
-            422: AdCPValidationError,  # FastAPI request-validation envelope ({"detail": [...]})
-            429: AdCPRateLimitError,
-            502: AdCPAdapterError,
-        }
-        error_cls = STATUS_TO_ERROR.get(status_code, Exception)
-        return error_cls(message)
+        return _wire_envelope(data)
 
     def get_rest_client(self) -> Any:
         """Return FastAPI TestClient with auth dependency overridden.
@@ -1217,9 +1205,8 @@ class BaseTestEnv:
         Called from ``__enter__`` in e2e mode. Delegates to the idempotent
         ``setup_default_data`` (get-or-create) so it shares ONE seeding path and
         envs that also call ``setup_default_data()`` themselves don't
-        double-create. Seeds the SAME ``tenant_id`` / ``principal_id`` the env's
-        identity uses, so the token ``identity_for`` later resolves matches the
-        seeded row.
+        double-create. Seeds the SAME ``tenant_id`` / ``principal_id`` the env
+        presents, so the token ``credential()`` later reads is the seeded row's.
         """
         if not self._session:
             return
@@ -1229,6 +1216,26 @@ class BaseTestEnv:
         if setup is not None:
             setup()
             self._session.commit()
+
+    def _seed_ambient_tenant(self, credential: dict[str, str]) -> None:
+        """In-process A2A preamble: audit-log tenant row and the ambient tenant ContextVar.
+
+        Both are keyed on the tenant the credential ADDRESSES (``x-adcp-tenant``), which is
+        what the resolver will read; a credential addressing no tenant seeds nothing, so a
+        scenario whose subject is tenant resolution gets the resolver's answer and not the
+        harness's.
+
+        The real A2A handler writes audit logs that need the tenant FK, so the row is
+        created if absent (integration mode only). The ContextVar seed is the ambient
+        channel salesagent-02rgd Phase 2 removes; until then it stays for the readers that
+        have not moved to ``identity.tenant``. Not identity resolution: the resolver still
+        detects the tenant from the headers itself.
+        """
+        tenant_id = _addressed_tenant(credential)
+        if not tenant_id:
+            return
+        if self.use_real_db:
+            self._ensure_tenant_for_audit(tenant_id)
 
     def _ensure_tenant_for_audit(self, tenant_id: str) -> None:
         """Create a minimal tenant record if none exists (idempotent).
@@ -1304,7 +1311,10 @@ class BaseTestEnv:
                     f._meta.sqlalchemy_session = self._session
                 self._guard("db_factories", self._unbind_factories)
 
-            # 2. Start patches
+            # 2. Start patches. Unit mode first substitutes the resolver's three database
+            #    reads, so the real chain runs over the in-process wire with no database.
+            if not self.use_real_db:
+                self._install_unit_resolver_substitutes()
             for name, target in self.EXTERNAL_PATCHES.items():
                 if name in self.ASYNC_PATCHES:
                     patcher = patch(target, new_callable=AsyncMock)
@@ -1461,13 +1471,53 @@ class BaseTestEnv:
         #    every patch, plus whatever the subclass hooks acquired.
         self._release_entered(errors)
         self.mock.clear()
-        self._identity_cache.clear()
 
         if errors:
             if len(errors) == 1:
                 raise errors[0]
             raise ExceptionGroup("Multiple teardown errors", errors)
         return False
+
+    @property
+    @realize_e2e(_e2e_external_seams_exercised)
+    def external_seams_exercised(self) -> bool:
+        """Whether production actually ran through its external seams for this call.
+
+        The question a sandbox scenario asks after the response is back: did the seller
+        really do the work, or skip every outside call and hand back a stub? A response
+        alone cannot answer it, which is why BR-RULE-209's "no real ad platform API
+        calls" Then asks this as well as reading ``sandbox`` off the wire.
+
+        In process the patched seam IS the observable: every external integration point
+        is a mock, and one of them being called is production having reached it.
+
+        Over e2e_rest those mocks live in the WRONG PROCESS -- the work happens inside the
+        Docker server, nothing here is patched, and ``any(mock.called)`` is False for
+        every scenario. That is the shape 97608a6fa fixed for UC-006's four mock-reading
+        Thens: the env owns the answer and each branch reads the observable that exists in
+        its own world. Here the live one is the audit row the server writes
+        (:func:`_e2e_external_seams_exercised`).
+
+        DECLARED ON ``BaseTestEnv``, NOT ``IntegrationEnv``, and that placement is the
+        fix for a near-miss rather than a preference. NOTE: the caller that motivated it,
+        the generic ``then_no_real_api_calls`` step, is DELETED -- its obligation has no
+        wire observable and production violates it (see that step's removal note in
+        tests/bdd/steps/generic/then_success.py), so this property currently has no
+        caller. It is kept here, at the base, because the original reasoning holds for
+        any future one: Five env classes in
+        ``tests/harness/`` extend ``BaseTestEnv`` directly (the ``*_unit.py`` variants of
+        ProductEnv / DeliveryPollEnv / WebhookEnv / CircuitBreakerEnv, plus
+        MediaBuyUpdateEnv), and on ``IntegrationEnv`` this property was an
+        ``AttributeError`` waiting for the first route that sent one of them through the
+        step. Here every env has it.
+
+        The e2e branch needs ``get_audit_logs``, which only ``IntegrationEnv`` can offer,
+        and that asymmetry is sound: ``is_e2e`` keys on ``e2e_config``, a unit-mode env is
+        built without one, so the branch that needs a session is unreachable from the envs
+        that have none. If that ever stops being true the AttributeError is the right,
+        loud answer.
+        """
+        return any(mock.called for mock in self.mock.values())
 
 
 class IntegrationEnv(BaseTestEnv):
@@ -1478,6 +1528,15 @@ class IntegrationEnv(BaseTestEnv):
     """
 
     use_real_db = True
+    #: TestClient(app, raise_server_exceptions=...) for get_rest_client(). True
+    #: preserves every existing REST test's behavior unchanged — provably a
+    #: no-op for every typed error path (AdCPSalesAgentError/ValueError/
+    #: RequestValidationError/PermissionError/ToolError each have their own
+    #: @app.exception_handler and never reach ServerErrorMiddleware, the only
+    #: place this flag matters). inject_untyped_exception() sets this to False
+    #: as an INSTANCE attribute (not by overriding this class default) so the
+    #: opt-out is scoped to exactly the scenario that calls it.
+    REST_RAISE_SERVER_EXCEPTIONS: bool = True
 
     def setup_default_data(self, **tenant_kwargs: Any) -> tuple[Any, Any]:
         """Get-or-create default tenant + principal via factories.
@@ -1515,7 +1574,143 @@ class IntegrationEnv(BaseTestEnv):
         ).first()
         if principal is None:
             principal = PrincipalFactory(tenant=tenant, principal_id=self._principal_id)
+
+        # NO account is seeded here, deliberately. Seeding one for every tenant made
+        # UC-011's account-LISTING scenarios wrong -- "0 accounts visible" saw one -- which
+        # is the cost of a default that is invisible at the call site. The tools that
+        # REQUIRE an account seed it where they build the request instead: see
+        # MediaBuyCreateEnv._ensure_required_request_fields / _seed_named_account, the BDD
+        # request defaults, and MediaBuyFactory.
         return tenant, principal
+
+    def setup_default_account(self, principal_id: str | None = None) -> Any:
+        """Get-or-create the default Account (plus this principal's access to it).
+
+        AdCP 3.1.1 makes ``account`` REQUIRED on several requests (sync-creatives-request
+        and update-media-buy-request both list it in /required), so a scenario that does
+        not seed one cannot build a valid request at all -- it fails on a missing field
+        before reaching the behaviour it means to grade.
+
+        Must be called inside the ``with env:`` block, and it calls
+        ``setup_default_data`` first: the Account row carries a tenant_id FK, so seeding
+        it against a tenant that does not exist yet is the FK violation this method
+        exists to make unreachable.
+
+        Idempotent, like ``setup_default_data`` -- reuses an existing row so repeated
+        Given steps do not collide.
+        """
+        tenant, principal = self.setup_default_data()
+        # Access is granted to the principal that will actually SEND the request, which is
+        # not always the env's default: a cross-principal isolation test drives a second
+        # principal, and an account its principal cannot reach comes back as
+        # AdCPAuthorizationError rather than the behaviour under test.
+        grantee = principal_id or principal.principal_id
+        return self._seed_default_account(tenant, grantee)
+
+    def _seed_default_account(self, tenant: Any, grantee: str) -> Any:
+        """The body of ``setup_default_account``, callable from ``setup_default_data`` too.
+
+        Split out so the tenant seeder can seed an account without calling
+        ``setup_default_account``, which starts by calling the tenant seeder -- the two
+        would otherwise recurse.
+        """
+        from sqlalchemy import select
+
+        from src.core.database.models import Account, AgentAccountAccess
+        from tests.factories.account import AccountFactory, AgentAccountAccessFactory
+
+        account = self._session.scalars(select(Account).filter_by(tenant_id=self._tenant_id)).first()
+        if account is None:
+            # tenant_id, never tenant= -- Account.tenant is a real relationship, so handing
+            # it a SubFactory's throwaway Tenant makes SQLAlchemy re-sync tenant_id FROM
+            # that object at flush and silently relocate the row (see AccountFactory.Meta).
+            # A DETERMINISTIC id, not the factory Sequence: tests name this account by
+            # literal (``{"account_id": "acct_test"}``) in ~120 request constructions, and a
+            # sequence id would parse in all of them and resolve in none.
+            account = AccountFactory(tenant_id=tenant.tenant_id, account_id=DEFAULT_TEST_ACCOUNT_ID)
+
+        # Only a principal that EXISTS can be granted access: agent_account_access carries
+        # an FK to principals, and several scenarios drive a deliberately unknown identity
+        # (tenant-not-found, unauthenticated) whose principal has no row. For those the
+        # grant is skipped -- the account still exists so the request is well-formed, and
+        # the scenario reaches the auth rejection it is actually about.
+        from src.core.database.models import Principal
+
+        grantee_exists = (
+            self._session.scalars(select(Principal).filter_by(tenant_id=self._tenant_id, principal_id=grantee)).first()
+            is not None
+        )
+        access = self._session.scalars(
+            select(AgentAccountAccess).filter_by(
+                tenant_id=self._tenant_id,
+                principal_id=grantee,
+                account_id=account.account_id,
+            )
+        ).first()
+        if access is None and grantee_exists:
+            AgentAccountAccessFactory(
+                tenant_id=tenant.tenant_id,
+                principal_id=grantee,
+                account_id=account.account_id,
+            )
+        self._commit_factory_data()
+        return account
+
+    def default_account_reference(self) -> Any:
+        """The seeded account as the AccountReference a request field wants.
+
+        core/account-ref.json is a oneOf: {account_id} or {brand, operator, sandbox?}.
+        The account_id form is the one a seeded row can satisfy exactly, so steps get
+        that rather than reconstructing a brand/operator pair the DB may not agree with.
+        """
+        from adcp.types import AccountReference
+
+        return AccountReference(root={"account_id": self.setup_default_account().account_id})
+
+    # Seeding a NAMED account reference lives here rather than on one env: any env whose
+    # tool carries an ``account`` needs it, and update_media_buy needed it the moment the
+    # boundary started RESOLVING the reference instead of accepting and dropping it.
+    def _seed_named_account_ref(self, account: Any) -> None:
+        """Seed the row behind an account reference, when it is the suite's default.
+
+        Takes the reference in either spelling -- the wire dict a per-field caller passes,
+        or the typed AccountReference on a built request -- because both paths reach the
+        same boundary lookup.
+        """
+        root = getattr(account, "root", account)
+        account_id = root.get("account_id") if isinstance(root, dict) else getattr(root, "account_id", None)
+        if account_id == DEFAULT_TEST_ACCOUNT_ID:
+            self.setup_default_account()
+
+    def _seed_named_account(self, req: Any) -> None:
+        """Seed the account a caller-BUILT request names, when it is the suite's default.
+
+        A test that hands ``req=`` built its request outside this env, so
+        ``_ensure_required_request_fields`` never ran and nothing created the row the
+        transport boundary is about to resolve. Only DEFAULT_TEST_ACCOUNT_ID is seeded: a
+        test naming its own account is describing a specific account state (missing,
+        suspended, foreign) and manufacturing a row for it would erase the case.
+        """
+        account = getattr(req, "account", None)
+        if account is not None:
+            self._seed_named_account_ref(account)
+
+    def configure_tenant_field(self, field: str, value: Any) -> None:
+        """Write a tenant-level config field for both caller paths.
+
+        Updates the in-memory tenant overrides (the ``identity`` a ``call_impl`` hands
+        over, and the unit-mode ``get_tenant_by_id`` substitute) AND the DB Tenant row
+        when the column exists (the wire legs' resolver reads the DB via config_loader).
+        """
+        self._tenant_overrides[field] = value
+
+        if self._session:
+            from src.core.database.models import Tenant
+
+            tenant = self._session.get(Tenant, self._tenant_id)
+            if tenant is not None and hasattr(tenant, field):
+                setattr(tenant, field, value)
+                self._session.commit()
 
     # -- Public query API (step functions must use these, not env._session) ----
 
@@ -1558,25 +1753,59 @@ class IntegrationEnv(BaseTestEnv):
         stmt = select(WorkflowStep).join(WorkflowStep.context).where(Context.tenant_id == self._tenant_id)
         return list(self.get_session().scalars(stmt).all())
 
-    def get_rest_client(self) -> Any:
-        """Return FastAPI TestClient with default auth dep override.
+    def get_audit_logs(self, operation_substring: str | None = None) -> list:
+        """``AuditLog`` rows this tenant accumulated, oldest first.
 
-        The default dep override returns ``self.identity_for(Transport.REST)``.
-        ``_run_rest_request`` overrides this per-request for multi-agent and
-        no-auth scenarios. Direct callers of ``get_rest_client()`` get the
-        default identity.
+        The audit trail is a DATABASE table by design -- "the database is the audit
+        authority" (src/core/audit_logger.py) and the files beside it are a backup -- so
+        the rows are readable on every transport, including the one where the audit
+        logger itself runs in another process.
+
+        Three step helpers in ``tests/bdd/steps/_outcome_helpers.py`` already CALLED
+        ``env.get_audit_logs`` on their e2e branch (``assert_audit_logged``,
+        ``assert_audit_approval_logged``, ``assert_audit_adapter_logged``) and no such
+        method existed: those branches raised ``AttributeError``, unnoticed because no
+        e2e_rest node has reached one of them yet. This is the method they were written
+        against, not a second spelling of it.
+
+        ``expire_all`` first: over e2e the server committed through its OWN session, so a
+        row written after this session last read is otherwise served from the identity
+        map -- the same reason ``creative_sync``'s and ``webhook_registration``'s
+        read-backs expire.
+
+        ``operation_substring`` matches against ``AuditLog.operation``, which production
+        stores adapter-prefixed (``AdCP.list_creatives``), so a caller naming the bare
+        tool name still matches.
+        """
+        from sqlalchemy import select
+
+        from src.core.database.models import AuditLog
+
+        session = self.get_session()
+        session.expire_all()
+        stmt = select(AuditLog).filter_by(tenant_id=self._tenant_id).order_by(AuditLog.timestamp)
+        rows = list(session.scalars(stmt).all())
+        if operation_substring is None:
+            return rows
+        return [row for row in rows if operation_substring in (row.operation or "")]
+
+    def get_rest_client(self) -> Any:
+        """Return the FastAPI TestClient. NO auth dependency override.
+
+        There is nothing to override. The identity is resolved once, inside
+        ``invoke_tool``, from the credential on the request, so a REST route has no
+        identity dependency. With an override in place every REST request ran as a
+        pre-built identity handed in by the test, so the header -> ``_detect_tenant`` ->
+        tenant-scoped principal lookup chain never executed and a scenario could not tell a
+        correct resolution from a broken one. The request carries ``credential()`` as its
+        headers and the server resolves it, the same way MCP and A2A do.
         """
         if self._rest_client is None:
             from starlette.testclient import TestClient
 
             from src.app import app
-            from src.core.auth_context import _require_auth_dep, _resolve_auth_dep
-            from tests.harness.transport import Transport
 
-            rest_identity = self.identity_for(Transport.REST)
-            app.dependency_overrides[_require_auth_dep] = lambda: rest_identity
-            app.dependency_overrides[_resolve_auth_dep] = lambda: rest_identity
-            self._rest_client = TestClient(app)
+            self._rest_client = TestClient(app, raise_server_exceptions=self.REST_RAISE_SERVER_EXCEPTIONS)
 
         return self._rest_client
 

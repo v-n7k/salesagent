@@ -45,7 +45,7 @@ from src.core.tools.media_buy_create import _create_media_buy_impl
 # Suite reports this script may publish. Named once so the pre-run purge and the
 # copy below cannot drift apart — a report present in one list and absent from
 # the other is how a stale file survives.
-_REPORT_SUITES="unit integration e2e admin bdd ui"
+_REPORT_SUITES="unit integration e2e admin bdd ui quality storyboard"
 
 purge_stale_reports() {
     # `.tox/` persists between invocations, so a suite that dies before writing
@@ -196,8 +196,19 @@ fi
 # the unit env too, which is now parallel, so this path is exposed to the same
 # hole. See scripts/check_truncated_reports.py.
 if ls "$RESULTS_DIR"/*.json >/dev/null 2>&1; then
-    if ! python3 scripts/check_truncated_reports.py "$RESULTS_DIR"; then
+    if ! python3 -m scripts.check_truncated_reports "$RESULTS_DIR"; then
         FAILURES="${FAILURES:+$FAILURES }truncated"
+    fi
+fi
+
+# --- Failure/error check ---
+# This path decides success from tox exit codes alone, so a suite whose only
+# problem is a fixture dying in SETUP contributes an `error` -- which is NOT in
+# summary.failed -- and every report still reads "failed 0". Name it out loud.
+# See scripts/report_suite_failures.py.
+if ls "$RESULTS_DIR"/*.json >/dev/null 2>&1; then
+    if ! python3 -m scripts.report_suite_failures "$RESULTS_DIR"; then
+        FAILURES="${FAILURES:+$FAILURES }suite-errors"
     fi
 fi
 

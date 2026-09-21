@@ -41,6 +41,7 @@ map $ssl_server_name $tls_upstream_named {
     proxy.adcp.test            adcp-server:8080;
     creative-agent.adcp.test   creative-agent:8080;
     webhooks.adcp.test         webhook-capture:8080;
+    storyboard.adcp.test       adcp-server-storyboard:8080;
 }
 
 server {

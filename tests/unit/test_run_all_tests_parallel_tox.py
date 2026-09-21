@@ -36,7 +36,18 @@ from scripts.check_truncated_reports import truncation_report
 from tests.unit.test_run_all_tests_contract import _REPO_ROOT, _RUNNER
 
 _CREATIVE_AGENT_STACK = _REPO_ROOT / "scripts" / "creative-agent-stack.sh"
-_CHECK_TRUNCATED = _REPO_ROOT / "scripts" / "check_truncated_reports.py"
+
+# Every scripts/ module the runner shells out to after collecting reports, plus
+# the shared walk they both import. Listing only the entry points was how the
+# sandbox went stale: `report_suite_failures.py` joined the runner and
+# `_suite_reports.py` became their shared dependency, and the sandbox -- which
+# copies files rather than the tree -- kept handing the runner a scripts/ dir
+# that could not execute the checks it invokes.
+_RUNNER_REPORT_SCRIPTS = (
+    "check_truncated_reports.py",
+    "report_suite_failures.py",
+    "_suite_reports.py",
+)
 
 _DOCKER_STUB = """#!/usr/bin/env bash
 # Records every invocation of this fake `docker` (argv, space-joined) to
@@ -45,19 +56,48 @@ _DOCKER_STUB = """#!/usr/bin/env bash
 #
 # "As it would against a healthy stack" includes WRITING THE REPORTS. tox runs
 # inside the container, so its `.tox/<suite>.json` never reaches the host when
-# `docker` is stubbed -- and the runner's missing-report arm correctly fails a
+# `docker` is stubbed -- and the runner's missing-report branch correctly fails a
 # run that produced none ("a suite that produced none was not measured"). A stub
 # that swallows the tox call without leaving reports behind is simulating a
 # stack where every suite died, not a healthy one. Emit a minimal report per
 # suite on the tox invocation so the simulation is faithful; the shape is what
 # scripts/check_truncated_reports.py reads (collected/total/deselected).
+#
+# The suites are whatever the runner just asked tox for (`... tests tox -p -e
+# a,b,c`), so they are read off the invocation rather than restated here: a
+# hard-coded list silently stops covering a suite the moment one is added, and
+# the runner then fails the run for a report the stub never wrote -- which is
+# how the `quality` env, added to ALL_SUITES upstream, turned this simulation
+# into a red run that said nothing about the runner.
 printf '%s\\n' "$*" >> "$DOCKER_STUB_LOG"
 case "$*" in
   *tox*)
     mkdir -p .tox
-    for _s in unit integration bdd bdd_inprocess bdd_e2e admin e2e ui storyboard; do
+    _envs="" _seen_tox=0 _take_next=0
+    for _arg in "$@"; do
+      if [ "$_take_next" = 1 ]; then _envs="$_arg"; break; fi
+      # Only tox's own -e: `docker compose run` takes -e KEY=VAL too.
+      if [ "$_seen_tox" = 1 ] && [ "$_arg" = "-e" ]; then _take_next=1; fi
+      [ "$_arg" = "tox" ] && _seen_tox=1
+    done
+    for _s in ${_envs//,/ }; do
       printf '%s' '{"summary": {"collected": 1, "total": 1, "passed": 1, "deselected": 0}, "exitcode": 0}' \\
         > ".tox/${_s}.json"
+      # A BDD suite now emits TWO artifacts: the pytest report and the dispatched-request
+      # payload capture (tests/bdd/payload_capture.py), and the runner fails a run whose
+      # BDD suite produced no payload artifact for the same reason it fails one that
+      # produced no report -- a suite that produced none was not measured. Emitting only
+      # the report here would simulate a stack whose BDD suites all died halfway, which
+      # is the failure this stub's comment above already warns against.
+      case "$_s" in bdd*) printf '%s' '{"run": {"collected": 1}, "nodes": {}}' > ".tox/${_s}_payloads.json" ;; esac
+      # The storyboard suite publishes the runner's per-protocol summary to
+      # test-results/ (tests/storyboard/test_storyboard_conformance.py, _publish_summary),
+      # and the runner keeps that score inside the run directory -- a storyboard env that
+      # produced no summary reads as not measured, so a healthy simulation writes both.
+      case "$_s" in storyboard)
+        mkdir -p test-results
+        for _p in mcp a2a; do printf '%s' '{"passed": 1, "failed": 0, "failures": []}' > "test-results/storyboard_summary_${_p}.json"; done ;;
+      esac
     done
     ;;
 esac
@@ -75,9 +115,11 @@ def _run_with_stubbed_docker(tmp_path: Path) -> tuple[subprocess.CompletedProces
     (workdir / "scripts").mkdir(parents=True)
     shutil.copy2(_RUNNER, workdir / "run_all_tests.sh")
     shutil.copy2(_CREATIVE_AGENT_STACK, workdir / "scripts" / "creative-agent-stack.sh")
-    # The runner shells out to this after collecting reports (main, PR #2091):
-    # a truncated suite must not be mistakable for a green one.
-    shutil.copy2(_CHECK_TRUNCATED, workdir / "scripts" / "check_truncated_reports.py")
+    # The runner shells out to these after collecting reports (main, PR #2091):
+    # a truncated suite, or one whose only problem is a setup error, must not be
+    # mistakable for a green one.
+    for name in _RUNNER_REPORT_SCRIPTS:
+        shutil.copy2(_REPO_ROOT / "scripts" / name, workdir / "scripts" / name)
 
     stub_bin = tmp_path / "stub_bin"
     stub_bin.mkdir()

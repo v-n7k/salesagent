@@ -68,7 +68,7 @@ from tests.helpers.marker_names import derive_marker_names
 
 if TYPE_CHECKING:
     from _pytest.fixtures import FixtureRequest
-    from pytest_bdd.parser import Feature, Scenario
+    from pytest_bdd.parser import Feature, Scenario, Step
 
 # IMPORTED, not re-declared. The previous comment here forbade this
 # import "so this pytest plugin has no import-time dependency on the audit CLI
@@ -97,6 +97,13 @@ class Observation:
     outcome: str  # "passed" | "failed" | "xfailed"
     reason: str | None
     reason_category: str  # "live" | "no_steps_bound" | "harness_not_wired" | "ledgered"
+    #: MEASURED: at least one step body of this (scenario, transport) run began
+    #: executing. Recorded by ``pytest_bdd_before_step_call``, which pytest-bdd
+    #: fires immediately before it calls a step function — so a run aborted in
+    #: fixture setup (which is where every blanket xfail route lives) records
+    #: False, whatever its reason string says. This is the structural fact
+    #: ``harness_wired`` is derived from; the reason string is metadata.
+    steps_executed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -105,6 +112,7 @@ class Observation:
             "outcome": self.outcome,
             "reason": self.reason,
             "reason_category": self.reason_category,
+            "steps_executed": self.steps_executed,
         }
 
 
@@ -140,12 +148,45 @@ class ScenarioLiveness:
                 self.unbound_steps.append(text)
 
     def record_observation(self, obs: Observation) -> None:
+        """Fold one (scenario, transport) outcome in.
+
+        ``harness_wired`` is derived from ``obs.steps_executed`` — a fact the run
+        recorded — and never from the reason text. The reason only ever selects
+        BETWEEN the not-wired verdicts; it cannot produce a wired one.
+
+        This is the fix for the defect the ``_classify_reason`` docstring
+        describes from the other side. "ledgered" is that function's RESIDUAL
+        bucket: every reason matching neither literal prefix nor both harness
+        tokens lands there, and "ledgered" used to set ``harness_wired=True``.
+        Two blanket routes that abort a scenario inside fixture setup name
+        reasons that land in it: ``uc010-not-wired``, whose message says "wiring"
+        where the token is "wired", and ``uc006-unclassified``, which contains
+        neither token. Fed to the old logic both produce a WIRED verdict for a
+        scenario that executed nothing.
+
+        Scope, measured rather than assumed: neither reason appears in
+        ``test-results/bdd_scenario_liveness.json`` as it stands, because both
+        rows are catch-alls currently shadowed by more specific ones. So this
+        removes a mechanism, not present inflation — the count does not move
+        today. It is still the fix, because under-matching inflates coverage and
+        the next rewording or newly-reachable catch-all would do it silently. A
+        step either ran or it did not, and no wording changes that.
+        """
         self.observations.append(obs)
         if obs.reason_category == "ledgered" or obs.nodeid in _LEDGERED_NODEIDS:
             self.ledgered = True
-        if obs.reason_category == "harness_not_wired":
+        # The verdict is AND over observations of one measured fact, so no reason
+        # string appears in it at all. The former ``harness_not_wired`` text branch
+        # is not merely unnecessary but unreachable as a separate case: that reason
+        # is raised by ``_harness_env``'s catch-all during FIXTURE setup, where no
+        # step can have run, so ``steps_executed`` is already False wherever it
+        # fires. Keeping the branch would leave the verdict sensitive to wording in
+        # exactly one corner, which is the defect with a smaller blast area rather
+        # than a fixed one.
+        if not obs.steps_executed:
+            # False dominates the cross-shard merge too, which is the safe direction.
             self.harness_wired = False
-        elif obs.reason_category in ("live", "ledgered") and self.harness_wired is not False:
+        elif self.harness_wired is not False:
             self.harness_wired = True
 
     def to_dict(self) -> dict[str, Any]:
@@ -170,6 +211,11 @@ _WORKEROUTPUT_KEY = "bdd_scenario_liveness"
 #: Controller-side merge target: ``scenario_id -> record dict``, folded from every
 #: worker's shard plus the controller's own (empty under xdist) records.
 _SHARDS: dict[str, dict[str, Any]] = {}
+
+#: Node ids whose run got at least one step body executed. Written by
+#: ``pytest_bdd_before_step_call``; read once when the observation is built.
+#: A set of ids rather than a counter: the question is whether ANY step ran.
+_STEPS_RAN: set[str] = set()
 
 
 def _scenario_identifier(scenario: Scenario, feature: Feature) -> str | None:
@@ -200,6 +246,22 @@ def _classify_reason(reason: str | None) -> str:
     if "harness" in lowered and "wired" in lowered:
         return "harness_not_wired"
     return "ledgered"
+
+
+def _classify_exception(excinfo: Any) -> str | None:
+    """The category implied by the EXCEPTION, or None when there is nothing typed to read.
+
+    ``StepDefinitionNotFoundError`` and ``NotImplementedError`` are the two
+    auto-xfail causes conftest converts, and the exception class says so without
+    anyone having to preserve a sentence. Returning None (rather than guessing)
+    keeps marker-based and explicit ``pytest.xfail()`` reasons on the prose path,
+    where the reason genuinely is the only signal.
+    """
+    if excinfo is None:
+        return None
+    if excinfo.errisinstance(StepDefinitionNotFoundError) or excinfo.errisinstance(NotImplementedError):
+        return "no_steps_bound"
+    return None
 
 
 def _transport_name(item: pytest.Item) -> str:
@@ -242,6 +304,23 @@ def pytest_bdd_before_scenario(request: FixtureRequest, feature: Feature, scenar
     request.node.stash[_SCENARIO_ID_KEY] = scenario_id
 
 
+def pytest_bdd_before_step_call(request: FixtureRequest, step: Step) -> None:
+    """Record that a step body of this run is about to execute.
+
+    pytest-bdd fires this hook immediately before calling a step function, with
+    the step's arguments already resolved. Reaching it means the scenario got
+    past collection, past every fixture, and into its own logic — which is the
+    only thing that distinguishes a scenario that GRADED something from one that
+    was xfailed out of existence in fixture setup.
+
+    ``pytest_bdd_before_step`` (without ``_call``) would fire slightly earlier,
+    before the step's own setup. This hook is the stricter of the two, and the
+    stricter one is correct here: the claim being recorded is that production
+    logic ran.
+    """
+    _STEPS_RAN.add(request.node.nodeid)
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> Any:
     """Record this item's outcome against the scenario ``pytest_bdd_before_scenario`` stashed.
@@ -276,7 +355,21 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> Any:
         elif call.excinfo.errisinstance(NotImplementedError):
             reason = f"Not implemented: {call.excinfo.value}"
 
-    category = _classify_reason(reason)
+    # CLASSIFY ON THE TYPED CAUSE, fall back to prose only when there is no exception
+    # to read (marker-based and explicit ``pytest.xfail()``). The reason string stays
+    # whatever conftest wrote, because it is the HUMAN channel; it is no longer the
+    # machine one.
+    #
+    # This module used to derive the category from that prose whenever conftest had
+    # already set ``wasxfail`` -- which made a REWORDING of conftest's message able to
+    # silently reclassify a scenario. It did: a dormancy message that stopped starting
+    # with "Step definition not found:" fell through to "ledgered", and "ledgered"
+    # sets ``harness_wired=True``, so two genuinely unbound UC-006 scenarios were
+    # reported as harness-wired. Anchoring the prefix match protected against
+    # over-matching but not against UNDER-matching, and under-matching is the
+    # direction that inflates measured coverage.
+    typed = _classify_exception(call.excinfo)
+    category = typed if typed is not None else _classify_reason(reason)
     outcome_name = "passed" if report.passed else ("xfailed" if reason is not None else "failed")
     record.record_observation(
         Observation(
@@ -285,6 +378,7 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> Any:
             outcome=outcome_name,
             reason=reason,
             reason_category=category,
+            steps_executed=item.nodeid in _STEPS_RAN,
         )
     )
 

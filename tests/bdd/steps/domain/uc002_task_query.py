@@ -12,10 +12,9 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-import pytest
 from pytest_bdd import given, parsers, when
 
-from src.core.exceptions import AdCPError
+from src.core.exceptions import AdCPSalesAgentError
 
 # ═══════════════════════════════════════════════════════════════════════
 # Helpers
@@ -32,19 +31,17 @@ def _parse_array_value(raw: str, separator: str = "+") -> list[str]:
     return [v.strip() for v in raw.split(separator) if v.strip()]
 
 
-def _xfail_on_unsupported_param(ctx: dict, param_name: str, outcome: str) -> None:
-    """Xfail if list_tasks() rejected a param with TypeError.
-
-    When the When step passes all configured params to list_tasks() and
-    production doesn't accept one, the call raises TypeError. This is
-    the real production gap — the param isn't supported yet.
-    """
-    error = ctx.get("error")
-    if isinstance(error, TypeError) and param_name in str(error):
-        pytest.xfail(
-            f"SPEC-PRODUCTION GAP: list_tasks() does not accept {param_name} parameter. "
-            f"Outcome={outcome!r}. Error: {error}"
-        )
+# _xfail_on_unsupported_param is DELETED. It excused list_tasks() for raising TypeError on
+# sort_field / sort_direction / domain / task_status / task_type — and the pinned 3.1
+# protocol/list-tasks-request.json declares NONE of those as parameters. It nests them:
+# ``sort`` is {field, direction} and filtering lives under ``filters``. So production was
+# REFUSING A NON-SPEC PARAMETER SHAPE, which is correct behaviour, and the xfail recorded
+# that correctness as a production gap.
+#
+# The `assert "error" not in ctx` that followed every call site is now the grader. If these
+# scenarios are ever wired, it fails with the TypeError and says the true thing: the steps
+# call list_tasks with a parameter shape the spec does not define. Fixing THAT is a scenario
+# change (pass sort={"field":..,"direction":..}), not an excuse.
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -266,7 +263,7 @@ def when_query_task_list(ctx: dict) -> None:
         else:
             result = _dispatch_list_tasks(env, **params)
         ctx["task_list_result"] = result
-    except (AdCPError, TypeError, Exception) as exc:
+    except (AdCPSalesAgentError, TypeError, Exception) as exc:
         ctx["error"] = exc
 
 
@@ -301,12 +298,10 @@ def assert_task_query_outcome(ctx: dict, outcome: str) -> None:
 def _assert_sorted_by(ctx: dict, outcome: str) -> None:
     """Assert tasks are sorted by a specific field.
 
-    SPEC-PRODUCTION GAP: list_tasks() hardcodes created_at DESC sorting.
-    There is no sort_field parameter. These scenarios xfail until production
-    implements parameterized sorting.
+    The pin nests sorting: protocol/list-tasks-request.json declares
+    ``sort: {field, direction}``, not a flat ``sort_field``. A TypeError here means
+    the STEP is sending a shape the spec does not define.
     """
-    _xfail_on_unsupported_param(ctx, "sort_field", outcome)
-
     assert "error" not in ctx, f"Expected sorted results but got error: {ctx.get('error')}"
     result = ctx.get("task_list_result")
     assert result is not None, "No task list result"
@@ -319,12 +314,10 @@ def _assert_default_sort(ctx: dict, outcome: str) -> None:
     'defaults to desc order' — production already does this (hardcoded).
     """
     if outcome == "defaults to created_at sort":
-        _xfail_on_unsupported_param(ctx, "sort_field", outcome)
         assert "error" not in ctx, f"Expected default sort but got error: {ctx.get('error')}"
         result = ctx.get("task_list_result")
         assert result is not None, "No task list result"
     elif outcome == "defaults to desc order":
-        _xfail_on_unsupported_param(ctx, "sort_direction", outcome)
         assert "error" not in ctx, f"Expected default order but got error: {ctx.get('error')}"
         result = ctx.get("task_list_result")
         assert result is not None, "No task list result"
@@ -335,11 +328,9 @@ def _assert_default_sort(ctx: dict, outcome: str) -> None:
 def _assert_sort_direction(ctx: dict, outcome: str) -> None:
     """Assert results are in ascending or descending order.
 
-    SPEC-PRODUCTION GAP: list_tasks() hardcodes DESC and has no sort_direction
-    parameter. These scenarios xfail until production implements it.
+    The pin nests direction under ``sort.direction`` (enums/sort-direction.json), not a
+    flat ``sort_direction``. A TypeError here means the STEP sends a non-spec shape.
     """
-    _xfail_on_unsupported_param(ctx, "sort_direction", outcome)
-
     assert "error" not in ctx, f"Expected sorted results but got error: {ctx.get('error')}"
     result = ctx.get("task_list_result")
     assert result is not None, "No task list result"
@@ -348,12 +339,10 @@ def _assert_sort_direction(ctx: dict, outcome: str) -> None:
 def _assert_filtered_to(ctx: dict, outcome: str) -> None:
     """Assert tasks are filtered to a specific domain, status, or type.
 
-    SPEC-PRODUCTION GAP: list_tasks() does not accept domain, task_status,
-    or task_type parameters. The TypeError from the call is the proof.
+    The pin nests these under ``filters`` (protocol/list-tasks-request.json); there are no
+    flat ``domain`` / ``task_status`` / ``task_type`` parameters. A TypeError here means the
+    STEP sends a shape the spec does not define.
     """
-    for param in ("domain", "task_status", "task_type"):
-        _xfail_on_unsupported_param(ctx, param, outcome)
-
     assert "error" not in ctx, f"Expected filtered results but got error: {ctx.get('error')}"
     result = ctx.get("task_list_result")
     assert result is not None, "No task list result"
@@ -362,12 +351,9 @@ def _assert_filtered_to(ctx: dict, outcome: str) -> None:
 def _assert_all_returned(ctx: dict, outcome: str) -> None:
     """Assert all tasks returned when filter is omitted.
 
-    When no domain/status/type filter is specified, list_tasks() returns all
-    tasks for the tenant — this is the production default behavior.
+    When no filter is specified, list_tasks() returns all tasks for the tenant — this is
+    the production default behavior, and the pin agrees (``filters`` is optional).
     """
-    for param in ("domain", "task_status", "task_type"):
-        _xfail_on_unsupported_param(ctx, param, outcome)
-
     assert "error" not in ctx, f"Expected all tasks but got error: {ctx.get('error')}"
     result = ctx.get("task_list_result")
     assert result is not None, "No task list result"

@@ -13,48 +13,59 @@ No Docker required. This is the regression gate between every Phase 2 step.
 
 import json
 import uuid
-from unittest.mock import patch
 
 import pytest
 from starlette.testclient import TestClient
 
-from src.app import app
+from src.app import _AGENT_CARD_PATHS, app
+from src.core.tools.registry import TOOLS
 from tests.factories.principal import PrincipalFactory
+from tests.helpers.agent_card import host_routes_to_no_tenant
+from tests.helpers.credentials import credential_headers
 
+# ``protocol="a2a"`` and the redundant ``tenant={...}`` are gone: the identity names no
+# transport since commit a1b79d22d took the testing-hook channel and the protocol off it,
+# and the factory builds the TenantContext for ``tenant_id`` itself (a dict is refused at
+# construction). What the A2A cases need from the identity is only that it IS an
+# authenticated caller, which is what ``make_identity`` means.
 _MOCK_IDENTITY = PrincipalFactory.make_identity(
     principal_id="test-principal",
     tenant_id="test-tenant",
-    tenant={"tenant_id": "test-tenant"},
-    protocol="a2a",
 )
 
-# ---------------------------------------------------------------------------
-# All 13 A2A skills from the dispatch map (adcp_a2a_server.py:1416-1438)
-# ---------------------------------------------------------------------------
-ALL_SKILLS = [
-    "get_adcp_capabilities",
-    "get_products",
-    "create_media_buy",
-    "list_creative_formats",
-    "list_authorized_properties",
-    "update_media_buy",
-    "get_media_buy_delivery",
-    "update_performance_index",
-    "sync_creatives",
-    "list_creatives",
-    "approve_creative",
-    "get_media_buy_status",
-    "optimize_media_buy",
-]
 
-DISCOVERY_SKILLS = [
-    "get_adcp_capabilities",
-    "list_creative_formats",
-    "list_authorized_properties",
-    "get_products",
-]
+# ---------------------------------------------------------------------------
+# The A2A skills, read from the server rather than copied.
+#
+# This was a hand-maintained list, and it was the THIRD copy of the same set -- the
+# dispatch map and the agent card being the other two. Deleting the non-spec skills from
+# those two left this one stale, which is the whole failure mode: a copy does not know it
+# is out of date. The agent card is the artifact a buyer actually reads, so it is the one
+# worth reading here.
+# ---------------------------------------------------------------------------
+def _advertised_skills() -> list[str]:
+    from src.a2a_server.adcp_a2a_server import create_agent_card
 
-AUTH_REQUIRED_SKILLS = [s for s in ALL_SKILLS if s not in DISCOVERY_SKILLS]
+    return [s.name for s in create_agent_card().skills]
+
+
+ALL_SKILLS = _advertised_skills()
+
+# Derived, not hand-kept. ``ToolSpec.requires_credential()`` is the one place a tool says
+# whether it needs a caller, and the boundary asks the same method -- so a list written here
+# could only ever agree with the gate by coincidence, and this one did not: it claimed
+# ``list_accounts`` was auth-optional, while tests/integration/test_list_accounts.py graded
+# the opposite behaviour ("unauthenticated list_accounts raises AUTH_REQUIRED") from the same
+# BR-RULE-055. The pin settles it -- account/list-accounts-request.json describes "accounts
+# accessible to the authenticated agent" -- and the registry agreed all along.
+#
+# The ``auth="required"|"optional"`` literal this read is gone (commit 4a57d38be): the policy
+# is DERIVED from the implementation's identity annotation, and the row carries no second
+# statement of it. Asked with no tenant, the answer is the annotation's alone -- which is the
+# right question here, because these cases present no seller-specific brand policy.
+DISCOVERY_SKILLS = [s for s in ALL_SKILLS if not TOOLS[s].requires_credential()]
+
+AUTH_REQUIRED_SKILLS = [s for s in ALL_SKILLS if TOOLS[s].requires_credential()]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -115,16 +126,28 @@ def _extract_artifact_data(result: dict) -> dict:
 
 @pytest.fixture
 def client():
-    """TestClient for the unified FastAPI app."""
-    c = TestClient(app, raise_server_exceptions=False)
-    yield c
-    c.close()
+    """TestClient for the unified FastAPI app, on a host that routes to no tenant.
+
+    Since #1291 the agent card reads the Host's tenant from the database to
+    advertise that tenant's canonical URL. This is a unit test with no database,
+    so it pins the branch it can actually exercise — an unclaimed host, where the
+    card still derives its URL from headers. ``host_routes_to_no_tenant`` supplies
+    only that routing answer; every other call in this file is untouched by it.
+    """
+    with host_routes_to_no_tenant():
+        c = TestClient(app, raise_server_exceptions=False)
+        yield c
+        c.close()
 
 
 @pytest.fixture
 def auth_headers():
     """Headers with a valid Bearer token."""
-    return {"Authorization": "Bearer test-transport-token", "Content-Type": "application/json", "A2A-Version": "1.0"}
+    return {
+        **credential_headers(token="test-transport-token"),
+        "Content-Type": "application/json",
+        "A2A-Version": "1.0",
+    }
 
 
 @pytest.fixture
@@ -169,45 +192,11 @@ class TestA2ARouteExistence:
 # ---------------------------------------------------------------------------
 
 
-class TestA2AAuthContract:
-    """Verify auth boundary: discovery vs auth-required skills."""
-
-    @pytest.mark.parametrize("skill", DISCOVERY_SKILLS)
-    def test_discovery_skills_accept_no_auth(self, client, no_auth_headers, skill):
-        """Discovery skills should NOT return auth error without token."""
-        payload = _build_jsonrpc(skill, {})
-        response = client.post("/a2a", json=payload, headers=no_auth_headers)
-        body = response.json()
-        # Should not get an auth error
-        if "error" in body:
-            error_msg = body["error"].get("message", "").lower()
-            # Check for explicit auth rejection (not just "authorized" in property names)
-            auth_rejection_phrases = [
-                "authentication token required",
-                "missing authentication token",
-                "bearer token required",
-            ]
-            for phrase in auth_rejection_phrases:
-                assert phrase not in error_msg, (
-                    f"Discovery skill '{skill}' rejected unauthenticated request: {body['error']}"
-                )
-
-    @pytest.mark.parametrize("skill", AUTH_REQUIRED_SKILLS)
-    def test_auth_required_skills_reject_no_auth(self, client, no_auth_headers, skill):
-        """Auth-required skills MUST reject requests without token."""
-        payload = _build_jsonrpc(skill, {})
-        response = client.post("/a2a", json=payload, headers=no_auth_headers)
-        body = response.json()
-        assert "error" in body, f"Auth-required skill '{skill}' should return error without token"
-        error_msg = body["error"].get("message", "").lower()
-        assert "auth" in error_msg or "token" in error_msg, (
-            f"Error for '{skill}' should mention auth/token: {body['error']['message']}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# JSON-RPC Protocol
-# ---------------------------------------------------------------------------
+# (Deleted) TestA2AAuthContract asserted "discovery skills accept no auth, auth-required
+# skills reject no auth" over A2A alone, from a unit test. BDD grades that same contract on
+# the wire across mcp/a2a/rest -- AUTH_MISSING appears in 18 feature files -- so this was one
+# transport's copy of a three-transport obligation, and the copy is what lets a transport
+# drift. Credential handling is not a unit test's subject.
 
 
 class TestA2AJsonRpcProtocol:
@@ -256,192 +245,6 @@ class TestA2AJsonRpcProtocol:
 
 # ---------------------------------------------------------------------------
 # Response Shape — Key Skills
-# ---------------------------------------------------------------------------
-
-
-class TestA2AResponseShape:
-    """Verify response field shapes for representative skills.
-
-    These tests mock _impl functions to return known responses,
-    testing the full transport chain: middleware → dispatch → serialization.
-    """
-
-    @patch("src.core.resolved_identity.resolve_identity", return_value=_MOCK_IDENTITY)
-    @patch("src.core.tools.products._get_products_impl")
-    def test_get_products_response_shape(self, mock_impl, mock_resolve, client, auth_headers):
-        """get_products response must contain 'products' list."""
-        from src.core.schemas import GetProductsResponse
-
-        mock_impl.return_value = GetProductsResponse(products=[], message="test")
-
-        payload = _build_jsonrpc("get_products", {"brief": "test"})
-        response = client.post("/a2a", json=payload, headers=auth_headers)
-        body = response.json()
-
-        if "result" in body:
-            result = body["result"]
-            assert "task" in result, "SendMessage result must contain 'task'"
-            data = _extract_artifact_data(result)
-            assert "products" in data, "get_products response must have 'products' field"
-            assert isinstance(data["products"], list)
-
-    @patch("src.core.resolved_identity.resolve_identity", return_value=_MOCK_IDENTITY)
-    @patch("src.core.tools.media_buy_create._create_media_buy_impl")
-    def test_create_media_buy_response_shape(self, mock_impl, mock_resolve, client, auth_headers):
-        """create_media_buy response must have media_buy_id."""
-        from adcp.types.aliases import CreateMediaBuySuccessResponse
-
-        mock_impl.return_value = CreateMediaBuySuccessResponse(
-            media_buy_id="mb-test-1",
-            packages=[],
-            # adcp 6.6 (spec 3.1.1) made these required on the success envelope
-            status="completed",
-            confirmed_at="2026-03-01T00:00:00Z",
-            revision=1,
-        )
-
-        payload = _build_jsonrpc(
-            "create_media_buy",
-            {
-                "brand": {"domain": "testbrand.com"},
-                "packages": [{"product_id": "p1", "budget": 1000.0, "pricing_option_id": "cpm"}],
-                "start_time": "2026-03-01T00:00:00Z",
-                "end_time": "2026-03-31T00:00:00Z",
-                "idempotency_key": "unit-test-key-a2a-shape-0001",
-            },
-        )
-        response = client.post("/a2a", json=payload, headers=auth_headers)
-        body = response.json()
-
-        if "result" in body:
-            data = _extract_artifact_data(body["result"])
-            assert "media_buy_id" in data, "create_media_buy response must have 'media_buy_id'"
-
-    def test_error_format_is_jsonrpc(self, client, auth_headers):
-        """Error responses must use JSON-RPC error envelope, not {success: false}."""
-        # Send a request that will fail (unknown skill)
-        payload = _build_jsonrpc("nonexistent_skill", {})
-        response = client.post("/a2a", json=payload, headers=auth_headers)
-        body = response.json()
-
-        # Must be JSON-RPC format
-        assert "error" in body or "result" in body, "Response must be JSON-RPC format"
-        if "error" in body:
-            assert "code" in body["error"], "JSON-RPC error must have 'code'"
-            assert "message" in body["error"], "JSON-RPC error must have 'message'"
-
-    @patch("src.core.resolved_identity.resolve_identity", return_value=_MOCK_IDENTITY)
-    @patch("src.a2a_server.adcp_a2a_server.core_sync_creatives_tool")
-    def test_sync_creatives_response_shape(self, mock_impl, mock_resolve, client, auth_headers):
-        """sync_creatives response must contain 'creatives' or 'synced_creatives'."""
-        from src.core.schemas import SyncCreativesResponse
-
-        mock_impl.return_value = SyncCreativesResponse(creatives=[], failed_creatives=[])
-
-        payload = _build_jsonrpc("sync_creatives", {"creatives": []})
-        response = client.post("/a2a", json=payload, headers=auth_headers)
-        body = response.json()
-
-        if "result" in body:
-            data = _extract_artifact_data(body["result"])
-            assert "creatives" in data or "synced_creatives" in data, (
-                "sync_creatives response must have 'creatives' field"
-            )
-
-    @patch("src.core.resolved_identity.resolve_identity", return_value=_MOCK_IDENTITY)
-    @patch("src.a2a_server.adcp_a2a_server.core_list_creatives_tool")
-    def test_list_creatives_response_shape(self, mock_impl, mock_resolve, client, auth_headers):
-        """list_creatives response must contain 'creatives' list."""
-        from src.core.schemas import ListCreativesResponse
-
-        # adcp 3.6.0: Pagination uses cursor-based pagination (has_more, total_count, cursor)
-        mock_impl.return_value = ListCreativesResponse(
-            creatives=[],
-            pagination={"has_more": False, "total_count": 0},
-            query_summary={"filters_applied": [], "returned": 0, "total_matching": 0},
-        )
-
-        payload = _build_jsonrpc("list_creatives", {})
-        response = client.post("/a2a", json=payload, headers=auth_headers)
-        body = response.json()
-
-        if "result" in body:
-            data = _extract_artifact_data(body["result"])
-            assert "creatives" in data, "list_creatives response must have 'creatives' field"
-            assert isinstance(data["creatives"], list)
-
-    @patch("src.core.resolved_identity.resolve_identity", return_value=_MOCK_IDENTITY)
-    @patch("src.a2a_server.adcp_a2a_server.core_update_media_buy_tool")
-    def test_update_media_buy_response_shape(self, mock_impl, mock_resolve, client, auth_headers):
-        """update_media_buy response must have media_buy_id."""
-        from adcp.types.aliases import UpdateMediaBuySuccessResponse
-
-        mock_impl.return_value = UpdateMediaBuySuccessResponse(
-            media_buy_id="mb-test-1",
-            affected_packages=[],
-            # adcp 6.6 (spec 3.1.1) made these required on the success envelope
-            status="completed",
-            revision=1,
-        )
-
-        payload = _build_jsonrpc("update_media_buy", {"media_buy_id": "mb-test-1", "paused": False})
-        response = client.post("/a2a", json=payload, headers=auth_headers)
-        body = response.json()
-
-        if "result" in body:
-            data = _extract_artifact_data(body["result"])
-            assert "media_buy_id" in data, "update_media_buy response must have 'media_buy_id'"
-
-    @patch("src.core.resolved_identity.resolve_identity", return_value=_MOCK_IDENTITY)
-    @patch("src.a2a_server.adcp_a2a_server.core_get_media_buy_delivery_tool")
-    def test_get_media_buy_delivery_response_shape(self, mock_impl, mock_resolve, client, auth_headers):
-        """get_media_buy_delivery response must have 'deliveries' or 'media_buys'."""
-        from src.core.schemas import GetMediaBuyDeliveryResponse
-
-        mock_impl.return_value = GetMediaBuyDeliveryResponse(
-            media_buy_deliveries=[],
-            aggregated_totals={"impressions": 0, "clicks": 0, "spend": 0.0, "media_buy_count": 0},
-            currency="USD",
-            reporting_period={"start": "2026-03-01T00:00:00Z", "end": "2026-03-31T00:00:00Z", "granularity": "daily"},
-        )
-
-        payload = _build_jsonrpc("get_media_buy_delivery", {"media_buy_ids": ["mb-1"]})
-        response = client.post("/a2a", json=payload, headers=auth_headers)
-        body = response.json()
-
-        if "result" in body:
-            data = _extract_artifact_data(body["result"])
-            assert "media_buy_deliveries" in data or "deliveries" in data, (
-                "get_media_buy_delivery response must have 'media_buy_deliveries' field"
-            )
-
-    @patch("src.core.resolved_identity.resolve_identity", return_value=_MOCK_IDENTITY)
-    @patch("src.a2a_server.adcp_a2a_server.core_update_performance_index_tool")
-    def test_update_performance_index_response_shape(self, mock_impl, mock_resolve, client, auth_headers):
-        """update_performance_index response must have acknowledgment fields."""
-        from src.core.schemas import UpdatePerformanceIndexResponse
-
-        mock_impl.return_value = UpdatePerformanceIndexResponse(
-            status="updated",
-            detail="Performance index updated for mb-test-1",
-        )
-
-        payload = _build_jsonrpc(
-            "update_performance_index",
-            {"media_buy_id": "mb-test-1", "performance_data": [{"product_id": "p1", "performance_index": 1.2}]},
-        )
-        response = client.post("/a2a", json=payload, headers=auth_headers)
-        body = response.json()
-
-        if "result" in body:
-            data = _extract_artifact_data(body["result"])
-            assert "media_buy_id" in data or "status" in data, (
-                "update_performance_index response must have 'media_buy_id' or 'status'"
-            )
-
-
-# ---------------------------------------------------------------------------
-# Stub Handlers (approve_creative, get_media_buy_status, optimize_media_buy)
 # ---------------------------------------------------------------------------
 
 
@@ -526,3 +329,95 @@ class TestAgentCardContract:
         extensions = card.get("capabilities", {}).get("extensions", [])
         adcp_uris = [e.get("uri", "") for e in extensions]
         assert any("adcp-extension" in uri for uri in adcp_uris), "Agent card must have AdCP extension in capabilities"
+
+
+# ---------------------------------------------------------------------------
+# Agent Card Discovery Paths (#1440 — every declared path must be routed)
+# ---------------------------------------------------------------------------
+
+# Read the declared set from production rather than retyping the literals: a
+# path added to (or dropped from) `_AGENT_CARD_PATHS` must change what these
+# tests grade. Sorted for a deterministic parametrization order.
+AGENT_CARD_PATHS = sorted(_AGENT_CARD_PATHS)
+
+# The path the a2a-sdk factory mounts (src/app.py: create_agent_card_routes
+# card_url=...). It is served today, so it is the regression guard: it must stay
+# green both before and after the routing fix.
+CANONICAL_AGENT_CARD_PATH = "/.well-known/agent-card.json"
+
+
+class TestAgentCardDiscoveryPaths:
+    """Every path the app declares as agent-card discovery must serve the same card.
+
+    Uses the module's `client` fixture, i.e. TestClient WITHOUT lifespan, on
+    purpose. Under lifespan `_install_admin_mounts()` re-appends the Flask
+    catch-all `Mount("/")`, and an unrouted path is then answered by Flask's own
+    HTML 404 — so a 404 would no longer prove anything about the FastAPI route
+    table. Without lifespan there is no catch-all, so a 404 is Starlette's "no
+    route matched" and a 200 is necessarily a FastAPI route. The live-server
+    behaviour under lifespan is graded by
+    tests/e2e/test_a2a_endpoints_working.py.
+    """
+
+    @pytest.mark.parametrize("path", AGENT_CARD_PATHS)
+    def test_declared_card_path_is_routed(self, client, path):
+        """GET on every path in _AGENT_CARD_PATHS returns 200."""
+        response = client.get(path)
+        assert response.status_code == 200, (
+            f"{path} is declared in _AGENT_CARD_PATHS but returned "
+            f"{response.status_code}; every declared discovery path must be routed"
+        )
+
+    def test_all_declared_card_paths_return_byte_identical_bodies(self, client):
+        """All declared paths serve the same card BYTE for byte.
+
+        Compares `response.content`, not the parsed dict: a caching fetcher keyed
+        on bytes treats a re-serialization difference (key order, separators) as
+        a different document, so an equal-dict/different-bytes result is a real
+        defect.
+        """
+        headers = {"Host": "tenant.example.com"}
+        responses = {path: client.get(path, headers=headers) for path in AGENT_CARD_PATHS}
+
+        # Guard against a vacuous pass: three identical 404 bodies are byte-identical
+        # too. Sibling cases would redden, but this one must not report success on a
+        # tree where no card route exists at all.
+        for path, response in responses.items():
+            assert response.status_code == 200, f"{path} returned {response.status_code}, not a card"
+
+        bodies = {path: response.content for path, response in responses.items()}
+        canonical = bodies[CANONICAL_AGENT_CARD_PATH]
+
+        for path in AGENT_CARD_PATHS:
+            assert bodies[path] == canonical, (
+                f"{path} body differs from {CANONICAL_AGENT_CARD_PATH}; "
+                f"all declared paths must serve one byte-identical card"
+            )
+
+    @pytest.mark.parametrize("path", AGENT_CARD_PATHS)
+    def test_apx_incoming_host_derivation_applies_on_every_card_path(self, client, path):
+        """Apx-Incoming-Host + X-Forwarded-Proto drive supportedInterfaces[0].url on every path.
+
+        A path that returns 200 carrying the STATIC fallback host is still
+        broken — it would advertise the wrong A2A endpoint to every tenant — so
+        the derivation, not just the status code, is the obligation.
+        """
+        response = client.get(
+            path,
+            headers={"Apx-Incoming-Host": "tenant.example.com", "X-Forwarded-Proto": "https"},
+        )
+        assert response.status_code == 200, f"{path} returned {response.status_code}, expected 200"
+        card = response.json()
+        assert card["supportedInterfaces"][0]["url"] == "https://tenant.example.com/a2a", (
+            f"{path} did not derive its URL from Apx-Incoming-Host/X-Forwarded-Proto"
+        )
+
+    @pytest.mark.parametrize("path", AGENT_CARD_PATHS)
+    def test_host_header_derivation_applies_on_every_card_path(self, client, path):
+        """The Host header (no Apx-Incoming-Host) drives the URL on every path too."""
+        response = client.get(path, headers={"Host": "publisher.example.com", "X-Forwarded-Proto": "http"})
+        assert response.status_code == 200, f"{path} returned {response.status_code}, expected 200"
+        card = response.json()
+        assert card["supportedInterfaces"][0]["url"] == "http://publisher.example.com/a2a", (
+            f"{path} did not derive its URL from the Host header"
+        )

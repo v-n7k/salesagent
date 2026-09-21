@@ -25,7 +25,16 @@ def is_then_decorated(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
 
 
 def iter_then_functions() -> list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]]:
-    """Return (relative_path:lineno func_name, func_node) for all Then steps."""
+    """Return ``(relative_path func_name, func_node)`` for all Then steps.
+
+    The key carries NO line number, deliberately. A step function's name is already
+    unique within its module, so the line added nothing to identity and everything to
+    fragility: every allowlist row keyed by it broke whenever anything ABOVE the
+    violation moved, so a reformat or an unrelated edit reddened the guard and the
+    "fix" was retyping numbers. Worse, a row that looks stale for that reason invites
+    deletion, and deleting it pardons a violation that is still there — which is one
+    edit away from a guard that reports nothing.
+    """
     results = []
     for py_file in sorted(BDD_STEPS_DIR.rglob("*.py")):
         if py_file.name.startswith("_"):
@@ -39,7 +48,7 @@ def iter_then_functions() -> list[tuple[str, ast.FunctionDef | ast.AsyncFunction
                 continue
             if not is_then_decorated(node):
                 continue
-            key = f"{relative}:{node.lineno} {node.name}"
+            key = f"{relative} {node.name}"
             results.append((key, node))
     return results
 

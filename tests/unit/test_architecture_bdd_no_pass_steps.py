@@ -25,18 +25,14 @@ _BDD_STEPS_DIR = Path(__file__).resolve().parents[1] / "bdd" / "steps"
 
 # Allowlist for empty Given/When steps. Must only shrink — never add entries.
 # Fixed in #1181: given_tenant_exists and given_account_not_exists now have real bodies.
-_EMPTY_GIVEN_WHEN_ALLOWLIST: set[tuple[str, str]] = {
-    # FIXME(#2131): uc019/uc026 stubs pending implementation
-    ("bdd/steps/domain/uc019_query_media_buys.py", "when_query_by_refs"),
-    ("bdd/steps/domain/uc026_package_media_buy.py", "given_request_with_buyer_ref"),
-    ("bdd/steps/domain/uc026_package_media_buy.py", "given_resubmit_buyer_ref"),
-    ("bdd/steps/domain/uc026_package_media_buy.py", "given_buyer_owns_mb_with_ref_and_id"),
-    ("bdd/steps/domain/uc026_package_media_buy.py", "given_buyer_owns_mb_with_buyer_ref"),
-    ("bdd/steps/domain/uc026_package_media_buy.py", "given_cross_buy_request"),
-    ("bdd/steps/domain/uc026_package_media_buy.py", "given_buyer_owns_pkg_by_buyer_ref"),
-    ("bdd/steps/domain/uc026_package_media_buy.py", "given_partition_buyer_ref"),
-    ("bdd/steps/domain/uc026_package_media_buy.py", "given_boundary_buyer_ref"),
-}
+#
+# EMPTY. Its nine rows all named step functions that no longer exist — eight uc026
+# ``buyer_ref`` Givens for a field the pin dropped from create-media-buy-request.json,
+# and uc019's when_query_by_refs. They survived because the staleness check below could
+# only see functions that were still THERE: it walked the live steps and asked whether an
+# allowlisted one had gained a body, so a row whose function was deleted outright was
+# never examined at all. The guard reported green while its allowlist tracked nothing.
+_EMPTY_GIVEN_WHEN_ALLOWLIST: set[tuple[str, str]] = set()
 
 
 def _is_decorated_with(func: ast.FunctionDef | ast.AsyncFunctionDef, decorator_name: str) -> bool:
@@ -173,12 +169,19 @@ class TestBddNoPassSteps:
         When someone fixes an allowlisted step, this test reminds them to remove
         it from the allowlist.
         """
+        live: set[tuple[str, str]] = set()
         stale = []
         for rel, name, lineno, _, func in _iter_step_functions({"given", "when"}):
+            live.add((rel, name))
             if (rel, name) in _EMPTY_GIVEN_WHEN_ALLOWLIST and not _body_is_empty(func):
-                stale.append(f"{rel}:{lineno} {name}")
+                stale.append(f"{rel}:{lineno} {name} — no longer empty")
 
-        assert not stale, (
-            f"Found {len(stale)} allowlisted step(s) that are no longer empty — remove from allowlist:\n"
-            + "\n".join(f"  {v}" for v in stale)
+        # A row whose function was DELETED is stale too, and it is the half this check
+        # used to miss: walking the live steps can only notice a row whose function is
+        # still there. Nine rows survived that way, naming functions the tree no longer
+        # had, while the guard reported green.
+        stale += [f"{rel} {name} — no such step function" for rel, name in sorted(_EMPTY_GIVEN_WHEN_ALLOWLIST - live)]
+
+        assert not stale, f"Found {len(stale)} stale allowlist entr(ies) — remove from allowlist:\n" + "\n".join(
+            f"  {v}" for v in stale
         )

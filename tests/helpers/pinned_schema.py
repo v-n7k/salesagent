@@ -3,8 +3,8 @@ fully offline.
 
 Single source of truth for schema-shape assertions in tests (e.g. the BDD
 step "the response should be schema-valid against <file>") AND for the
-Pydantic-model alignment suite's schema walking
-(tests/unit/test_pydantic_schema_alignment.py). Reads the SDK's own "plain"
+request-factory conformance suite's schema walking
+(tests/unit/test_request_factory_schema_conformance.py). Reads the SDK's own "plain"
 schema tree (``adcp/_schemas/<major.minor>/``, sibling of the SDK's
 ``bundled/`` tree) — never the network, and never an independently vendored
 snapshot: the SDK's own installed version IS the pin (moves with
@@ -27,10 +27,9 @@ and it maps back to a path with no invented naming convention in between.
 
 The pure resolution primitives (``schema_root``, ``normalize_ref``, ``load``,
 ``PinnedSchemaError``, and their private helpers) live in
-``tests/helpers/adcp_pinned_schema.py`` — a stdlib-only module test code
-(``src/core/version_compat.py``) also imports, so there is exactly ONE
-resolution implementation shared by prod and tests, never a test-only copy
-duplicated into src/. This module re-exports every one of those names and
+``tests/helpers/adcp_pinned_schema.py`` — a stdlib-only module, so there is
+exactly ONE resolution implementation and never a second copy. This module
+re-exports every one of those names and
 adds on top the jsonschema-validation surfaces plus the pinned-enum readers
 that the test-side oracles grade against:
 
@@ -108,7 +107,7 @@ def recovery_by_code() -> dict[str, str]:
     can silently drift to a different key filter.
 
     Reads through this module's own ``load()``, so it stays independent of
-    ``src.core.exceptions.RECOVERY_BY_WIRE_CODE``: a test-side oracle that
+    ``src.core.errors.codes.CODE_TABLE``: a test-side oracle that
     imported src's table would agree with the thing it grades instead of
     grading it.
 
@@ -185,11 +184,33 @@ def _retrieve(uri: str) -> referencing.Resource:
 
 
 def validator_for(ref: str) -> Draft7Validator:
-    """A Draft7Validator for *ref* with full (relative) $ref resolution wired."""
-    _, schema = _resolve_and_load(ref)
+    """A Draft7Validator for *ref* with full (relative) $ref resolution wired.
+
+    *ref* may carry a JSON-pointer fragment naming a subschema —
+    ``"media-buy/create-media-buy-response.json#/oneOf/0"`` validates against
+    that ONE branch of a branching response. The registry is still built from
+    the whole file and keyed on its ``$id``, so the branch's own relative
+    ``$ref``s resolve exactly as they do when the whole document is validated.
+    """
+    file_ref, _, pointer = ref.partition("#")
+    _, schema = _resolve_and_load(file_ref)
     registry: referencing.Registry = referencing.Registry(retrieve=_retrieve)
     registry = registry.with_resource(schema["$id"], DRAFT7.create_resource(schema))
-    return Draft7Validator(schema, registry=registry)
+
+    target = schema
+    if pointer:
+        for token in (t for t in pointer.split("/") if t):
+            key = int(token) if token.isdigit() else token.replace("~1", "/").replace("~0", "~")
+            try:
+                target = target[key]  # type: ignore[index]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise PinnedSchemaError(f"Schema ref {ref!r}: no such subschema at {pointer!r}") from exc
+        # The subschema inherits the document's identity so its relative refs
+        # resolve; without this the branch is an anonymous fragment and every
+        # "../core/*.json" inside it is unresolvable.
+        target = {"$id": schema["$id"], **target}
+
+    return Draft7Validator(target, registry=registry)
 
 
 def validate_against_pinned_schema(filename: str, data: Any) -> None:

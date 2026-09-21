@@ -37,6 +37,8 @@ dependencies = [
     "waitress>=3.0.0",
     "pytz>=2024.1",
     "httpx>=0.28.1",
+    "idna>=3.7",  # explicit: src/vendor/adcp_canonical needs UTS-46 ToASCII (NOT str.encode('idna'), which is IDNA2003). Drops out with the vendored copy — see salesagent-3xcdk
+
     "a2a-cli>=0.2.0",
     "a2a-sdk[http-server]>=1.0.1", # a2a-sdk 1.0 (protobuf API, required by adcp>=4.3.0)
     "jinja2>=3.1.0",
@@ -61,6 +63,12 @@ dependencies = [
     "pyasn1>=0.6.4",  # GHSA-jr27-m4p2-rc6r; PYSEC-2026-3455/3456/3457
     "mako>=1.3.12",  # GHSA-2h4p-vjrc-8xpq (transitive via alembic)
     "click>=8.3.3",  # PYSEC-2026-2132 (transitive via flask/uvicorn)
+    # Transitive via pydantic-ai-slim -> genai-prices. 2.3.0 carries four advisories:
+    # httpcore2 GHSA-7mj9-2mp8-4m2p, httpx2 GHSA-h4x7-gw46-3wm6 / GHSA-pf96-p4fj-6566 /
+    # GHSA-8xx6-hgc6-gc2m. Floors are the highest fix version each names, so uv-secure
+    # (the security-audit gate) has nothing left to report.
+    "httpcore2>=2.10.0",  # GHSA-7mj9-2mp8-4m2p
+    "httpx2>=2.12.0",  # GHSA-h4x7-gw46-3wm6 + GHSA-pf96-p4fj-6566 + GHSA-8xx6-hgc6-gc2m
 ]
 
 
@@ -86,6 +94,17 @@ Changelog = "https://github.com/prebid/salesagent/blob/main/CHANGELOG.md"
 [dependency-groups]
 dev = [
     "asgi-lifespan>=2.1.0",
+    # The structural-rule scanner `make quality-ci` runs over .ast-grep/rules/.
+    # Declared here rather than left to a system install so `uv run ast-grep`
+    # resolves to a pinned copy: a PATH lookup finds whatever version a developer
+    # happens to have, and a CI runner has none at all.
+    #
+    # EXACT, not a floor. Whether a `# ast-grep-ignore:` directive still suppresses
+    # when a reason follows the rule id changed between 0.41.1 and 0.45.3, and every
+    # exemption in tests/ is written in the form the pinned version honours. A floor
+    # would let CI resolve a version that silently un-suppresses all of them;
+    # tests/unit/test_ast_grep_credential_header_ban.py grades the pin for that reason.
+    "ast-grep-cli==0.45.3",
     "factory-boy>=3.3.0",
     "mypy>=1.18.2",
     "pytest>=9.0.3",  # GHSA-6w46-j5rx-g56g
@@ -94,7 +113,6 @@ dev = [
     "pytest-mock>=3.14.1",
     "pytest-timeout>=2.3.1",
     "ruff>=0.8.0",
-    "datamodel-code-generator>=0.26.0",
     "jsonref>=1.1.0",
     "types-psycopg2>=2.9.21.20251012",
     "types-requests>=2.32.4.20250913",
@@ -131,6 +149,7 @@ exclude = [
     ".tox",
     ".venv",
     ".claude/worktrees",  # Agent worktrees have their own checkouts
+    "src/vendor",  # Third-party source copied verbatim; we are forbidden from editing it, so linting it can only produce findings nobody may act on. Bounded by tests/unit/test_architecture_vendored_code.py
     "_build",
     "buck-out",
     "build",
@@ -160,6 +179,7 @@ ignore = [
     "C901",    # complexity
     "PLR0912", # too-many-branches
     "PLR0915", # too-many-statements
+    "F841",    # unused local variable — was a blanket keep until it hid a computed-then-dropped warning
     #
     # --- Permanently accepted (low-signal style; ADR-009) ---
     "PLR0911", # too-many-return-statements — guard-clause returns; low signal
@@ -170,13 +190,11 @@ ignore = [
     "E501",    # Handled by ruff formatter; manual enforcement would conflict
     "E402",    # Flask app (admin_ui.py) requires imports after app config
     "E722",    # Bare excepts in error-recovery paths (adapters, auth) — prefer specific exceptions
-    "F821",    # False positives from conditional imports and TYPE_CHECKING blocks
     "F403",    # Star imports in __init__.py re-exports — prefer explicit imports when touching
     "F405",    # Consequence of F403
     "E741",    # Short `l` in math-heavy loops — renaming hurts readability
     "B904",    # raise-without-from in adapter error handling — add `from e` when touching
     "B027",    # Empty methods in BaseAdapter — intentional optional interface, not abstract
-    "F841",    # Unused vars in complex destructuring — each reviewed, kept for clarity
 ]
 
 
@@ -193,7 +211,28 @@ max-statements = 50
 "inspect.getsource".msg = "inspect.getsource() is banned in tests. Write behavioral tests that exercise the actual code path instead of asserting strings exist in source code. See salesagent-gqzp."
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["E722", "F821"]
+# F821 is no longer ignored globally. It was, on the stated grounds of "false positives
+# from conditional imports and TYPE_CHECKING blocks" -- but almost nothing it flagged was
+# that. Turning it on surfaced 9 real undefined names under tests/, every one a latent
+# NameError: a `logger` referenced by two except blocks that would have masked the very
+# delete failure they report, an `AdCPSalesAgentError` raised but never imported, a
+# `wire_absent` step helper never imported into two step modules, and three missing
+# annotation imports. All nine are fixed rather than pinned.
+#
+# The ignore also cost a live bug: a `context` block edited into the wrong builder
+# function referenced an undeclared name, ruff stayed silent, and it surfaced as four
+# NameErrors only after a 25-minute in-network e2e run.
+#
+# The 9 remaining violations are all in src/ and are likewise NOT the documented false
+# positive -- they are undefined names (`oauth_client_id`, `formats`, `_inspect`, ...)
+# that look latent-real but sit in admin code this change does not touch. They are pinned
+# per FILE so the rule stays live everywhere else and this list can only shrink.
+# FIXME(#2099): investigate and remove these four entries.
+"src/admin/blueprints/api.py" = ["F821"]
+"src/admin/blueprints/products.py" = ["F821"]
+"src/admin/tests/unit/test_auth.py" = ["F821"]
+"src/core/schemas/__init__.py" = ["F821"]
+"tests/*" = ["E722"]
 "admin_ui.py" = ["E402", "E722"]
 
 # ─── Coverage configuration ──────────────────────────────────────

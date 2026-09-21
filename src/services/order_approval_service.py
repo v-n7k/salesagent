@@ -14,7 +14,7 @@ from typing import Any
 from sqlalchemy import select
 
 from src.core.database.database_session import get_db_session
-from src.core.database.models import PushNotificationConfig, SyncJob
+from src.core.database.models import SyncJob
 from src.core.security.webhook_egress import deliver_webhook
 from src.core.thread_registry import ThreadRegistry
 from src.core.webhook_validator import webhook_url_for_log
@@ -213,7 +213,7 @@ def _run_approval_thread(
         from src.adapters.gam.client import GAMClientManager
 
         client_manager = GAMClientManager(gam_config, adapter_config.gam_network_code)
-        orders_manager = GAMOrdersManager(client_manager, dry_run=False)
+        orders_manager = GAMOrdersManager(client_manager)
 
         # Poll GAM approval endpoint
         for attempt in range(1, max_attempts + 1):
@@ -391,6 +391,32 @@ def _mark_approval_failed(
         logger.error(f"Failed to mark approval failed: {e}")
 
 
+def _lookup_approval_webhook_auth(
+    tenant_id: str, principal_id: str, webhook_url: str
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve ``(scheme, credentials, validation_token)`` for this webhook URL.
+
+    The lookup goes through :class:`PushNotificationConfigRepository` rather than
+    a hand-written ``select`` here, so the (tenant, principal, active) scope that
+    every config lookup must carry is enforced in one place instead of being
+    retyped at this call site.
+
+    The three columns are read INSIDE the session and returned as plain values:
+    the config row itself never escapes the session, so no caller can touch a
+    detached instance, and the auth decision is resolved exactly once per
+    delivery.
+    """
+    from src.core.database.repositories.push_notification_config import PushNotificationConfigRepository
+
+    with get_db_session() as db:
+        config = PushNotificationConfigRepository(db, tenant_id).find_by_url(
+            principal_id, webhook_url, active_only=True
+        )
+        if config is None:
+            return None, None, None
+        return config.authentication_type, config.authentication_token, config.validation_token
+
+
 def _approval_webhook_headers(validation_token: str | None) -> dict[str, str]:
     """Build HTTP headers for an order-approval webhook POST.
 
@@ -556,12 +582,7 @@ def _send_approval_webhook(
         if attempts is not None:
             payload["attempts"] = attempts
 
-        # Get webhook authentication from push notification config
-        with get_db_session() as db:
-            stmt = select(PushNotificationConfig).filter_by(
-                tenant_id=tenant_id, principal_id=principal_id, url=webhook_url, is_active=True
-            )
-            config = db.scalars(stmt).first()
+        scheme, credentials, validation_token = _lookup_approval_webhook_auth(tenant_id, principal_id, webhook_url)
 
         # The egress seam validates the URL as part of sending it, so there is no
         # separate SSRF pre-flight here: one refusal path, raised as
@@ -569,9 +590,9 @@ def _send_approval_webhook(
         _post_approval_webhook(
             webhook_url,
             payload,
-            _approval_webhook_headers(config.validation_token if config else None),
-            scheme=config.authentication_type if config else None,
-            credentials=config.authentication_token if config else None,
+            _approval_webhook_headers(validation_token),
+            scheme=scheme,
+            credentials=credentials,
             tenant_id=tenant_id,
             principal_id=principal_id,
             # Threaded through from the caller, not looked up here: _send_approval_webhook

@@ -11,6 +11,8 @@ import psycopg2
 import pytest
 from psycopg2.extras import DictCursor
 
+from tests.factories.principal import plaintext_token_for
+
 # Database configuration
 DB_URL = os.environ.get(
     "DATABASE_URL",
@@ -39,11 +41,11 @@ def test_database_queries(integration_db):
         session.add(tenant)
 
         # Create principal
-        principal = Principal(
+        principal = Principal.with_token(
+            plaintext_token_for("test_principal"),
             tenant_id=tenant_id,
             principal_id="test_principal",
             name="Test Principal",
-            access_token="test_token",
             platform_mappings={"mock": {"advertiser_id": "test-advertiser"}},
         )
         session.add(principal)

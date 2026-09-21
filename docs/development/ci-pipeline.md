@@ -303,7 +303,7 @@ not persist baseline writes.
 Checks invoked directly by `make quality-ci` (not via `pre-commit run --all-files` in the Quality Gate):
 
 - **CI-only** (no commit/pre-push stage): `check_code_duplication`, `check-gam-auth-support`,
-  `check_response_attribute_access`, `check_roundtrip_tests`.
+  `check_response_attribute_access`.
 - **Dual-stage** (`pre-push + ci-step` in the coverage map): `check-route-conflicts`,
   `type-ignore-no-regression`, `check-docs-links`, `no-hardcoded-urls`.
 

@@ -85,7 +85,8 @@ def test_serialize_tenant_nullable_fields_have_defaults(integration_db):
         # TEST: Nullable scalar fields are None (no default)
         assert result["virtual_host"] is None
         assert result["slack_webhook_url"] is None
-        assert result["admin_token"] is None
+        # admin_token assertion removed: serialize_tenant_to_dict no longer emits the key
+        # (84a86e019 dropped the tenant admin credential; principal tokens are hashed).
 
 
 @pytest.mark.requires_db

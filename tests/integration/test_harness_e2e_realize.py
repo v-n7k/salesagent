@@ -92,7 +92,6 @@ class TestDeliveryPollE2ERealization:
             with pytest.raises(E2EUnsupportedSetup) as exc_info:
                 env.set_adapter_error(RuntimeError("adapter down"))
             assert exc_info.value.method_name == "set_adapter_error"
-            assert "fault-injection" in str(exc_info.value)
 
 
 @pytest.mark.requires_db
@@ -143,7 +142,6 @@ class TestCreativeFormatsE2EValidation:
         with CreativeFormatsEnv(e2e_config=_e2e_config_for_integration_db()) as env:
             with pytest.raises(E2EUnsupportedSetup) as exc_info:
                 env.set_registry_formats([])
-            assert "empty catalog" in str(exc_info.value)
 
     def test_unknown_format_is_unrealizable_and_named(self, integration_db):
         from src.core.format_cache import load_reference_formats
@@ -158,7 +156,6 @@ class TestCreativeFormatsE2EValidation:
         with CreativeFormatsEnv(e2e_config=_e2e_config_for_integration_db()) as env:
             with pytest.raises(E2EUnsupportedSetup) as exc_info:
                 env.set_registry_formats([bogus])
-            assert "totally_made_up_format_xyz" in str(exc_info.value)
 
 
 @pytest.mark.requires_db

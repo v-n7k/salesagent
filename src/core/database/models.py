@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
+from typing import Any
 from uuid import uuid4
 
 from adcp.types import BrandReference
@@ -11,6 +12,9 @@ from adcp.types.generated_poc.core.account import (
     CreditLimit,
     GovernanceAgent,
     Setup,
+)  # TODO: no stable alias in adcp.types
+from adcp.types.generated_poc.core.business_entity import (
+    BusinessEntity,
 )  # TODO: no stable alias in adcp.types
 from sqlalchemy import (
     DECIMAL,
@@ -32,9 +36,17 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
+from src.core.billing_policy import BILLING_PARTY_VALUES
+from src.core.credentials import hash_token, mint_token, token_prefix
 from src.core.database.json_type import JSONType
+from src.core.errors.details import ConfigurationDetails
 from src.core.exceptions import AdCPConfigurationError, AdCPPersistedStateError
 from src.core.json_validators import JSONValidatorMixin
+
+# The ONE NotificationConfig, whose authentication block is the one Authentication class
+# (src/core/schemas/notification.py): a stored row reads back as the same type the request
+# chain carries, so nothing downstream holds two spellings of the block.
+from src.core.schemas.notification import NotificationConfig
 
 logger = logging.getLogger(__name__)
 
@@ -69,13 +81,19 @@ class Tenant(Base, JSONValidatorMixin):
     slack_webhook_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     slack_audit_webhook_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     hitl_webhook_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    admin_token: Mapped[str | None] = mapped_column(String(100), nullable=True)
     # List of format ID strings (just the id part, not full FormatId objects)
     # Validated at database level via CHECK constraint (see migration: rename_formats_to_format_ids)
     auto_approve_format_ids: Mapped[list[str] | None] = mapped_column(JSONType, nullable=True)
     human_review_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     policy_settings: Mapped[dict | None] = mapped_column(JSONType, nullable=True)
     supported_billing: Mapped[list[str] | None] = mapped_column(JSONType, nullable=True)  # BR-RULE-059
+    # Default FALSE: a seller advertises sandbox support by configuring it, never
+    # by the absence of configuration. A true-by-default column made every
+    # unconfigured tenant declare account.sandbox support it had not opted into,
+    # and made the sync_accounts provisioning gate admit sandbox entries for it.
+    account_sandbox: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )  # #1592 C2/A2
     account_approval_mode: Mapped[str | None] = mapped_column(
         String(50), nullable=True
     )  # BR-RULE-060: auto|credit_review|legal_review
@@ -92,6 +110,21 @@ class Tenant(Base, JSONValidatorMixin):
         JSONType,
         nullable=True,
         comment="Advertising policy configuration with prohibited categories, tactics, and advertisers",
+    )
+
+    # Per-tenant AdCP capability declarations (#1592 T1a).
+    # STRICT policy: this store may carry only blocks the implementation BACKS --
+    # business facts the capabilities response echoes (trusted_match surfaces,
+    # measurement catalog, adapter-backed creative_specs, legacy axe_integrations).
+    # It deliberately has NO field for a behavioral posture we do not implement
+    # (request_signing / webhook_signing / identity signing / webhook or offline
+    # report delivery): declaring one would promise the buyer behavior production
+    # lacks. Those blocks land with RFC 9421 signing (#1291).
+    # NULL means "nothing declared" and reproduces the pre-#1592 wire exactly.
+    capability_declarations: Mapped[dict | None] = mapped_column(
+        JSONType,
+        nullable=True,
+        comment="Implementation-backed AdCP capability declaration blocks (#1592); NULL = nothing declared",
     )
 
     # Pydantic AI configuration for multi-model support
@@ -132,7 +165,19 @@ class Tenant(Base, JSONValidatorMixin):
 
     # Relationships
     products = relationship("Product", back_populates="tenant", cascade="all, delete-orphan")
-    principals = relationship("Principal", back_populates="tenant", cascade="all, delete-orphan")
+    # No `principals` collection. It had no reader, and a relationship traversal is the
+    # one way to reach Principal rows without importing the class — which is what the
+    # TID251 ban on `src.core.database.models.Principal` outside the four repository
+    # modules exists to prevent. Deleting a tenant still deletes its principals: the
+    # DATABASE does it, because alembic revision 390461e816ea sets the
+    # principals.tenant_id foreign key to ON DELETE CASCADE. Before that revision the
+    # migrated schema had NO ACTION — the `ondelete="CASCADE"` declared on the mapped
+    # column never altered the constraint `initial_schema` had already created — and this
+    # collection's `cascade="all, delete-orphan"` was the only thing deleting them, which
+    # is why the constraint had to change when the collection went. The hard-delete path
+    # in src/admin/tenant_management_api.py also deletes principals explicitly through
+    # PrincipalRepository.delete_all; that is now belt-and-braces, not the guarantee.
+    # Principal.tenant survives: the other direction yields a tenant, not a principal.
     users = relationship("User", back_populates="tenant", cascade="all, delete-orphan")
     accounts = relationship("Account", back_populates="tenant", cascade="all, delete-orphan")
     media_buys = relationship("MediaBuy", back_populates="tenant", cascade="all, delete-orphan", overlaps="media_buys")
@@ -181,7 +226,7 @@ class Tenant(Base, JSONValidatorMixin):
         try:
             return decrypt_api_key(self._gemini_api_key)
         except ValueError as exc:
-            raise AdCPConfigurationError(f"Failed to decrypt Gemini API key for tenant {self.tenant_id}") from exc
+            raise AdCPConfigurationError(details=ConfigurationDetails(tenant_id=self.tenant_id)) from exc
 
     @gemini_api_key.setter
     def gemini_api_key(self, value: str | None) -> None:
@@ -473,6 +518,7 @@ class PricingOption(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(50), nullable=False)
     product_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    pricing_option_id: Mapped[str] = mapped_column(String(100), nullable=False)
     pricing_model: Mapped[str] = mapped_column(String(20), nullable=False)
     rate: Mapped[Decimal | None] = mapped_column(DECIMAL(10, 2), nullable=True)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
@@ -491,7 +537,71 @@ class PricingOption(Base):
             ondelete="CASCADE",
         ),
         Index("idx_pricing_options_product", "tenant_id", "product_id"),
+        UniqueConstraint(
+            "tenant_id",
+            "product_id",
+            "pricing_option_id",
+            name="uq_pricing_options_option_id",
+        ),
     )
+
+    @staticmethod
+    def default_option_id(pricing_model: str, currency: str, is_fixed: bool) -> str:
+        """The id assigned to a row whose writer supplies none.
+
+        ``{model}_{currency}_{fixed|auction}``, lowercase. This is a DEFAULT for a new
+        row, not a derivation: once written, the column is what every reader reads, and a
+        publisher is free to give an option any id it likes.
+
+        CPA is the one model whose suffix ignores *is_fixed*. It always prices off
+        ``fixed_price`` (``pricing-options/cpa-option.json`` puts it in ``required``), so
+        an ``auction`` suffix would name a shape the option cannot take.
+        """
+        model = pricing_model.lower()
+        suffix = "fixed" if (is_fixed or model == "cpa") else "auction"
+        return f"{model}_{currency.lower()}_{suffix}"
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        pricing_model: str,
+        tenant_id: str | None = None,
+        product_id: str | None = None,
+        currency: str,
+        is_fixed: bool,
+        rate: Decimal | None = None,
+        pricing_option_id: str | None = None,
+        price_guidance: dict | None = None,
+        parameters: dict | None = None,
+        min_spend_per_package: Decimal | None = None,
+    ) -> "PricingOption":
+        """A row for *product_id*, defaulting ``pricing_option_id`` when the writer has none.
+
+        ``tenant_id``/``product_id`` are optional because a writer can build the row before
+        the product exists — the admin create form parses its pricing options out of the
+        submitted form, then stamps both ids once the product row has been flushed. The
+        columns stay NOT NULL, so a row that reaches the database without them is refused
+        there rather than accepted quietly.
+
+        Every writer goes through here so that no row can reach the database without the
+        identifier the spec requires. ``pricing-options/*.json`` puts ``pricing_option_id``
+        in ``required`` for all nine models, and ``media-buy/package-request.json`` marks
+        it ``x-entity: product_pricing_option`` — a reference to a stored entity, which is
+        what makes storing it rather than recomputing it the correct shape.
+        """
+        return cls(
+            tenant_id=tenant_id,
+            product_id=product_id,
+            pricing_option_id=pricing_option_id or cls.default_option_id(pricing_model, currency, is_fixed),
+            pricing_model=pricing_model,
+            rate=rate,
+            currency=currency,
+            is_fixed=is_fixed,
+            price_guidance=price_guidance,
+            parameters=parameters,
+            min_spend_per_package=min_spend_per_package,
+        )
 
 
 class CurrencyLimit(Base):
@@ -545,14 +655,22 @@ class Principal(Base, JSONValidatorMixin):
     principal_id: Mapped[str] = mapped_column(String(50), primary_key=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     platform_mappings: Mapped[dict] = mapped_column(JSONType, nullable=False)
-    access_token: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    #: sha256 of the token, never the token (src/core/credentials.py). Unique across tenants
+    #: so a lookup by hash is an index hit; the resolver still scopes it by tenant.
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    #: The displayable head of the token, so an operator can tell tokens apart.
+    token_prefix: Mapped[str] = mapped_column(String(16), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
 
-    # Relationships
-    tenant = relationship("Tenant", back_populates="principals")
+    # Relationships. `tenant` has no back_populates any more: the collection it paired
+    # with, Tenant.principals, is deleted (salesagent-3cs7o.26). This direction stays —
+    # it yields a TENANT row from a principal, which is not the traversal the ban on
+    # importing this class is about, and every ORM factory in tests/factories builds its
+    # parent row through exactly this attribute.
+    tenant = relationship("Tenant", overlaps="principals")
     media_buys = relationship("MediaBuy", back_populates="principal", overlaps="media_buys")
     strategies = relationship("Strategy", back_populates="principal", overlaps="strategies")
     push_notification_configs = relationship(
@@ -563,8 +681,33 @@ class Principal(Base, JSONValidatorMixin):
 
     __table_args__ = (
         Index("idx_principals_tenant", "tenant_id"),
-        Index("idx_principals_token", "access_token"),
+        Index("idx_principals_token_hash", "token_hash"),
     )
+
+    @classmethod
+    def issue(cls, **fields: Any) -> "tuple[Principal, str]":
+        """A new principal with a freshly minted token, and the token itself.
+
+        The ONE way a principal gets a credential. The plaintext is returned to the caller
+        for showing once and is stored nowhere; the row carries its hash and prefix.
+        """
+        token = mint_token()
+        return cls.with_token(token, **fields), token
+
+    @classmethod
+    def with_token(cls, token: str, **fields: Any) -> "Principal":
+        """A new principal whose token is *token*: for seeds and CI fixtures whose token is
+        documented in advance. The row still stores only the hash."""
+        return cls(token_hash=hash_token(token), token_prefix=token_prefix(token), **fields)
+
+    def rotate_token(self) -> str:
+        """Replace this principal's token; returns the new plaintext, to be shown once.
+
+        The old token stops resolving the moment the row is committed."""
+        token = mint_token()
+        self.token_hash = hash_token(token)
+        self.token_prefix = token_prefix(token)
+        return token
 
     def get_adapter_id(self, adapter_name: str) -> str | None:
         """Get the adapter-specific ID for this principal.
@@ -646,7 +789,7 @@ class TenantAuthConfig(Base):
         try:
             return decrypt_api_key(self.oidc_client_secret_encrypted)
         except ValueError as exc:
-            raise AdCPConfigurationError(f"Failed to decrypt OIDC client secret for tenant {self.tenant_id}") from exc
+            raise AdCPConfigurationError(details=ConfigurationDetails(tenant_id=self.tenant_id)) from exc
 
     @oidc_client_secret.setter
     def oidc_client_secret(self, value: str | None) -> None:
@@ -670,7 +813,12 @@ class Creative(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     agent_url: Mapped[str] = mapped_column(String(500), nullable=False)
     format: Mapped[str] = mapped_column(String(100), nullable=False)
-    status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
+    # AdCP CreativeStatus member: the buyer-facing reader (list_creatives) parses this
+    # column through the closed spec enum, so a non-member default (this was "pending")
+    # makes every row written with the field omitted unreadable. No CHECK constraint or
+    # PG enum backs it — the spec enum widens over time and DDL would turn a spec bump
+    # into a boot-blocking migration.
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending_review")
 
     # Data field stores creative content and metadata as JSON
     data: Mapped[dict] = mapped_column(JSONType, nullable=False, default=dict)
@@ -828,6 +976,23 @@ class Account(Base):
     governance_agents: Mapped[list[GovernanceAgent] | None] = mapped_column(
         JSONType(model=GovernanceAgent, is_list=True), nullable=True
     )
+    # Account-level notification subscribers (#1592 T2). Whole-array declarative
+    # replace (maxItems 16, always read and written entire), so a column rather
+    # than a table: there is no cross-account query and no per-entry lifecycle.
+    # NULL and [] are DIFFERENT states the wire must distinguish -- NULL means
+    # "never configured" (the field is omitted from the echo) and [] means
+    # "explicitly cleared" (the echo carries an empty array). JSONType uses
+    # JSONB(none_as_null=True), so that distinction survives the round trip; do
+    # not collapse it with a falsy check.
+    notification_configs: Mapped[list[NotificationConfig] | None] = mapped_column(
+        JSONType(model=NotificationConfig, is_list=True), nullable=True
+    )
+    # Legal/billing entity, permitted in BOTH sync_accounts entry modes and
+    # echoed back on the response ("echoed from the request ... Bank details are
+    # omitted (write-only)"). Whole-object declarative replace, so a column
+    # rather than a table. `bank` IS persisted (the seller needs it to bill) and
+    # stripped only on the way out -- see _scrub_business_entity.
+    billing_entity: Mapped[BusinessEntity | None] = mapped_column(JSONType(model=BusinessEntity), nullable=True)
     sandbox: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=False)
     ext: Mapped[dict | None] = mapped_column(JSONType, nullable=True)
 
@@ -850,7 +1015,7 @@ class Account(Base):
             name="ck_accounts_status",
         ),
         CheckConstraint(
-            "billing IS NULL OR billing IN ('operator', 'agent')",
+            "billing IS NULL OR billing IN ({})".format(", ".join(repr(v) for v in BILLING_PARTY_VALUES)),
             name="ck_accounts_billing",
         ),
         CheckConstraint(
@@ -864,6 +1029,42 @@ class Account(Base):
         Index("idx_accounts_tenant", "tenant_id"),
         Index("idx_accounts_status", "status"),
         Index("idx_accounts_operator", "operator"),
+        # The natural key is IDENTITY, not a search convenience: every resolver
+        # reads this tuple (get_by_natural_key resolves a buyer's sync_accounts
+        # entry, list_by_natural_key detects ambiguity). salesagent-8sfr made the
+        # components immutable so an account cannot be re-keyed; without this
+        # index a second CREATE could still land on an occupied key, and then
+        # get_by_natural_key().first() answers non-deterministically while
+        # list_by_natural_key reports the key unresolvable. The repository's
+        # collision check is the good error message; this index is the invariant,
+        # and the only thing that closes the check-then-insert race.
+        #
+        # Two different NULL mechanics, each doing its own job:
+        # - COALESCE(sandbox, false) because NULL and false are the SAME key to
+        #   get_by_natural_key ("sandbox IS NULL OR sandbox = false"); NULLS NOT
+        #   DISTINCT would not merge them, since it equates NULLs to each other,
+        #   never to a non-NULL value.
+        # - NULLS NOT DISTINCT so a NULL `operator` or a NULL brand_id still
+        #   enforces uniqueness on the rest of the tuple, matching the sibling
+        #   idx_media_buys_idempotency_key / idx_idempotency_attempts_lookup.
+        #
+        # PARTIAL on brand.domain for the same reason that sibling is partial on
+        # idempotency_key: an account with no brand domain has no natural key at
+        # all. The admin form permits one (brand is None when the field is blank)
+        # and no resolver can ever reach it — every lookup supplies a domain — so
+        # constraining keyless rows would forbid a legitimate shape while
+        # preventing no ambiguity.
+        Index(
+            "uq_accounts_natural_key",
+            "tenant_id",
+            "operator",
+            text("(brand ->> 'domain')"),
+            text("(brand ->> 'brand_id')"),
+            text("COALESCE(sandbox, false)"),
+            unique=True,
+            postgresql_nulls_not_distinct=True,
+            postgresql_where=text("(brand ->> 'domain') IS NOT NULL"),
+        ),
     )
 
 
@@ -900,7 +1101,7 @@ class AgentAccountAccess(Base):
 # carries no commitment instant for these — on get_media_buys it is serialized as
 # PRESENT-AND-NULL, because the pinned item schema types it {"type": ["string",
 # "null"]} AND lists it in `required`. "Absent" is only true of the create
-# response's not-yet-committed arms, which omit the field entirely.
+# response's not-yet-committed branches, which omit the field entirely.
 #
 # This is the SINGLE source of truth for "seller committed", consulted by both the
 # create path and the repository's write-once confirmation stamp
@@ -967,11 +1168,16 @@ class PersistedMediaBuyStatus(StrEnum):
         """
         member = cls.parse_or_none(raw)
         if member is None:
-            subject = f"media buy {media_buy_id!r} " if media_buy_id else ""
+            # The buy, the column and the legal member set travel as typed details,
+            # not as an authored message: buyer-facing text is a function of the code
+            # (``AdCPSalesAgentError.message``), so the raise site names the subject
+            # instead of writing the sentence.
             raise AdCPPersistedStateError(
-                f"{subject}carries persisted status {raw!r}, which is not a member of "
-                f"the media_buys.status vocabulary; expected one of "
-                f"{sorted(m.value for m in cls)}",
+                details=ConfigurationDetails(
+                    media_buy_id=media_buy_id,
+                    rejected_value=raw,
+                    accepted_values=sorted(m.value for m in cls),
+                ),
                 field="status",
             )
         return member
@@ -1157,6 +1363,12 @@ class MediaBuy(Base):
 
     # Relationships
     tenant = relationship("Tenant", back_populates="media_buys", overlaps="media_buys")
+    #: ADMIN-ONLY READ. One reader: src/admin/services/dashboard_service.py, which needs
+    #: the advertiser's display name and joinedloads this through MediaBuyRepository. A
+    #: tool must not traverse it — a tool reads `identity.principal`, and reaching a
+    #: Principal row off a media buy is the traversal the TID251 ban on the ORM class
+    #: cannot see. Tenant.principals was deleted for that reason (salesagent-3cs7o.26);
+    #: this one survives because the admin UI genuinely reads it.
     principal = relationship(
         "Principal",
         foreign_keys=[tenant_id, principal_id],
@@ -1425,9 +1637,6 @@ class AdapterConfig(Base):
     )
     adapter_type: Mapped[str] = mapped_column(String(50), nullable=False)
 
-    # Mock adapter
-    mock_dry_run: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-
     # Google Ad Manager
     gam_network_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
     gam_refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -1529,9 +1738,7 @@ class AdapterConfig(Base):
         try:
             return decrypt_api_key(self._gam_service_account_json)
         except ValueError as exc:
-            raise AdCPConfigurationError(
-                f"Failed to decrypt GAM service account JSON for tenant {self.tenant_id}"
-            ) from exc
+            raise AdCPConfigurationError(details=ConfigurationDetails(tenant_id=self.tenant_id)) from exc
 
     @gam_service_account_json.setter
     def gam_service_account_json(self, value: str | None) -> None:
@@ -2300,10 +2507,12 @@ class PushNotificationConfig(Base, JSONValidatorMixin):
     authentication_token: Mapped[str | None] = mapped_column(Text, nullable=True)
     validation_token: Mapped[str | None] = mapped_column(Text, nullable=True)
     webhook_secret: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    # Which protocol the buyer registered over. NULL means a row written before
-    # this column existed; readers fall back to MCP, which is what every sender
-    # did unconditionally before (salesagent-pldmk.39).
-    protocol: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # The two values core/push-notification-config.json says the seller MUST echo
+    # VERBATIM into every webhook payload built against this registration. Stored
+    # because the sender that echoes them runs long after the request that carried
+    # them, and the spec forbids recovering operation_id from the URL.
+    operation_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    token: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()

@@ -14,10 +14,10 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from src.core.config_loader import get_tenant_config
 from src.core.database.database_session import get_db_session
 from src.core.database.models import Context, ObjectWorkflowMapping, WorkflowStep
 from src.core.schemas import MediaPackage
+from src.core.tenant_context import TenantContext
 from src.services.slack_notifier import SlackNotifier
 
 logger = logging.getLogger(__name__)
@@ -172,13 +172,8 @@ class BaseWorkflowManager:
             action_details: Details about the workflow step
         """
         try:
-            # get_tenant_config takes a config KEY, not a tenant id. Passing
-            # self.tenant_id returned None, and the .get("slack", {}) that followed
-            # raised AttributeError into the broad handler below — so this
-            # notification never fired, for any tenant, including the four GAM
-            # workflow callers that inherit this method. The column is a per-field
-            # tenant column (models.py:68), read by key like every other caller.
-            slack_webhook_url = get_tenant_config("slack_webhook_url")
+            tenant = TenantContext.load(self.tenant_id)
+            slack_webhook_url = tenant.slack_webhook_url if tenant else None
 
             if not slack_webhook_url:
                 self.log("[yellow]No Slack webhook configured - skipping notification[/yellow]")

@@ -11,10 +11,12 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
-import httpx
 import pytest
 import requests
 
@@ -25,8 +27,33 @@ _GETPID = os.getpid
 # tests/e2e/conftest.py -> tests/ -> repo root.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+from scripts.setup.init_database_ci import CI_TEST_TOKEN
+
 # Import contract validation - this automatically validates tool calls at test collection time
 from tests.e2e.conftest_contract_validation import pytest_collection_modifyitems  # noqa: F401
+from tests.utils.database_helpers import production_db_pointed_at
+
+
+@contextmanager
+def admin_stack_env(ports: dict[str, int], build_env: Callable[[str], AbstractContextManager]) -> Iterator[Any]:
+    """Run an admin harness env against the running Docker stack.
+
+    Builds the stack's admin address and hands it to ``build_env``: the env is TOLD its
+    address and never discovers one. Through ``production_db_pointed_at`` it also points
+    ``DATABASE_URL`` plus the cached engine at the SERVER's ``/adcp`` Postgres for the
+    env's lifetime, so the harness's DB reads and factory writes land in the database the
+    HTTP server reads. In-network the runner exports ``E2E_DATABASE_URL``
+    (postgres:5432/adcp, no host port); on the host path the URL is built from the
+    published port. Everything is restored on exit, including on failure.
+    """
+    db_host = os.environ.get("ADCP_TEST_DB_HOST", "localhost")
+    db_port = os.environ.get("ADCP_TEST_DB_PORT", str(ports["postgres_port"]))
+    url = os.environ.get("E2E_DATABASE_URL") or (
+        f"postgresql://adcp_user:secure_password_change_me@{db_host}:{db_port}/adcp"
+    )
+    base_url = f"http://{e2e_host()}:{ports['admin_port']}"
+    with production_db_pointed_at(url), build_env(base_url) as env:
+        yield env
 
 
 def e2e_host() -> str:
@@ -285,8 +312,8 @@ def docker_services_e2e(request):
         # clear of the Linux ephemeral range (32768+), which the 20000-30000
         # choice for those two was already picked to avoid.
         tls_port = int(os.getenv("ADCP_TLS_PORT")) if os.getenv("ADCP_TLS_PORT") else find_free_port(15000, 20000)
-        # webhook-capture's plain-HTTP READBACK control-plane (salesagent-amht.3)
-        # — same dynamic-allocation reasoning as tls_port above (a fixed default
+        # webhook-capture's plain-HTTP READBACK control-plane — same
+        # dynamic-allocation reasoning as tls_port above (a fixed default
         # would let two concurrent stacks cross-wire onto the same host port).
         # DELIVERY never uses this port; it goes through tls_port above.
         webhook_capture_port = (
@@ -300,10 +327,17 @@ def docker_services_e2e(request):
             f"TLS={tls_port}, WebhookCapture={webhook_capture_port}"
         )
 
-        # Set port env vars in os.environ so that:
-        # 1. docker-compose subprocess inherits them via os.environ.copy()
-        # 2. Tests that read ports via os.getenv() (e.g., test_a2a_endpoints_working.py,
-        #    test_landing_pages.py) pick up the correct dynamic ports
+        # Set port env vars in os.environ for ONE consumer: the docker-compose
+        # subprocess, which inherits them via os.environ.copy() at the call below.
+        # Exporting to a child process is what environment variables are for.
+        #
+        # Tests must NOT read these back. A test receives its port from the fixture
+        # that allocated it — this fixture's yielded ports dict, or the `live_server`
+        # URLs built from it. A process-global carries no sender (this fixture,
+        # docker-compose.e2e.yml:146 and scripts/test-stack.sh:174 all write
+        # ADCP_SALES_PORT), no lifetime (a stale value outlives the fixture instead of
+        # failing) and no multiplicity (one variable cannot hold a port per xdist
+        # worker). Env at the edge, data on the inside.
         os.environ["ADCP_SALES_PORT"] = str(mcp_port)
         os.environ["POSTGRES_PORT"] = str(postgres_port)
         os.environ["ADCP_TLS_PORT"] = str(tls_port)
@@ -562,13 +596,19 @@ def docker_services_e2e(request):
         product_count = cursor.fetchone()[0]
         print(f"   Products in database: {product_count}")
 
-        # Count principals
-        cursor.execute("SELECT COUNT(*) FROM principals WHERE access_token = 'ci-test-token'")
+        # Count principals. BY TOKEN HASH: the row stores sha256(token) and a prefix, never
+        # the plaintext, so `WHERE access_token = ...` names a column that does not exist
+        # and raised UndefinedColumn here -- inside the block that reports whether the
+        # stack is seeded at all.
+        from src.core.credentials import hash_token
+
+        ci_token_hash = hash_token(CI_TEST_TOKEN)
+        cursor.execute("SELECT COUNT(*) FROM principals WHERE token_hash = %s", (ci_token_hash,))
         principal_count = cursor.fetchone()[0]
-        print(f"   Principals with ci-test-token: {principal_count}")
+        print(f"   Principals answering ci-test-token: {principal_count}")
 
         # Get principal's tenant_id
-        cursor.execute("SELECT tenant_id FROM principals WHERE access_token = 'ci-test-token'")
+        cursor.execute("SELECT tenant_id FROM principals WHERE token_hash = %s", (ci_token_hash,))
         result = cursor.fetchone()
         if result:
             principal_tenant = result[0]
@@ -664,11 +704,11 @@ def live_server(docker_services_e2e):
 def test_auth_token(live_server):
     """Create or get a test principal with auth token.
 
-    This token must match the one created by src/core/database/database.py::init_db().
+    Reads the constant the seeding script owns, so this fixture cannot hand out a token
+    the stack was not seeded with (``scripts/setup/init_database_ci.py``, which is also
+    the value ``src/core/database/database.py::init_db()`` creates for the demo tenant).
     """
-    # Return the CI test token that is created by init_db() in database.py
-    # This ensures consistency between database initialization and E2E tests
-    return "ci-test-token"
+    return CI_TEST_TOKEN
 
 
 @pytest.fixture
@@ -717,21 +757,6 @@ async def clean_test_data(live_server, request):
     if not request.config.getoption("--keep-data", False):
         # Could add database cleanup here
         pass
-
-
-@pytest.fixture
-async def a2a_client(live_server, test_auth_token):
-    """Provide A2A client for testing."""
-    async with httpx.AsyncClient() as client:
-        client.base_url = live_server["a2a"]
-        client.headers.update(
-            {
-                "Authorization": f"Bearer {test_auth_token}",
-                "X-Test-Session-ID": str(uuid.uuid4()),
-                "X-Dry-Run": "true",
-            }
-        )
-        yield client
 
 
 @pytest.fixture

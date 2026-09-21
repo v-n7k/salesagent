@@ -4,6 +4,23 @@ Each dispatcher calls the env's transport-specific method and wraps the
 result in a TransportResult. The env subclass provides the actual call logic;
 the dispatcher only handles result wrapping and error capture.
 
+ONE DISPATCH FORM. The MCP and A2A dispatchers call ``env.deliver_mcp`` /
+``env.deliver_a2a`` — the single pair ``BaseTestEnv`` owns
+(``tests/harness/_base.py``), which ``call_mcp``/``call_a2a`` delegate to as
+``deliver_*(**kwargs).payload``. There is no second channel: the deprecated
+raw-kwargs dispatch path was deleted once its last 18 call sites migrated, and
+per-env ``call_mcp``/``call_a2a`` re-implementations are banned by
+``tests/unit/test_architecture_harness_single_dispatch.py``. A scenario builds
+the request model; the transport serializes it.
+
+THE WIRE RIDES THE RETURN VALUE. Success-path wire bytes arrive on
+``DeliverResult.wire_response`` and are re-emitted on
+``TransportResult.wire_response``; error-path wire bytes arrive on
+``TransportResult.wire_error_envelope`` from ``client.py``'s per-transport
+unwraps. No dispatcher reads another object's private wire stash — that
+attribute (``_last_wire_response``) is deleted, which is what makes a second
+writer, and a stale wire, structurally impossible.
+
 On error, dispatchers capture the wire error envelope (the raw two-layer dict
 the buyer would see) alongside the reconstructed exception.  New tests should
 assert on ``result.wire_error_envelope`` via ``assert_envelope_shape()`` — see
@@ -22,7 +39,6 @@ from typing import TYPE_CHECKING, Any
 from tests.harness.transport import (
     Transport,
     TransportResult,
-    _envelope_from_adcp_error,
 )
 
 if TYPE_CHECKING:
@@ -44,51 +60,23 @@ if TYPE_CHECKING:
 #   - ``wire_error_envelope`` carries REAL wire bytes or None — NEVER an
 #     envelope the harness rebuilt from the exception it just caught. A
 #     scenario asserting on that field would otherwise grade the rebuild, which
-#     passes whether or not production emitted anything at all. A transport
-#     that genuinely has no wire says so through ``has_wire=False`` and offers
-#     ``_synthesized_error_envelope`` under its own name, as ImplDispatcher
-#     does below.
+#     passes whether or not production emitted anything at all. Every dispatcher
+#     below has a real wire, so None is the honest answer when nothing crossed
+#     it and there is no second field to fall back to.
 #   - ``has_wire`` is declared PER CONSTRUCTION SITE (required and keyword-only
 #     on TransportResult), True only downstream of an actual send/receive; a
-#     catch-all arm that may fire before anything was sent declares False.
-
-
-class ImplDispatcher:
-    """Dispatch via direct ``_impl()`` call.
-
-    IMPL is the in-process direct call — there is no wire by definition.
-    ``wire_error_envelope`` is left ``None`` on this transport; the envelope
-    that production WOULD emit at the boundary is exposed on the separate
-    private ``_synthesized_error_envelope`` field so tests cannot accidentally lean
-    on IMPL to catch real-wire regressions (a regression in the production
-    boundary translator would not change what this dispatcher computes,
-    because both call ``build_two_layer_error_envelope`` on the same
-    in-memory exception). Use A2A, REST, or MCP for wire-shape coverage.
-    """
-
-    def dispatch(self, env: BaseTestEnv, **kwargs: Any) -> TransportResult:
-        try:
-            payload = env.call_impl(**kwargs)
-        except Exception as exc:
-            return TransportResult(
-                has_wire=False,  # in-process call, no wire exists
-                error=exc,
-                _synthesized_error_envelope=_envelope_from_adcp_error(exc),
-            )
-        return TransportResult(
-            payload=payload, envelope={"transport": "impl"}, has_wire=False
-        )  # in-process call, no wire exists
+#     catch-all branch that may fire before anything was sent declares False.
 
 
 class A2ADispatcher:
     """Dispatch via ``handler.on_message_send`` — exercises the full A2A pipeline.
 
-    ``env.call_a2a`` drives ``AdCPRequestHandler.on_message_send`` end-to-end
-    (message parsing → skill routing → handler dispatch → ``_serialize_for_a2a``
+    ``env.deliver_a2a`` drives ``AdCPRequestHandler.on_message_send`` end-to-end
+    (message parsing → skill routing → ``serve`` → ``to_wire``
     → Task/Artifact framing). On a failed Task, the harness reconstructs the
-    ``AdCPError`` from the artifact DataPart and stashes the real wire
-    envelope on the exception via ``_wire_error_envelope`` — read off it by
-    ``client.py``'s ``unwrap_a2a_error``, the one A2A error unwrap.
+    ``AdCPSalesAgentError`` from the artifact DataPart and stashes the real
+    wire envelope on the exception — read off it by ``client.py``'s
+    ``unwrap_a2a_error``, the one A2A error unwrap.
     """
 
     def dispatch(self, env: BaseTestEnv, **kwargs: Any) -> TransportResult:
@@ -118,10 +106,10 @@ class A2ADispatcher:
 
 
 class RestDispatcher:
-    """Dispatch via FastAPI TestClient → route → _raw() → _impl().
+    """Dispatch via FastAPI TestClient → route → invoke_tool() → _impl().
 
-    Identity flows through kwargs to env._run_rest_request(), which pops it
-    and configures the FastAPI auth dep override per-request.
+    The credential flows through kwargs to env._run_rest_request(), which pops it
+    and sends it as the request headers; the production middleware reads it there.
 
     Unlike other dispatchers, REST includes HTTP metadata in the envelope
     (status_code, content_type) since tests may assert on these.
@@ -151,8 +139,8 @@ class RestDispatcher:
 class McpDispatcher:
     """Dispatch via Client(mcp) — full FastMCP pipeline.
 
-    Identity flows through kwargs to env.call_mcp() → _run_mcp_client(),
-    which pops it and dispatches via FastMCP in-memory transport.
+    The credential flows through kwargs to env.deliver_mcp() → _run_mcp_client(),
+    which pops it and presents it as the request headers the tool reads.
     """
 
     def dispatch(self, env: BaseTestEnv, **kwargs: Any) -> TransportResult:
@@ -180,8 +168,8 @@ class McpDispatcher:
 class RestE2EDispatcher:
     """Dispatch via real HTTP through nginx to the Docker stack.
 
-    Exercises the full stack: nginx -> UnifiedAuthMiddleware ->
-    resolve_identity() -> get_principal_from_token() DB lookup -> route
+    Exercises the full stack: nginx -> the live server's header read ->
+    resolver -> get_principal_from_token() DB lookup -> route
     handler -> _impl().
 
     WRAP (``env.build_rest_body`` / ``env.REST_ENDPOINT`` / ``env.REST_METHOD``)
@@ -217,18 +205,17 @@ class RestE2EDispatcher:
                 error=RuntimeError("E2E dispatch requires env.e2e_config (pass e2e_config= to env)"), has_wire=False
             )  # no e2e_config: refused before any httpx call
 
-        # NO_IDENTITY_OVERRIDE default (not None): omitted identity must fall
-        # back to env.identity_for(transport) inside _deliver_e2e_rest, the
-        # same resolution every other transport's omitted-identity dispatch
-        # gets — a bare ``None`` default here would force every omitted-
-        # identity call unauthenticated instead.
-        identity = kwargs.pop("identity", NO_IDENTITY_OVERRIDE)
+        # NO_IDENTITY_OVERRIDE default (not ``{}``): an omitted credential must fall
+        # back to env.credential() inside _deliver_e2e_rest, the same default every
+        # other transport's omitted-credential dispatch gets — a bare ``{}`` default
+        # here would send every omitted-credential call unauthenticated instead.
+        credential = kwargs.pop("credential", NO_IDENTITY_OVERRIDE)
         body = env.build_rest_body(**kwargs)
         endpoint = env.REST_ENDPOINT  # type: ignore[attr-defined]
         method = getattr(env, "REST_METHOD", "post")
         address = ToolAddress(Transport.E2E_REST, name=endpoint, method=method)
 
-        response = _deliver_e2e_rest(env, address, {"url": endpoint, "body": body}, identity)
+        response = _deliver_e2e_rest(env, address, {"url": endpoint, "body": body}, credential)
         return unwrap_rest_response(env, response, Transport.E2E_REST, env.parse_rest_response)
 
 
@@ -268,11 +255,11 @@ class McpE2EDispatcher:
                 "Prefer AdCPTestClient(env).call(tool_name, payload, Transport.E2E_MCP) directly."
             )
 
-        identity = kwargs.pop("identity", NO_IDENTITY_OVERRIDE)
+        credential = kwargs.pop("credential", NO_IDENTITY_OVERRIDE)
         req = kwargs.pop("req", None)
         payload = flatten_payload(req, **kwargs)
 
-        return _dispatch_core(env, Transport.E2E_MCP, tool_name, payload, identity)
+        return _dispatch_core(env, Transport.E2E_MCP, tool_name, payload, credential)
 
 
 class A2AE2EDispatcher:
@@ -305,7 +292,7 @@ class A2AE2EDispatcher:
         from tests.harness.client import _dispatch_core, flatten_payload
         from tests.harness.transport import NO_IDENTITY_OVERRIDE, MissingToolNameError, Transport
 
-        identity = kwargs.pop("identity", NO_IDENTITY_OVERRIDE)
+        credential = kwargs.pop("credential", NO_IDENTITY_OVERRIDE)
         tool_name = kwargs.pop("tool_name", None) or getattr(env, "A2A_SKILL", None)
         if not tool_name:
             raise MissingToolNameError(
@@ -319,20 +306,13 @@ class A2AE2EDispatcher:
         req = kwargs.pop("req", None)
         payload = flatten_payload(req, **kwargs)
 
-        return _dispatch_core(env, Transport.E2E_A2A, tool_name, payload, identity)
+        return _dispatch_core(env, Transport.E2E_A2A, tool_name, payload, credential)
 
 
 DISPATCHERS: dict[
     Transport,
-    ImplDispatcher
-    | A2ADispatcher
-    | RestDispatcher
-    | McpDispatcher
-    | RestE2EDispatcher
-    | McpE2EDispatcher
-    | A2AE2EDispatcher,
+    A2ADispatcher | RestDispatcher | McpDispatcher | RestE2EDispatcher | McpE2EDispatcher | A2AE2EDispatcher,
 ] = {
-    Transport.IMPL: ImplDispatcher(),
     Transport.A2A: A2ADispatcher(),
     Transport.REST: RestDispatcher(),
     Transport.MCP: McpDispatcher(),

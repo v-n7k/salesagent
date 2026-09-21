@@ -89,14 +89,11 @@ class SignalsAgentRegistry:
         agents: list[SignalsAgent] = []
 
         # Load tenant-specific agents from database
-        from sqlalchemy import select
-
         from src.core.database.database_session import get_db_session
-        from src.core.database.models import SignalsAgent as SignalsAgentModel
+        from src.core.database.repositories.agent import SignalsAgentRepository
 
         with get_db_session() as session:
-            stmt = select(SignalsAgentModel).filter_by(tenant_id=tenant_id, enabled=True)
-            db_agents = session.scalars(stmt).all()
+            db_agents = SignalsAgentRepository(session, tenant_id).get_enabled()
 
             agents.extend(self.config_for(db_agent) for db_agent in db_agents)
 
@@ -151,11 +148,11 @@ class SignalsAgentRegistry:
             # would otherwise validate CLEANLY with signals=None — every field is
             # optional — silently producing signals=[] and masking a genuine
             # agent failure as "agent up, 0 signals" (salesagent-9eu class bug).
-            raise AdCPConfigurationError(f"No parseable content in get_signals response from {agent.name}")
+            raise AdCPConfigurationError()
         try:
             parsed = LibraryGetSignalsResponse.model_validate(payload)
         except ValidationError as e:
-            raise AdCPConfigurationError(f"Signals agent {agent.name} returned an invalid response") from e
+            raise AdCPConfigurationError(internal_detail=e) from e
 
         signals = parsed.signals or []
         total_duration = time.time() - start_time
@@ -167,7 +164,6 @@ class SignalsAgentRegistry:
         brief: str,
         tenant_id: str,
         principal_id: str | None = None,
-        context: dict[str, Any] | None = None,
         principal_data: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Get signals from all registered agents for a tenant.
@@ -176,7 +172,6 @@ class SignalsAgentRegistry:
             brief: Search brief/query
             tenant_id: Tenant identifier
             principal_id: Optional principal identifier
-            context: Optional context data (may include promoted_offering)
             principal_data: Optional principal information
 
         Returns:

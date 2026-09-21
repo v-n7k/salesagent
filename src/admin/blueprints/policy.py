@@ -1,12 +1,11 @@
 """Policy management blueprint."""
 
-import json
 import logging
 
 from flask import Blueprint, jsonify, redirect, render_template, request, session, url_for
 from sqlalchemy import select
 
-from src.admin.utils import get_tenant_config_from_db, require_auth
+from src.admin.utils import get_tenant_config_from_db, require_auth, require_tenant_access
 from src.admin.utils.audit_decorator import log_admin_action
 from src.core.audit_logger import AuditLogger
 from src.core.database.database_session import get_db_session
@@ -82,7 +81,7 @@ def index(tenant_id):
 
         recent_checks = []
         for log in audit_logs:
-            details = json.loads(log.details) if log.details else {}
+            details = log.details or {}
             recent_checks.append(
                 {
                     "timestamp": log.timestamp,
@@ -198,7 +197,7 @@ def update(tenant_id):
         with get_db_session() as db_session:
             tenant = db_session.scalars(select(Tenant).filter_by(tenant_id=tenant_id)).first()
             if tenant:
-                tenant.policy_settings = json.dumps(policy_settings)
+                tenant.policy_settings = policy_settings
                 db_session.commit()
 
         return redirect(url_for("policy.index", tenant_id=tenant_id))
@@ -208,7 +207,7 @@ def update(tenant_id):
 
 
 @policy_bp.route("/rules", methods=["GET", "POST"])
-@require_auth()
+@require_tenant_access()
 def rules(tenant_id):
     """Redirect old policy rules URL to new comprehensive policy settings page."""
     return redirect(url_for("policy.index", tenant_id=tenant_id))
