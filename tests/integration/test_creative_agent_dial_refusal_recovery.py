@@ -21,7 +21,7 @@ auto-retry" (pinned ``dist/schemas/3.1.1/enums/error-code.json``
 enumMetadata, same grounding as ``tests/integration/test_creative_agent_egress.py``).
 
 The bug: ``_processing.py``'s ``_create_new_creative``/``_update_existing_creative``
-wrap the dial in a bare ``try`` whose only typed arm is
+wrap the dial in a bare ``try`` whose only typed branch is
 ``except AdCPConfigurationError`` (the GEMINI_API_KEY-missing case) — a
 refused seam call is not that class, falls through to the generic
 ``except Exception``, and is laundered into::
@@ -31,7 +31,7 @@ refused seam call is not that class, falls through to the generic
     recovery="transient"
 
 which tells the buyer to retry a refusal that will recur identically forever.
-``src/core/tools/creatives/_sync.py``'s own outer ``except AdCPError as e:``
+``src/core/tools/creatives/_sync.py``'s own outer ``except AdCPSalesAgentError as e:``
 handler (around line 359) ALREADY carries a typed error's own
 ``recovery``/``error_code`` onto the per-item result correctly — the defect is
 that the seam failure never reaches it, because the inner generic
@@ -58,7 +58,7 @@ from tests.harness.transport import Transport
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
-_ALL_TRANSPORTS = [Transport.IMPL, Transport.A2A, Transport.REST, Transport.MCP]
+_ALL_TRANSPORTS = [Transport.A2A, Transport.REST, Transport.MCP]
 
 _FORMAT_ID = "display_300x250_image"
 
@@ -95,7 +95,7 @@ class TestOperatorDialRefusalIsTerminalNotTransient:
     """A refused OPERATOR creative-agent dial must be reported terminal, not transient.
 
     Today it surfaces as ``SERVICE_UNAVAILABLE``/transient with "Retry
-    recommended" (the generic ``except Exception`` arm's defaults) instead of
+    recommended" (the generic ``except Exception`` branch's defaults) instead of
     the seam's own ``CONFIGURATION_ERROR``/terminal classification.
     """
 
@@ -134,7 +134,7 @@ class TestOperatorDialRefusalIsTerminalNotTransient:
             )
             assert error.code == "CONFIGURATION_ERROR", (
                 f"errors[0].code={error.code!r} — this is the seam's OWN classification "
-                "(raise_mapped_outbound_error's operator arm), not the generic SERVICE_UNAVAILABLE "
+                "(raise_mapped_outbound_error's operator branch), not the generic SERVICE_UNAVAILABLE "
                 "default a laundered Exception falls back to"
             )
 

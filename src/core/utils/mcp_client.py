@@ -42,6 +42,8 @@ from fastmcp.client.transports import (
     StreamableHttpTransport as _StreamableHttpTransport,
 )
 
+from src.core.errors.details import AdapterFailureDetails
+from src.core.exceptions import AdCPAdapterError
 from src.core.security.egress.attempts import Attempts
 from src.core.security.outbound_http import (
     OutboundError,
@@ -54,16 +56,26 @@ from src.core.security.outbound_http import (
 logger = logging.getLogger(__name__)
 
 
-class MCPConnectionError(Exception):
-    """Raised when MCP client connection fails after all retries."""
+class MCPConnectionError(AdCPAdapterError):
+    """Could not reach an MCP agent after every retry.
 
-    pass
+    In the AdCP hierarchy because we define it and we raise it. SERVICE_UNAVAILABLE
+    is inherited from AdCPAdapterError and is honest here: the upstream did not
+    answer, and a retry may well succeed.
+
+    The agent URL and the last underlying error travel in ``details`` and
+    ``internal_detail`` -- the latter is server-log only, which is what keeps an
+    upstream exception's text off the buyer's wire.
+    """
 
 
-class MCPCompatibilityError(Exception):
-    """Raised when MCP SDK version compatibility issue detected."""
+class MCPCompatibilityError(AdCPAdapterError):
+    """An MCP agent rejected a notification its own protocol version requires.
 
-    pass
+    Same tree and same code as its sibling: the upstream was reached and answered
+    in a way its protocol does not permit, which is a gateway-level fault rather
+    than anything the buyer sent.
+    """
 
 
 def _build_auth_headers(auth: dict[str, Any] | None, auth_header: str | None = None) -> dict[str, str]:
@@ -247,7 +259,7 @@ async def call_mcp_tool(
                 # It has to be recovered from the chain rather than caught by
                 # type, because fastmcp re-raises it as a bare RuntimeError
                 # ("Client failed to connect: ..."). An `except OutboundError`
-                # arm here reads like it closes the case and catches nothing --
+                # branch here reads like it closes the case and catches nothing --
                 # the shape this epic exists to delete -- so the unwrap is the
                 # one mechanism, not a decoration in front of one.
                 #
@@ -270,9 +282,8 @@ async def call_mcp_tool(
                         f"This is a known issue between FastMCP SDK versions."
                     )
                     raise MCPCompatibilityError(
-                        f"MCP SDK compatibility issue with {current_url}: "
-                        f"Server doesn't support notifications/initialized notification. "
-                        f"The agent may need to upgrade their FastMCP version to match the client."
+                        details=AdapterFailureDetails(url=current_url),
+                        internal_detail=e,
                     ) from e
 
                 attempts.record_transport_failure()
@@ -298,8 +309,8 @@ async def call_mcp_tool(
                     )
                     break
 
-    # If we reach here, all candidates failed — preserve legacy error format regardless of fallback
+    # If we reach here, all candidates failed, regardless of fallback
     raise MCPConnectionError(
-        f"Failed to connect to MCP agent at {agent_url} after {max_attempts} attempts: "
-        f"{type(last_exception).__name__ if last_exception else 'UnknownError'}: {last_exception}"
+        details=AdapterFailureDetails(url=agent_url, max_retries=max_attempts),
+        internal_detail=last_exception,
     ) from last_exception

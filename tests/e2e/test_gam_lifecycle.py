@@ -30,6 +30,7 @@ from tests.e2e.conftest import (
     GAM_TEST_ADVERTISER_ID,
     GAM_TEST_NETWORK_CODE,
 )
+from tests.factories.principal import plaintext_token_for
 
 GAM_LIFECYCLE_TENANT_ID = "gam_lifecycle_test"
 
@@ -225,14 +226,14 @@ def _seed_lifecycle_test_data():
         session.add(tenant)
 
         # Create principal (required by MediaBuy FK)
-        principal = PrincipalModel(
+        principal = PrincipalModel.with_token(
+            plaintext_token_for("e2e_lifecycle_test"),
             tenant_id=GAM_LIFECYCLE_TENANT_ID,
             principal_id="e2e_lifecycle_test",
             name="E2E Lifecycle Test Principal",
             platform_mappings={
                 "google_ad_manager": {"advertiser_id": GAM_TEST_ADVERTISER_ID},
             },
-            access_token=f"e2e_test_token_{uuid.uuid4().hex[:8]}",
         )
         session.add(principal)
 
@@ -361,7 +362,6 @@ def gam_adapter(gam_lifecycle_db, gam_service_account_json):
         principal=principal,
         network_code=GAM_TEST_NETWORK_CODE,
         advertiser_id=GAM_TEST_ADVERTISER_ID,
-        dry_run=False,
         tenant_id=GAM_LIFECYCLE_TENANT_ID,
     )
 
@@ -427,6 +427,7 @@ def _make_create_request(product_id: str, po_number: str, delivery_type: str = "
     )
 
     request = CreateMediaBuyRequest(
+        account={"account_id": "acct_test"},
         brand={"domain": "testbrand.com"},
         po_number=po_number,
         start_time=start_time,

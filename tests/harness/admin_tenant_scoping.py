@@ -101,8 +101,9 @@ def seed_target_tenant(session: Session) -> TargetTenant:
         media_buy_id=unique_id("mb"),
         status="active",
         budget=ACTIVE_BUY_BUDGET,
+        # Only the principal id is set: PrincipalFactory derives token_hash/token_prefix
+        # from it (tests/factories/principal.py), so a unique id is a unique credential.
         principal__principal_id=unique_id("principal"),
-        principal__access_token=unique_id("token"),
     )
     products_payload = [
         {
@@ -193,8 +194,8 @@ class AdminTenantScopingEnv(AdminAccountEnv):
     memberships (elsewhere / inactive here / active here) and the four routes.
     """
 
-    def __init__(self, *, mode: str | None = None) -> None:
-        super().__init__(mode=mode)
+    def __init__(self, *, mode: str = "integration", base_url: str | None = None) -> None:
+        super().__init__(mode=mode, base_url=base_url)
         self._target: TargetTenant | None = None
         self._state: tuple | None = None
 

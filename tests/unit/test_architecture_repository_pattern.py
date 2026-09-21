@@ -25,26 +25,37 @@ ROOT = Path(__file__).resolve().parents[2]
 # Invariant 1: No get_db_session() in _impl functions
 # ---------------------------------------------------------------------------
 
+# Directories scanned by discovery glob (not a hand-maintained file list) for
+# _impl-adjacent get_db_session() calls. The hand-maintained list this replaced
+# omitted accounts.py (the largest new tools module) entirely and
+# never scanned helpers/ at all -- making a session-opening helper one call
+# frame from _impl invisible to this guard (the guard even taught the
+# workaround: adapter_helpers.py's _read_mock_test_behavior docstring used to
+# describe the loophole as the sanctioned seam). #1721 M2.
+_IMPL_DISCOVERY_DIRS = ("src/core/tools", "src/core/helpers")
+
+# Two files outside the discovery dirs were already in the pre-glob list.
+# Kept explicit so widening scan scope never NARROWS it for these.
+_IMPL_LEGACY_EXTRA_FILES = frozenset({"src/core/context_manager.py", "src/admin/blueprints/creatives.py"})
+
+
+def _glob_python_files(root: Path, dirs: tuple[str, ...]) -> set[str]:
+    """``.py`` files under any of ``dirs`` (relative to ``root``), pycache excluded."""
+    return {
+        str(p.relative_to(root))
+        for scan_dir in dirs
+        for p in (root / scan_dir).rglob("*.py")
+        if "__pycache__" not in str(p)
+    }
+
+
+def _discover_impl_files() -> list[str]:
+    """_impl-adjacent files scanned for direct get_db_session() calls."""
+    return sorted(_glob_python_files(ROOT, _IMPL_DISCOVERY_DIRS) | _IMPL_LEGACY_EXTRA_FILES)
+
+
 # Production files that contain _impl functions to scan
-IMPL_FILES = [
-    "src/core/tools/media_buy_create.py",
-    "src/core/tools/media_buy_update.py",
-    "src/core/tools/media_buy_delivery.py",
-    "src/core/tools/media_buy_list.py",
-    "src/core/tools/products.py",
-    "src/core/tools/capabilities.py",
-    "src/core/tools/creative_formats.py",
-    "src/core/tools/properties.py",
-    "src/core/tools/creatives/listing.py",
-    "src/core/tools/creatives/_sync.py",
-    "src/core/tools/creatives/_assignments.py",
-    "src/core/tools/creatives/_workflow.py",
-    "src/core/tools/performance.py",
-    "src/core/tools/signals.py",
-    "src/core/tools/task_management.py",
-    "src/core/context_manager.py",
-    "src/admin/blueprints/creatives.py",
-]
+IMPL_FILES = _discover_impl_files()
 
 # Was: pre-existing violations, (file_path, function_name).
 # EMPTY AND MUST STAY EMPTY: the _impl-side migration completed in #1094 (closed
@@ -90,7 +101,6 @@ INTEGRATION_SESSION_ADD_ALLOWLIST = {
     ("tests/integration/conftest.py", "sample_tenant"),
     ("tests/integration/conftest.py", "sample_principal"),
     ("tests/integration/conftest.py", "sample_products"),
-    ("tests/integration/conftest.py", "test_media_buy_workflow"),
     # tests/integration/test_adapter_factory.py
     ("tests/integration/test_adapter_factory.py", "setup_adapters"),
     # tests/integration/test_gam_adapter_auth.py — no AdapterConfigFactory exists yet
@@ -226,23 +236,6 @@ INTEGRATION_SESSION_ADD_ALLOWLIST = {
         "test_updating_profile_inventory_affects_product_implementation_config",
     ),
     ("tests/integration/test_inventory_profile_updates.py", "test_updating_profile_properties_affects_all_products"),
-    # tests/integration/test_list_authorized_properties_integration.py
-    (
-        "tests/integration/test_list_authorized_properties_integration.py",
-        "test_list_authorized_properties_reads_from_publisher_partner",
-    ),
-    (
-        "tests/integration/test_list_authorized_properties_integration.py",
-        "test_list_authorized_properties_returns_all_registered_publishers",
-    ),
-    (
-        "tests/integration/test_list_authorized_properties_integration.py",
-        "test_list_authorized_properties_returns_empty_when_no_publishers",
-    ),
-    (
-        "tests/integration/test_list_authorized_properties_integration.py",
-        "test_list_authorized_properties_returns_sorted_domains",
-    ),
     # tests/integration/test_media_buy_readiness.py
     ("tests/integration/test_media_buy_readiness.py", "test_tenant"),
     ("tests/integration/test_media_buy_readiness.py", "test_principal"),
@@ -359,14 +352,10 @@ INTEGRATION_SESSION_ADD_ALLOWLIST = {
     ("tests/integration/test_tenant_dashboard.py", "test_dashboard_metrics_calculation"),
     ("tests/integration/test_tenant_dashboard.py", "test_tenant_config_building"),
     ("tests/integration/test_tenant_dashboard.py", "test_dashboard_with_empty_tenant"),
-    # tests/integration/test_tenant_isolation_breach_fix.py
-    ("tests/integration/test_tenant_isolation_breach_fix.py", "test_cross_tenant_token_rejected"),
     # tests/integration/test_tenant_isolation_fix.py
-    ("tests/integration/test_tenant_isolation_fix.py", "test_tenant_isolation_with_subdomain_and_cross_tenant_token"),
-    ("tests/integration/test_tenant_isolation_fix.py", "test_global_token_lookup_sets_tenant_from_principal"),
-    ("tests/integration/test_tenant_isolation_fix.py", "test_admin_token_with_subdomain_preserves_tenant_context"),
     # tests/integration/test_tenant_management_api_integration.py
-    ("tests/integration/test_tenant_management_api_integration.py", "mock_api_key_auth"),
+    # mock_api_key_auth fixed — stores the API key digest through
+    # TenantManagementConfigRepository (salesagent-3cs7o.18)
     ("tests/integration/test_tenant_management_api_integration.py", "test_tenant"),
     # tests/integration/test_tenant_settings_comprehensive.py
     ("tests/integration/test_tenant_settings_comprehensive.py", "test_database_queries"),
@@ -379,10 +368,6 @@ INTEGRATION_SESSION_ADD_ALLOWLIST = {
         "test_update_media_buy_assigns_creatives_to_package",
     ),
     ("tests/integration/test_update_media_buy_creative_assignment.py", "test_update_media_buy_replaces_creatives"),
-    (
-        "tests/integration/test_update_media_buy_creative_assignment.py",
-        "test_update_media_buy_rejects_missing_creatives",
-    ),
     ("tests/integration/test_update_media_buy_creative_assignment.py", "test_creative_assignments_with_weights"),
     ("tests/integration/test_update_media_buy_creative_assignment.py", "test_creative_assignments_replaces_all"),
     # tests/integration/test_update_media_buy_persistence.py
@@ -397,9 +382,6 @@ INTEGRATION_SESSION_ADD_ALLOWLIST = {
     ("tests/integration/conftest.py", "create_test_product_with_pricing"),
     ("tests/integration/conftest.py", "authenticated_admin_session"),
     ("tests/integration/conftest.py", "test_tenant_with_data"),
-    # tests/integration/test_a2a_skill_invocation.py
-    ("tests/integration/test_a2a_skill_invocation.py", "test_update_media_buy_skill"),
-    ("tests/integration/test_a2a_skill_invocation.py", "test_list_authorized_properties_skill"),
     # tests/integration/test_admin_ui_data_validation.py
     ("tests/integration/test_admin_ui_data_validation.py", "test_products_list_no_duplicates_with_pricing_options"),
     ("tests/integration/test_admin_ui_data_validation.py", "test_principals_list_no_duplicates_with_relationships"),
@@ -408,15 +390,12 @@ INTEGRATION_SESSION_ADD_ALLOWLIST = {
     ("tests/integration/test_admin_ui_data_validation.py", "test_media_buys_list_no_duplicates_with_packages"),
     ("tests/integration/test_admin_ui_data_validation.py", "test_media_buys_list_shows_all_statuses"),
     ("tests/integration/test_admin_ui_data_validation.py", "test_workflows_list_no_duplicate_steps"),
-    # tests/integration/test_create_media_buy_roundtrip.py
-    ("tests/integration/test_create_media_buy_roundtrip.py", "setup_test_tenant"),
     # tests/integration/test_create_media_buy_v24.py
     ("tests/integration/test_create_media_buy_v24.py", "setup_test_tenant"),
     # tests/integration/test_creative_lifecycle_mcp.py
     ("tests/integration/test_creative_lifecycle_mcp.py", "setup_test_data"),
     ("tests/integration/test_creative_lifecycle_mcp.py", "test_sync_creatives_upsert_existing_creative"),
     ("tests/integration/test_creative_lifecycle_mcp.py", "test_list_creatives_with_media_buy_assignments"),
-    ("tests/integration/test_creative_lifecycle_mcp.py", "test_validate_creatives_missing_required_fields"),
     # tests/integration/test_gam_automation_focused.py
     ("tests/integration/test_gam_automation_focused.py", "test_tenant_data"),
     # tests/integration/test_get_products_database_integration.py — migrated to factories
@@ -424,11 +403,6 @@ INTEGRATION_SESSION_ADD_ALLOWLIST = {
     # tests/integration/test_get_products_filters.py — migrated to factories
     # tests/integration/test_get_products_format_id_filter.py — migrated to factories
     # tests/integration/test_mcp_endpoints_comprehensive.py — requires_server suite removed (#1233 D11)
-    # tests/integration/test_mcp_tool_roundtrip_validation.py
-    ("tests/integration/test_mcp_tool_roundtrip_validation.py", "test_tenant_id"),
-    # tests/integration/test_mcp_tools_audit.py
-    ("tests/integration/test_mcp_tools_audit.py", "test_tenant_id"),
-    ("tests/integration/test_mcp_tools_audit.py", "test_get_media_buy_delivery_roundtrip_safety"),
     # tests/integration/test_minimum_spend_validation.py
     ("tests/integration/test_minimum_spend_validation.py", "setup_test_data"),
     ("tests/integration/test_minimum_spend_validation.py", "test_no_minimum_when_not_set"),
@@ -612,6 +586,26 @@ class TestImplNoDirectDbSession:
             fix_hint="Remove fixed entries from IMPL_SESSION_ALLOWLIST.",
         )
 
+    @pytest.mark.arch_guard
+    def test_discovery_glob_catches_a_synthetic_new_file(self, tmp_path):
+        """Guard self-test: the discovery glob picks up a file it has never seen
+        before, proving it is a LIVE glob (re-evaluated every run) and not a
+        frozen snapshot masquerading as one -- the exact failure mode of the
+        hand-maintained list this replaced (#1721 M2)."""
+        scan_dir = tmp_path / "src" / "core" / "tools"
+        scan_dir.mkdir(parents=True)
+        (scan_dir / "_never_seen_before.py").write_text("def f():\n    pass\n")
+        found = _glob_python_files(tmp_path, ("src/core/tools",))
+        assert "src/core/tools/_never_seen_before.py" in found
+
+    @pytest.mark.arch_guard
+    def test_discovery_glob_covers_the_files_the_old_list_missed(self):
+        """accounts.py and helpers/ were invisible to the hand-maintained
+        IMPL_FILES list -- confirm the discovery glob now sees them."""
+        assert "src/core/tools/accounts.py" in IMPL_FILES
+        assert "src/core/helpers/adapter_helpers.py" in IMPL_FILES
+        assert "src/core/helpers/activity_helpers.py" in IMPL_FILES
+
 
 class TestIntegrationTestsNoInlineSessionAdd:
     """Integration tests must use factories/fixtures, not inline session.add().
@@ -696,11 +690,7 @@ GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
     ("tests/integration/conftest.py", "sample_principal"),
     ("tests/integration/conftest.py", "sample_products"),
     ("tests/integration/conftest.py", "sample_tenant"),
-    ("tests/integration/conftest.py", "test_media_buy_workflow"),
     ("tests/integration/conftest.py", "test_tenant_with_data"),
-    ("tests/integration/test_a2a_skill_invocation.py", "test_explicit_skill_create_media_buy_manual_approval"),
-    ("tests/integration/test_a2a_skill_invocation.py", "test_list_authorized_properties_skill"),
-    ("tests/integration/test_a2a_skill_invocation.py", "test_update_media_buy_skill"),
     ("tests/integration/test_adapter_config_repository.py", "_tenants"),
     ("tests/integration/test_adapter_config_repository.py", "test_find_by_tenant_returns_config"),
     ("tests/integration/test_adapter_config_repository.py", "test_find_by_tenant_returns_none_for_unconfigured"),
@@ -719,8 +709,6 @@ GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
     ("tests/integration/test_adapter_config_repository.py", "test_has_gam_credentials_service_account"),
     ("tests/integration/test_adapter_config_repository.py", "test_update_custom_targeting_keys_raises_when_missing"),
     ("tests/integration/test_adapter_factory.py", "setup_adapters"),
-    ("tests/integration/test_adapter_factory.py", "test_gam_adapter_requires_network_code"),
-    ("tests/integration/test_adapter_factory.py", "test_get_adapter_instantiates_all_adapter_types"),
     ("tests/integration/test_admin_ui_data_validation.py", "_bind_factories_for_sizes"),
     ("tests/integration/test_admin_ui_data_validation.py", "test_dashboard_media_buy_count_accurate"),
     ("tests/integration/test_admin_ui_data_validation.py", "test_inventory_browser_no_duplicate_ad_units"),
@@ -741,7 +729,6 @@ GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
     ("tests/integration/test_audit_decorator.py", "test_decorator_skips_logging_without_tenant_id"),
     ("tests/integration/test_audit_decorator.py", "test_decorator_truncates_long_values"),
     ("tests/integration/test_context_persistence.py", "test_simplified_context"),
-    ("tests/integration/test_create_media_buy_roundtrip.py", "setup_test_tenant"),
     ("tests/integration/test_create_media_buy_v24.py", "setup_test_tenant"),
     ("tests/integration/test_creative_assignment_principal_id.py", "_query_assignments"),
     ("tests/integration/test_creative_assignment_principal_id.py", "ca_creatives"),
@@ -761,9 +748,7 @@ GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
     ("tests/integration/test_creative_lifecycle_mcp.py", "setup_test_data"),
     ("tests/integration/test_creative_lifecycle_mcp.py", "test_create_media_buy_with_creative_ids"),
     ("tests/integration/test_creative_lifecycle_mcp.py", "test_list_creatives_no_filters"),
-    ("tests/integration/test_creative_lifecycle_mcp.py", "test_list_creatives_pagination_and_sorting"),
     ("tests/integration/test_creative_lifecycle_mcp.py", "test_list_creatives_with_date_filters"),
-    ("tests/integration/test_creative_lifecycle_mcp.py", "test_list_creatives_with_format_filter"),
     ("tests/integration/test_creative_lifecycle_mcp.py", "test_list_creatives_with_media_buy_assignments"),
     ("tests/integration/test_creative_lifecycle_mcp.py", "test_list_creatives_with_search"),
     ("tests/integration/test_creative_lifecycle_mcp.py", "test_list_creatives_with_status_filter"),
@@ -772,34 +757,11 @@ GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
     ("tests/integration/test_creative_lifecycle_mcp.py", "test_sync_creatives_validation_failures"),
     ("tests/integration/test_creative_lifecycle_mcp.py", "test_sync_creatives_with_assignments_lookup"),
     ("tests/integration/test_creative_lifecycle_mcp.py", "test_sync_creatives_with_package_assignments"),
-    ("tests/integration/test_creative_lifecycle_mcp.py", "test_validate_creatives_missing_required_fields"),
     ("tests/integration/test_creative_review_model.py", "test_get_ai_review_stats_empty"),
     ("tests/integration/test_creative_review_model.py", "test_get_creative_reviews_filters_by_review_type"),
     ("tests/integration/test_creative_review_model.py", "test_get_creative_reviews_query"),
     ("tests/integration/test_creative_review_model.py", "test_get_creative_reviews_tenant_isolation"),
     ("tests/integration/test_creative_review_model.py", "test_get_creative_with_latest_review_tenant_isolation"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_assignment_persists_to_db"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_auto_approve_sets_approved_status"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_creative_visible_only_to_owning_principal"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_default_approval_mode_is_require_human"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_delete_missing_archives_unlisted_creatives"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_delete_missing_false_preserves_unlisted"),
-    (
-        "tests/integration/test_creative_sync_behavioral.py",
-        "test_draft_with_approved_at_transitions_to_pending_creatives",
-    ),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_draft_without_approved_at_stays_draft"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_dry_run_does_not_persist"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_existing_creative_updates_in_place"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_idempotent_assignment_upsert"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_lenient_savepoint_isolation_with_real_db"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_new_creative_creates_db_record"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_new_creative_stamped_with_correct_principal"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_non_draft_status_unchanged"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_none_assignments_produces_no_records"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_require_human_sets_pending_review"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_same_creative_id_different_principals_are_separate"),
-    ("tests/integration/test_creative_sync_behavioral.py", "test_upsert_assignment_still_transitions"),
     ("tests/integration/test_creative_sync_data_preservation.py", "test_generative_output_preserves_user_assets"),
     ("tests/integration/test_creative_sync_data_preservation.py", "test_generative_output_preserves_user_url"),
     (
@@ -845,16 +807,16 @@ GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
         "tests/integration/test_cross_principal_security.py",
         "test_update_media_buy_cannot_modify_other_principals_media_buy",
     ),
-    ("tests/integration/test_dashboard_integration.py", "test_db"),
+    # test_dashboard_integration.py::test_db is gone with the file: 8 tests that seeded rows
+    # with raw SQL, queried them with raw SQL, and asserted the query returned what they
+    # seeded. The file's only two src imports were in that fixture, both to get a connection,
+    # so no test called a production function. DashboardService is graded by
+    # tests/unit/test_dashboard_service.py and tests/integration/test_dashboard_reliability.py,
+    # 21 tests that construct it and call get_dashboard_metrics.
     ("tests/integration/test_database_health_integration.py", "test_health_check_performance_with_real_database"),
     ("tests/integration/test_database_health_integration.py", "test_health_check_table_existence_validation"),
     ("tests/integration/test_database_health_integration.py", "test_health_check_with_real_schema_validation"),
     ("tests/integration/test_database_integration.py", "test_settings_queries"),
-    ("tests/integration/test_database_timeouts.py", "test_circuit_breaker_fail_fast"),
-    ("tests/integration/test_database_timeouts.py", "test_circuit_breaker_recovery"),
-    ("tests/integration/test_database_timeouts.py", "test_connection_timeout_configuration"),
-    ("tests/integration/test_database_timeouts.py", "test_query_timeout_configuration"),
-    ("tests/integration/test_database_timeouts.py", "test_statement_timeout_enforced"),
     ("tests/integration/test_delivery_poll_behavioral.py", "test_get_pricing_options_uses_string_id_not_integer_pk"),
     ("tests/integration/test_delivery_poll_behavioral.py", "test_integer_pk_lookup_returns_none"),
     (
@@ -931,14 +893,19 @@ GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
     ("tests/integration/test_dynamic_products.py", "test_tenant_filter_scoping"),
     ("tests/integration/test_dynamic_products_integration.py", "test_archives_expired_variant"),
     ("tests/integration/test_dynamic_products_integration.py", "test_templates_with_signals_creates_variants"),
-    ("tests/integration/test_error_paths.py", "test_rest_error_with_valid_token_writes_audit_row"),
     ("tests/integration/test_execute_approved_platform_ids.py", "test_empty_platform_line_item_ids_dict"),
     (
         "tests/integration/test_execute_approved_platform_ids.py",
         "test_manual_approval_enriches_concept_and_is_filterable",
     ),
     ("tests/integration/test_execute_approved_platform_ids.py", "test_multiple_packages_all_persisted"),
-    ("tests/integration/test_execute_approved_platform_ids.py", "test_no_platform_line_item_ids_attr"),
+    # Re-keyed, not added: this pre-existing violation was allowlisted as
+    # "test_no_platform_line_item_ids_attr" and the test was renamed to
+    # "test_omitted_platform_line_item_ids" (the attribute it named can no longer be
+    # absent — AdapterCreateResult declares platform_line_item_ids with
+    # default_factory=dict). Same violation, same count; this allowlist is keyed on the
+    # test NAME, so a rename has to re-point the entry in the same change.
+    ("tests/integration/test_execute_approved_platform_ids.py", "test_omitted_platform_line_item_ids"),
     ("tests/integration/test_execute_approved_platform_ids.py", "test_platform_line_item_ids_persisted_after_approval"),
     ("tests/integration/test_format_conversion_approval.py", "create_media_package"),
     ("tests/integration/test_format_conversion_approval.py", "test_currency_limit"),
@@ -955,8 +922,6 @@ GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
     ("tests/integration/test_format_conversion_approval.py", "test_tenant"),
     ("tests/integration/test_format_conversion_approval.py", "test_valid_format_id_dict_conversion"),
     ("tests/integration/test_format_conversion_approval.py", "test_valid_format_reference_dict_conversion"),
-    ("tests/integration/test_gam_adapter_auth.py", "_load_principal"),
-    ("tests/integration/test_gam_adapter_auth.py", "_set_tenant_context"),
     ("tests/integration/test_gam_adapter_auth.py", "oauth_tenant"),
     ("tests/integration/test_gam_adapter_auth.py", "sa_tenant"),
     ("tests/integration/test_gam_adapter_auth.py", "test_oauth_config_includes_refresh_token"),
@@ -1060,30 +1025,6 @@ GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
     ),
     ("tests/integration/test_inventory_profile_updates.py", "test_updating_profile_properties_affects_all_products"),
     ("tests/integration/test_inventory_tree_lazy_loading.py", "_bind_factories"),
-    (
-        "tests/integration/test_list_authorized_properties_integration.py",
-        "test_list_authorized_properties_reads_from_publisher_partner",
-    ),
-    (
-        "tests/integration/test_list_authorized_properties_integration.py",
-        "test_list_authorized_properties_returns_all_registered_publishers",
-    ),
-    (
-        "tests/integration/test_list_authorized_properties_integration.py",
-        "test_list_authorized_properties_returns_empty_when_no_publishers",
-    ),
-    (
-        "tests/integration/test_list_authorized_properties_integration.py",
-        "test_list_authorized_properties_returns_sorted_domains",
-    ),
-    (
-        "tests/integration/test_list_authorized_properties_integration.py",
-        "test_list_authorized_properties_tenant_isolation",
-    ),
-    ("tests/integration/test_mcp_tool_roundtrip_validation.py", "real_products_in_db"),
-    ("tests/integration/test_mcp_tool_roundtrip_validation.py", "test_tenant_id"),
-    ("tests/integration/test_mcp_tools_audit.py", "test_get_media_buy_delivery_roundtrip_safety"),
-    ("tests/integration/test_mcp_tools_audit.py", "test_tenant_id"),
     ("tests/integration/test_media_buy_readiness.py", "test_completed_state"),
     ("tests/integration/test_media_buy_readiness.py", "test_draft_state_no_packages"),
     ("tests/integration/test_media_buy_readiness.py", "test_live_state"),
@@ -1237,11 +1178,6 @@ GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
     ),
     ("tests/integration/test_property_targeting_allowed_enforcement.py", "_seed_media_buy"),
     ("tests/integration/test_property_targeting_allowed_enforcement.py", "property_targeting_tenant"),
-    ("tests/integration/test_resolve_account.py", "test_natural_key_not_found_raises"),
-    ("tests/integration/test_resolve_account.py", "test_no_access_raises"),
-    ("tests/integration/test_resolve_account.py", "test_not_found_raises"),
-    ("tests/integration/test_resolve_account.py", "test_resolves_by_account_id"),
-    ("tests/integration/test_resolve_account.py", "test_resolves_by_natural_key"),
     ("tests/integration/test_schema_database_mapping.py", "test_database_field_access_validation"),
     ("tests/integration/test_schema_database_mapping.py", "test_database_json_field_handling"),
     ("tests/integration/test_schema_database_mapping.py", "test_schema_to_database_conversion_safety"),
@@ -1286,12 +1222,6 @@ GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
     ("tests/integration/test_tenant_dashboard.py", "test_dashboard_with_empty_tenant"),
     ("tests/integration/test_tenant_dashboard.py", "test_dashboard_with_media_buys"),
     ("tests/integration/test_tenant_dashboard.py", "test_tenant_config_building"),
-    ("tests/integration/test_tenant_isolation_breach_fix.py", "test_cross_tenant_token_rejected"),
-    ("tests/integration/test_tenant_isolation_breach_fix.py", "test_no_fallback_to_first_tenant"),
-    ("tests/integration/test_tenant_isolation_breach_fix.py", "test_tenant_isolation_with_valid_subdomain"),
-    ("tests/integration/test_tenant_isolation_fix.py", "test_admin_token_with_subdomain_preserves_tenant_context"),
-    ("tests/integration/test_tenant_isolation_fix.py", "test_global_token_lookup_sets_tenant_from_principal"),
-    ("tests/integration/test_tenant_isolation_fix.py", "test_tenant_isolation_with_subdomain_and_cross_tenant_token"),
     ("tests/integration/test_tenant_management_api_integration.py", "mock_api_key_auth"),
     ("tests/integration/test_tenant_management_api_integration.py", "test_tenant"),
     ("tests/integration/test_tenant_settings_comprehensive.py", "test_database_queries"),
@@ -1302,10 +1232,6 @@ GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
     (
         "tests/integration/test_update_media_buy_creative_assignment.py",
         "test_update_media_buy_assigns_creatives_to_package",
-    ),
-    (
-        "tests/integration/test_update_media_buy_creative_assignment.py",
-        "test_update_media_buy_rejects_missing_creatives",
     ),
     ("tests/integration/test_update_media_buy_creative_assignment.py", "test_update_media_buy_replaces_creatives"),
     ("tests/integration/test_update_media_buy_persistence.py", "test_tenant_setup"),
@@ -1364,3 +1290,81 @@ class TestIntegrationTestsNoGetDbSession:
             GET_DB_SESSION_IN_TESTS_ALLOWLIST,
             fix_hint="Remove fixed entries from GET_DB_SESSION_IN_TESTS_ALLOWLIST.",
         )
+
+
+# ---------------------------------------------------------------------------
+# Invariant 4: Repositories may not import SDK protocol/response types (reverse layer)
+# ---------------------------------------------------------------------------
+
+# The generated-response-shape family: types describing a WIRE response, not a
+# DB row. IdempotencyPosture/to_sdk_union() imported Idempotency/Idempotency3
+# from here while living in repositories/idempotency_attempt.py (D2, salesagent-
+# c0ia.11 M2) -- business/wire-shaping logic belongs above the repository,
+# never inside it. Scoped to this specific submodule (not bare `adcp.types`,
+# whose top-level re-exports like ContextObject/Error are generic shared types
+# used legitimately in a handful of repository method signatures today) so the
+# check is crisp with zero false positives.
+_FORBIDDEN_REPOSITORY_IMPORT_PREFIX = "adcp.types.generated_poc.protocol"
+
+REPOSITORIES_DIR = "src/core/database/repositories"
+
+
+def _scan_for_protocol_imports(tree: ast.Module) -> list[tuple[str, int]]:
+    """(imported_module, line) for every ``from adcp.types.generated_poc.protocol...
+    import ...`` in ``tree``."""
+    return [
+        (node.module, node.lineno)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.module
+        and node.module.startswith(_FORBIDDEN_REPOSITORY_IMPORT_PREFIX)
+    ]
+
+
+def _find_repository_protocol_imports() -> list[tuple[str, str, int]]:
+    """(file_path, imported_module, line) for every repositories/*.py file."""
+    violations: list[tuple[str, str, int]] = []
+    for py_file in sorted((ROOT / REPOSITORIES_DIR).rglob("*.py")):
+        if "__pycache__" in str(py_file):
+            continue
+        rel_path = str(py_file.relative_to(ROOT))
+        tree = ast.parse(py_file.read_text())
+        violations.extend((rel_path, module, lineno) for module, lineno in _scan_for_protocol_imports(tree))
+    return violations
+
+
+class TestRepositoriesDoNotImportProtocolResponseTypes:
+    """The repository layer sits BELOW schemas/tools -- importing an SDK
+    protocol-response type here is the reverse-direction violation of the same
+    layering rule CLAUDE.md Pattern #3 enforces one direction of (business
+    logic must not reach INTO the repository's session; a repository must not
+    reach UP into wire-response typing). Allowlist is empty and stays empty:
+    after M2's IdempotencyPosture relocation there are zero legitimate cases.
+    """
+
+    @pytest.mark.arch_guard
+    def test_no_repository_imports_adcp_protocol_response_types(self):
+        violations = _find_repository_protocol_imports()
+        assert not violations, (
+            "repositories/*.py importing adcp.types.generated_poc.protocol.* "
+            "(a response-shaped SDK type) -- move the business/wire-shaping logic "
+            "that needs this type OUT of the repository layer (see "
+            "src/core/idempotency_policy.py for the pattern):\n"
+            + "\n".join(f"  {f}:{line} imports {mod}" for f, mod, line in violations)
+        )
+
+    @pytest.mark.arch_guard
+    def test_guard_catches_a_reintroduced_protocol_import(self):
+        """Positive meta-test: reproduces the exact pre-M2 idempotency_attempt.py shape."""
+        drifted = ast.parse(
+            "from adcp.types.generated_poc.protocol.get_adcp_capabilities_response import Idempotency\n"
+        )
+        assert _scan_for_protocol_imports(drifted), "a reintroduced protocol-response import must be flagged"
+
+    @pytest.mark.arch_guard
+    def test_guard_ignores_generic_adcp_types_imports(self):
+        """Negative meta-test: bare `adcp.types` re-exports (ContextObject, Error, ...)
+        are generic shared types legitimately used in repository method signatures
+        today (e.g. src/core/database/repositories/media_buy.py) -- not a violation."""
+        generic = ast.parse("from adcp.types import ContextObject, Error\n")
+        assert _scan_for_protocol_imports(generic) == []

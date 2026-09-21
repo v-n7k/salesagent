@@ -27,9 +27,9 @@ _AGENT_URL = "https://creative.adcontextprotocol.org"
 # PIN-EXPRESSIBLE ON PURPOSE. The obligation here is format_id RESOLUTION — the
 # seller returns the format it advertised, verbatim — not any particular asset shape.
 # The previous seed, display_300x250_image, carries three `pixel_tracker` assets, and
-# the pinned AdCP 3.1.1 format-declaration union (core/format.json, 16 arms: image,
+# the pinned AdCP 3.1.1 format-declaration union (core/format.json, 16 branches: image,
 # video, audio, text, markdown, html, css, javascript, zip, vast, daast, url, webhook,
-# brief, catalog) has no such arm — verified directly against the pinned schema. So
+# brief, catalog) has no such branch — verified directly against the pinned schema. So
 # full schema validation of the returned format reports one violation per tracker,
 # and the roundtrip obligation could not be graded through it.
 #
@@ -57,10 +57,10 @@ def given_captured_format_id_from_get_products(ctx: dict) -> None:
     disabled), no dynamic templates (variants return []), and no product_ranking_prompt
     (AI ranking skipped).
     """
-    from src.core.database.models import Tenant
+    from src.core.database.models import Principal, Tenant
     from src.core.schemas import GetProductsRequest
     from src.core.tools.products import _get_products_impl
-    from tests.factories import PricingOptionFactory, ProductFactory, TenantFactory
+    from tests.factories import PricingOptionFactory, PrincipalFactory, ProductFactory, TenantFactory
     from tests.factories.core import get_or_create
 
     env = ctx["env"]
@@ -77,6 +77,15 @@ def given_captured_format_id_from_get_products(ctx: dict) -> None:
         Tenant,
         {"tenant_id": env._tenant_id},
         lambda: TenantFactory(tenant_id=env._tenant_id, ad_server="mock"),
+    )
+    # Tenant.brand_manifest_policy defaults to "require_auth" — the credential the
+    # dispatch presents needs a real Principal row to read a token from, or it
+    # presents none and trips the require_auth gate (salesagent-z9e0).
+    get_or_create(
+        env,
+        Principal,
+        {"principal_id": env._principal_id, "tenant_id": env._tenant_id},
+        lambda: PrincipalFactory(tenant=tenant, principal_id=env._principal_id),
     )
     product = ProductFactory(
         tenant=tenant,

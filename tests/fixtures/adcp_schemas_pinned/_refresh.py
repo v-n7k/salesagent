@@ -2,7 +2,7 @@
 """Refresh the pinned AdCP error-code enum vendored here.
 
 Source of truth: adcontextprotocol/adcp @ commit
-    04f59d2d56d3d77033162c310e99a1188e4eb419  (tag v3.1-04f59d2d5, 2026-05-13)
+    467fd93d77112baf9e094e18980119edcd3a4d07  (tag v3.1.1)
 
 This commit is an INTENTIONAL, frozen reference point, DELIBERATELY independent
 of the installed adcp SDK's own pin (see docs/adcp-spec-version.md "Pinned
@@ -30,19 +30,28 @@ one enum, kept only for its suggestion-text divergence.
 
 ``$id`` convention (GH #1881)
 ----------------------------
-Vendored files keep upstream's ``$id`` **verbatim**: the site-rooted,
-VERSION-FREE form ``/schemas/<category>/<name>.json`` (so
-``/schemas/enums/error-code.json``, never ``/schemas/3.1.1/enums/...``).
-``main()`` refuses to write a file whose fetched ``$id`` is anything else.
+Vendored files keep upstream's ``$id`` **verbatim** — whatever the pinned
+commit ships, byte for byte. ``main()`` refuses to write a file whose fetched
+``$id`` is anything else.
 
-Two reasons this is the decision rather than a versioned ``$id``:
+Verbatim is the invariant; the concrete form follows the pin. At v3.1.1 that
+form is the VERSION-STAMPED ``/schemas/<version>/<category>/<name>.json``
+(so ``/schemas/3.1.1/enums/error-code.json``), mirroring the file's own path
+under ``dist/schemas/3.1.1/``. Derived from the pin by ``expected_id()`` below
+rather than hardcoded, so advancing ``PINNED_SHA``/``PINNED_VERSION`` together
+keeps the check honest instead of stale.
 
-- The point of this directory is to preserve ONE frozen upstream artifact for
-  byte-comparison. Any field _refresh.py rewrote would no longer be evidence of
-  what upstream said.
-- The pin here is a SHA, not a spec version. Stamping a version into ``$id``
-  would assert a spec identity the commit does not carry — 04f59d2d5 predates
-  3.1.1, and the number would silently go stale the moment the SHA advances.
+The point of this directory is to preserve ONE frozen upstream artifact for
+byte-comparison: any field _refresh.py rewrote would no longer be evidence of
+what upstream said. That is why the version segment is kept rather than
+stripped — stripping it would be this script editing upstream's bytes, the
+exact thing the convention exists to prevent.
+
+History: this pin previously sat at 04f59d2d5 (2026-05-13), which predates
+3.1.1 and shipped the version-free ``/schemas/<category>/<name>.json`` form.
+The vendored copy had drifted from the v3.1.1 enum it claimed to be (65 vs 93
+codes, 7+ divergent enumMetadata entries, and an unversioned ``$id``); it was
+re-vendored from v3.1.1 verbatim, and this pin advanced to match.
 
 Nothing resolves ``$ref``s against this tree (it holds exactly one leaf enum, and
 every ``$ref``-resolving consumer reads the SDK tree via
@@ -64,9 +73,10 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-PINNED_SHA = "04f59d2d56d3d77033162c310e99a1188e4eb419"
+PINNED_SHA = "467fd93d77112baf9e094e18980119edcd3a4d07"
+PINNED_VERSION = "3.1.1"  # the spec version PINNED_SHA tags; stamped into upstream's own `$id`
 REPO = "adcontextprotocol/adcp"
-SRC_PREFIX = "static/schemas/source"  # repo path that backs the `/schemas/...` namespace
+SRC_PREFIX = f"dist/schemas/{PINNED_VERSION}"  # repo path that backs the `/schemas/...` namespace
 LOCAL_CLONE = Path.home() / "projects" / "adcp"
 FIXTURE_DIR = Path(__file__).parent
 
@@ -101,8 +111,19 @@ class IdConventionError(RuntimeError):
     """A fetched schema's ``$id`` does not follow the vendoring convention."""
 
 
+def expected_id(ref: str) -> str:
+    """Upstream's own ``$id`` for *ref* at the current pin.
+
+    Derived from ``PINNED_VERSION`` rather than hardcoded so that advancing the
+    pin cannot leave this check asserting a form the pinned commit stopped
+    shipping. ``/schemas/enums/error-code.json`` ->
+    ``/schemas/3.1.1/enums/error-code.json``.
+    """
+    return f"/schemas/{PINNED_VERSION}" + ref[len("/schemas") :]
+
+
 def check_id_convention(ref: str, schema: dict) -> None:
-    """Raise unless *schema*'s ``$id`` is the version-free ``ref`` it was fetched as.
+    """Raise unless *schema*'s ``$id`` is verbatim what the pinned commit ships.
 
     See the module docstring's "$id convention" section. Called before writing,
     so a refresh that would change the vendored ``$id`` aborts loudly instead of
@@ -110,10 +131,12 @@ def check_id_convention(ref: str, schema: dict) -> None:
     reader much later.
     """
     actual = schema.get("$id")
-    if actual != ref:
+    expected = expected_id(ref)
+    if actual != expected:
         raise IdConventionError(
-            f"{ref}: upstream $id is {actual!r}, expected {ref!r}. Vendored fixtures keep "
-            f"upstream's version-free /schemas/<category>/<name>.json form verbatim (GH #1881). "
+            f"{ref}: upstream $id is {actual!r}, expected {expected!r}. Vendored fixtures keep "
+            f"upstream's $id verbatim; at v{PINNED_VERSION} that is the version-stamped "
+            f"/schemas/<version>/<category>/<name>.json form (GH #1881). "
             f"If upstream deliberately changed its $id convention, update this script's "
             f"docstring and tests/unit/test_pinned_fixture_id_convention.py in the same "
             f"reviewed change — do not vendor the new form silently."

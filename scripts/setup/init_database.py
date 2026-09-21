@@ -1,13 +1,14 @@
 import os
-import secrets
 import sys
 
 # Add project root to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from scripts.ops.migrate import run_migrations
+from src.core.config import get_settings
 from src.core.database.database_session import get_db_session
-from src.core.database.models import AdapterConfig, Principal, Product, Tenant, TenantManagementConfig
+from src.core.database.models import AdapterConfig, Product, Tenant, TenantManagementConfig
+from src.core.database.repositories.principal import PrincipalRepository
 
 
 def init_db(exit_on_error=False):
@@ -22,9 +23,10 @@ def init_db(exit_on_error=False):
     run_migrations(exit_on_error=exit_on_error)
 
     # Now populate default data if needed
+    settings = get_settings()
     with get_db_session() as session:
-        # Initialize tenant management configuration from environment variables
-        tenant_management_emails = os.environ.get("TENANT_MANAGEMENT_EMAILS", os.environ.get("SUPER_ADMIN_EMAILS", ""))
+        # Initialize tenant management configuration from the settings
+        tenant_management_emails = settings.auth.tenant_management_email_list_source
         if tenant_management_emails:
             # Check if config exists
             existing_config = session.query(TenantManagementConfig).filter_by(config_key="super_admin_emails").first()
@@ -45,9 +47,7 @@ def init_db(exit_on_error=False):
                 print(f"✅ Updated tenant management emails: {tenant_management_emails}")
 
         # Similarly for tenant management domains
-        tenant_management_domains = os.environ.get(
-            "TENANT_MANAGEMENT_DOMAINS", os.environ.get("SUPER_ADMIN_DOMAINS", "")
-        )
+        tenant_management_domains = settings.auth.tenant_management_domain_list_source
         if tenant_management_domains:
             existing_config = session.query(TenantManagementConfig).filter_by(config_key="super_admin_domains").first()
             if not existing_config:
@@ -65,7 +65,7 @@ def init_db(exit_on_error=False):
                 print(f"✅ Updated tenant management domains: {tenant_management_domains}")
 
         # Check if demo tenant creation is enabled (default: false for production deployments)
-        create_demo_tenant = os.environ.get("CREATE_DEMO_TENANT", "false").lower() == "true"
+        create_demo_tenant = settings.provisioning.create_demo_tenant
 
         # Check if default tenant already exists (idempotent for CI/testing)
         from sqlalchemy import select
@@ -97,9 +97,6 @@ def init_db(exit_on_error=False):
 
         if not existing_tenant:
             # No default tenant exists - create one for simple use case
-            admin_token = secrets.token_urlsafe(32)
-            secrets.token_urlsafe(32)
-
             # Create default tenant
             from datetime import UTC, datetime
 
@@ -112,7 +109,6 @@ def init_db(exit_on_error=False):
                 billing_plan="standard",
                 ad_server="mock",
                 enable_axe_signals=True,
-                admin_token=admin_token,
                 human_review_required=True,
                 auto_approve_format_ids=["display_300x250", "display_728x90", "display_320x50"],
                 brand_manifest_policy="public",  # Allow unauthenticated discovery for quick start
@@ -141,19 +137,17 @@ def init_db(exit_on_error=False):
             session.add(default_currency_limit)
 
             # Create adapter config for mock adapter
-            adapter_config = AdapterConfig(tenant_id="default", adapter_type="mock", mock_dry_run=False)
+            adapter_config = AdapterConfig(tenant_id="default", adapter_type="mock")
             session.add(adapter_config)
 
             # Create default principal with well-known token for easy testing
             # This token is documented and can be used immediately after docker-compose up
-            default_principal = Principal(
-                tenant_id="default",
+            PrincipalRepository(session, "default").create_with_token(
+                "test-token",  # Well-known token for easy testing; stored hashed like any other
                 principal_id="default_principal",
                 name="Default Principal",
                 platform_mappings={"mock": {"advertiser_id": "mock-default"}},
-                access_token="test-token",  # Well-known token for easy testing
             )
-            session.add(default_principal)
 
             # Always create basic products for demo/testing
             basic_products = [
@@ -204,7 +198,7 @@ def init_db(exit_on_error=False):
                 session.add(product)
 
             # Only create sample advertisers if this is a development environment
-            if os.environ.get("CREATE_SAMPLE_DATA", "false").lower() == "true":
+            if settings.provisioning.create_sample_data:
                 principals_data = [
                     {
                         "principal_id": "acme_corp",
@@ -247,14 +241,12 @@ def init_db(exit_on_error=False):
                 ]
 
                 for p in principals_data:
-                    principal = Principal(
-                        tenant_id="default",
+                    PrincipalRepository(session, "default").create_with_token(
+                        p["access_token"],
                         principal_id=p["principal_id"],
                         name=p["name"],
                         platform_mappings=p["platform_mappings"],
-                        access_token=p["access_token"],
                     )
-                    session.add(principal)
 
                 # Create sample products
                 products_data = [
@@ -339,9 +331,9 @@ def init_db(exit_on_error=False):
                     raise
 
             # Update the print statement based on whether sample data was created
-            if os.environ.get("CREATE_SAMPLE_DATA", "false").lower() == "true":
+            if settings.provisioning.create_sample_data:
                 print(
-                    f"""
+                    """
 ╔══════════════════════════════════════════════════════════════════╗
 ║                 🚀 ADCP SALES AGENT INITIALIZED                  ║
 ╠══════════════════════════════════════════════════════════════════╣
@@ -351,8 +343,8 @@ def init_db(exit_on_error=False):
 ║  🏢 Tenant: Default Publisher                                    ║
 ║  🌐 URL: http://localhost:8080                                   ║
 ║                                                                  ║
-║  🔑 Admin Token (x-adcp-auth header):                            ║
-║     {admin_token}  ║
+║  🔑 Default Advertiser Token (Authorization: Bearer):            ║
+║     test-token                                                   ║
 ║                                                                  ║
 ║  👤 Sample Advertiser Tokens:                                    ║
 ║     • Acme Corp: acme_corp_token                                 ║

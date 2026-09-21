@@ -62,8 +62,6 @@ class TestAuthOptionalForDiscovery:
             identity_no_token = PrincipalFactory.make_identity(
                 principal_id="anon_buyer",
                 tenant_id="test_tenant",
-                protocol="mcp",
-                auth_token=None,
             )
             response = env.call_impl(identity=identity_no_token)
 
@@ -88,38 +86,12 @@ class TestAuthOptionalForDiscovery:
             identity_no_token = PrincipalFactory.make_identity(
                 principal_id="anon_buyer",
                 tenant_id="test_tenant",
-                protocol="a2a",
-                auth_token=None,
             )
             response = env.call_a2a(identity=identity_no_token)
 
         assert isinstance(response, ListCreativeFormatsResponse)
         assert len(response.formats) == 1
         assert response.formats[0].format_id.id == "a2a_fmt"
-
-    def test_impl_with_no_auth_token_via_call_via(self, integration_db):
-        """UC-005-MAIN-MCP-02: call_via(IMPL) with explicit no-token identity.
-
-        Uses the multi-transport dispatch path with an unauthenticated identity
-        to verify the TransportResult wrapper also succeeds.
-        """
-        formats = [_make_format("dispatch_fmt", "Dispatched Format")]
-
-        with CreativeFormatsEnv() as env:
-            TenantFactory(tenant_id="test_tenant")
-            env.set_registry_formats(formats)
-
-            identity_no_token = PrincipalFactory.make_identity(
-                principal_id="anon_buyer",
-                tenant_id="test_tenant",
-                protocol="mcp",
-                auth_token=None,
-            )
-            result = env.call_via(Transport.IMPL, identity=identity_no_token)
-
-        assert result.is_success
-        assert isinstance(result.payload, ListCreativeFormatsResponse)
-        assert len(result.payload.formats) == 1
 
     def test_a2a_with_no_auth_token_via_call_via(self, integration_db):
         """UC-005-MAIN-MCP-02: call_via(A2A) with explicit no-token identity.
@@ -135,8 +107,6 @@ class TestAuthOptionalForDiscovery:
             identity_no_token = PrincipalFactory.make_identity(
                 principal_id="anon_buyer",
                 tenant_id="test_tenant",
-                protocol="a2a",
-                auth_token=None,
             )
             result = env.call_via(Transport.A2A, identity=identity_no_token)
 
@@ -144,30 +114,10 @@ class TestAuthOptionalForDiscovery:
         assert isinstance(result.payload, ListCreativeFormatsResponse)
         assert len(result.payload.formats) == 1
 
-    def test_no_tenant_context_raises_auth_error(self, integration_db):
-        """UC-005-MAIN-MCP-02: missing tenant context IS an error, even though auth is optional.
-
-        Authentication is optional for discovery, but tenant context is still
-        required to resolve which format catalog to return. When tenant=None,
-        the AUTH_REQUIRED error code is returned.
-        """
-        formats = [_make_format("no_tenant_fmt", "Should Not Reach")]
-
-        with CreativeFormatsEnv() as env:
-            TenantFactory(tenant_id="test_tenant")
-            env.set_registry_formats(formats)
-
-            identity_no_tenant = PrincipalFactory.make_identity(
-                principal_id="anon_buyer",
-                tenant_id="orphan",
-                tenant=None,
-                protocol="mcp",
-                auth_token=None,
-            )
-            result = env.call_via(Transport.IMPL, identity=identity_no_tenant)
-
-        assert result.is_error
-        assert result.error.error_code == "AUTH_REQUIRED"
+    # (Deleted) test_no_tenant_context_raises_auth_error: it built an identity with a
+    # resolved principal and tenant=None. See the note on the deleted
+    # TestTenantResolutionFailure class below -- the state is unreachable and the
+    # behavior it expected is not the one production has.
 
     def test_authenticated_vs_unauthenticated_return_same_catalog(self, integration_db):
         """UC-005-MAIN-MCP-02: auth token does not affect the catalog returned.
@@ -187,14 +137,10 @@ class TestAuthOptionalForDiscovery:
             authed_identity = PrincipalFactory.make_identity(
                 principal_id="authed_buyer",
                 tenant_id="test_tenant",
-                protocol="mcp",
-                auth_token="valid-token-123",
             )
             unauthed_identity = PrincipalFactory.make_identity(
                 principal_id="anon_buyer",
                 tenant_id="test_tenant",
-                protocol="mcp",
-                auth_token=None,
             )
 
             authed_response = env.call_impl(identity=authed_identity)
@@ -211,57 +157,22 @@ class TestAuthOptionalForDiscovery:
 # ---------------------------------------------------------------------------
 
 
-class TestTenantResolutionFailure:
-    """Covers: UC-005-EXT-A-01
-
-    Given no auth token AND no hostname mapping resolves to a tenant,
-    When Buyer calls list_creative_formats,
-    Then error with tenant context message and suggestion to provide credentials.
-    """
-
-    def test_no_tenant_no_auth_raises_auth_error(self, integration_db):
-        """UC-005-EXT-A-01: tenant=None + auth_token=None -> AUTH_REQUIRED error code."""
-        with CreativeFormatsEnv() as env:
-            TenantFactory(tenant_id="test_tenant")
-            env.set_registry_formats([_make_format("unreachable", "Should Not Reach")])
-
-            identity = PrincipalFactory.make_identity(
-                principal_id="anon_buyer",
-                tenant_id="unknown",
-                tenant=None,
-                protocol="mcp",
-                auth_token=None,
-            )
-            result = env.call_via(Transport.IMPL, identity=identity)
-
-        assert result.is_error
-        assert result.error.error_code == "AUTH_REQUIRED"
-
-    def test_error_message_mentions_tenant(self, integration_db):
-        """UC-005-EXT-A-01: error message indicates tenant context could not be determined."""
-        with CreativeFormatsEnv() as env:
-            TenantFactory(tenant_id="test_tenant")
-            env.set_registry_formats([])
-
-            identity = PrincipalFactory.make_identity(
-                principal_id="anon_buyer",
-                tenant_id="unknown",
-                tenant=None,
-                protocol="a2a",
-                auth_token=None,
-            )
-            result = env.call_via(Transport.A2A, identity=identity)
-
-        assert result.is_error
-        # Wire-envelope assertion via the harness's captured A2A artifact DataPart —
-        # exercises the real on_message_send pipeline + serialize-for-a2a envelope
-        # build, not the lossy reconstructed exception. See tests/CLAUDE.md §
-        # Error Verification Policy.
-        from tests.helpers import assert_envelope_shape
-
-        assert_envelope_shape(
-            result.wire_error_envelope,
-            "AUTH_REQUIRED",
-            recovery="correctable",
-            message_substr="tenant",
-        )
+# (Deleted) TestTenantResolutionFailure, whose two tests -- an in-process AUTH_MISSING
+# raise and its A2A wire envelope -- both began by constructing an identity with a
+# RESOLVED principal and ``tenant=None``.
+#
+# That state cannot be produced. ``_resolve_identity`` looks a credential up only inside
+# the tenant the request reached ("no tenant, no lookup", step 4), so a caller with no
+# tenant has no principal either; and ``ResolvedIdentity`` declares ``tenant`` required,
+# which is why these calls now fail in ``make_identity`` rather than in the assertion.
+#
+# The reachable tenant-less discovery request is the anonymous one --
+# ``PublicIdentity(principal=None, tenant=None)`` -- and production answers it with an
+# empty catalog rather than refusing it: "No seller is addressed: there are no formats to
+# list, and nothing to refuse" (``_list_creative_formats_impl``, 76c2a96fb, which replaced
+# the ``require_tenant`` raise these tests were written against).
+#
+# So UC-005-EXT-A-01 ("no hostname mapping resolves to a tenant -> error") is now
+# UNGRADED. Grading it means driving the boundary with no ``x-adcp-tenant`` header and
+# reading the wire; that also settles whether the empty catalog or the refusal is the
+# spec-correct answer, which is a question for the storyboard, not for a fixture.

@@ -10,13 +10,14 @@ from sqlalchemy import select
 from src.core.database.database_session import get_db_session
 from src.core.database.models import (
     CurrencyLimit,
-    PricingOption,
     Principal,
     Product,
     PropertyTag,
     Tenant,
 )
 from src.core.product_conversion import convert_product_model_to_schema
+from tests.factories import PricingOptionFactory
+from tests.factories.principal import plaintext_token_for
 
 
 @pytest.mark.requires_db
@@ -184,7 +185,7 @@ def test_convert_product_includes_allowed_principal_ids(integration_db):
         session.add(product_model)
 
         # Create pricing option (required for valid products)
-        pricing_option = PricingOption(
+        pricing_option = PricingOptionFactory.build(
             tenant_id=tenant_id,
             product_id="convert_test_product",
             pricing_model="cpm",
@@ -253,7 +254,7 @@ def test_allowed_principal_ids_excluded_from_serialization(integration_db):
         )
         session.add(product_model)
 
-        pricing_option = PricingOption(
+        pricing_option = PricingOptionFactory.build(
             tenant_id=tenant_id,
             product_id="serialize_test_product",
             pricing_model="cpm",
@@ -295,19 +296,19 @@ def test_principal_model_exists_for_access_control(integration_db):
 
         # Create principals (with required fields)
         # platform_mappings must have at least one platform (google_ad_manager, kevel, or mock)
-        principal1 = Principal(
+        principal1 = Principal.with_token(
+            plaintext_token_for("adv_001"),
             principal_id="adv_001",
             tenant_id=tenant_id,
             name="Advertiser One",
             platform_mappings={"mock": {"advertiser_id": "mock_adv_001"}},
-            access_token="test_token_adv_001",
         )
-        principal2 = Principal(
+        principal2 = Principal.with_token(
+            plaintext_token_for("adv_002"),
             principal_id="adv_002",
             tenant_id=tenant_id,
             name="Advertiser Two",
             platform_mappings={"mock": {"advertiser_id": "mock_adv_002"}},
-            access_token="test_token_adv_002",
         )
         session.add_all([principal1, principal2])
         session.commit()

@@ -6,6 +6,7 @@ import os
 from adcp import get_adcp_spec_version
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from src.core.config import get_settings
 from src.core.domain_config import (
     extract_subdomain_from_host,
     get_sales_agent_url,
@@ -37,7 +38,7 @@ def _determine_base_url(virtual_host: str | None = None) -> str:
         Base URL for generating endpoint URLs
     """
     # Check if we're in production
-    if os.getenv("PRODUCTION") == "true":
+    if get_settings().runtime.is_production:
         if virtual_host:
             return f"https://{virtual_host}"
         # Fallback to production domain (if configured)
@@ -52,15 +53,14 @@ def _determine_base_url(virtual_host: str | None = None) -> str:
         return f"{scheme}://{virtual_host}"
 
     # Local development fallback (should rarely be reached)
-    port = os.getenv("ADCP_SALES_PORT", "8080")
-    return f"http://localhost:{port}"
+    return get_settings().runtime.local_base_url
 
 
-def _extract_tenant_subdomain(tenant: dict, virtual_host: str | None = None) -> str | None:
+def _extract_tenant_subdomain(tenant_row: dict, virtual_host: str | None = None) -> str | None:
     """Extract tenant subdomain from tenant data or virtual host.
 
     Args:
-        tenant: Tenant data from database
+        tenant_row: Tenant data from database, as ``serialize_tenant_to_dict`` shapes it
         virtual_host: Virtual host domain if available
 
     Returns:
@@ -77,25 +77,25 @@ def _extract_tenant_subdomain(tenant: dict, virtual_host: str | None = None) -> 
             return virtual_host.split(".")[0]
 
     # Fallback to tenant subdomain field
-    if tenant.get("subdomain"):
-        return tenant["subdomain"]
+    if tenant_row.get("subdomain"):
+        return tenant_row["subdomain"]
 
     # Fallback to tenant_id
-    return tenant.get("tenant_id")
+    return tenant_row.get("tenant_id")
 
 
-def _generate_pending_configuration_page(tenant: dict, virtual_host: str | None = None) -> str:
+def _generate_pending_configuration_page(tenant_row: dict, virtual_host: str | None = None) -> str:
     """Generate pending configuration page for unconfigured tenants.
 
     Args:
-        tenant: Tenant data from database
+        tenant_row: Tenant data from database, as ``serialize_tenant_to_dict`` shapes it
         virtual_host: Virtual host domain if applicable
 
     Returns:
         Simple HTML page indicating pending configuration
     """
-    tenant_name = html.escape(tenant.get("name", "Unknown Publisher"))
-    tenant_id = tenant.get("tenant_id", "default")
+    tenant_name = html.escape(tenant_row.get("name", "Unknown Publisher"))
+    tenant_id = tenant_row.get("tenant_id", "default")
     base_url = _determine_base_url(virtual_host)
     admin_url = f"{base_url}/admin/tenant/{tenant_id}"
 
@@ -200,11 +200,11 @@ def _generate_pending_configuration_page(tenant: dict, virtual_host: str | None 
     """
 
 
-def generate_tenant_landing_page(tenant: dict, virtual_host: str | None = None) -> str:
+def generate_tenant_landing_page(tenant_row: dict, virtual_host: str | None = None) -> str:
     """Generate HTML content for tenant landing page.
 
     Args:
-        tenant: Tenant data from database containing name, subdomain, etc.
+        tenant_row: Tenant data from database (``serialize_tenant_to_dict``): name, subdomain, etc.
         virtual_host: Virtual host domain if applicable (e.g., from Apx-Incoming-Host)
 
     Returns:
@@ -216,18 +216,18 @@ def generate_tenant_landing_page(tenant: dict, virtual_host: str | None = None) 
     # Check if tenant is configured (has ad server connection)
     from src.core.tenant_status import is_tenant_ad_server_configured
 
-    tenant_id = tenant.get("tenant_id")
+    tenant_id = tenant_row.get("tenant_id")
     is_configured = is_tenant_ad_server_configured(tenant_id) if tenant_id else False
 
     # If not configured, show pending configuration page
     if not is_configured:
-        return _generate_pending_configuration_page(tenant, virtual_host)
+        return _generate_pending_configuration_page(tenant_row, virtual_host)
 
     # Get base URL for this environment
     base_url = _determine_base_url(virtual_host)
 
     # Extract tenant subdomain
-    tenant_subdomain = _extract_tenant_subdomain(tenant, virtual_host)
+    tenant_subdomain = _extract_tenant_subdomain(tenant_row, virtual_host)
 
     # Generate endpoint URLs
     mcp_url = f"{base_url}/mcp"
@@ -256,7 +256,7 @@ def generate_tenant_landing_page(tenant: dict, virtual_host: str | None = None) 
         is_external_domain = virtual_host and not is_sales_agent_domain(virtual_host)
         if is_external_domain and tenant_subdomain:
             # External domain: Point admin to tenant subdomain
-            if os.getenv("PRODUCTION") == "true":
+            if get_settings().runtime.is_production:
                 admin_url = f"{get_tenant_url(tenant_subdomain)}/admin/"
             else:
                 # Local dev: Use localhost with subdomain simulation
@@ -268,7 +268,7 @@ def generate_tenant_landing_page(tenant: dict, virtual_host: str | None = None) 
     # Prepare template context
     template_context = {
         # Tenant information (escaped by Jinja2 auto-escape)
-        "tenant_name": tenant.get("name", "Unknown Publisher"),
+        "tenant_name": tenant_row.get("name", "Unknown Publisher"),
         "tenant_subdomain": tenant_subdomain,
         # URLs
         "base_url": base_url,
@@ -279,9 +279,9 @@ def generate_tenant_landing_page(tenant: dict, virtual_host: str | None = None) 
         "adcp_docs_url": "https://adcontextprotocol.org",
         # Virtual host info
         "virtual_host": virtual_host,
-        "is_production": os.getenv("PRODUCTION") == "true",
+        "is_production": get_settings().runtime.is_production,
         # Additional context
-        "page_title": f"{tenant.get('name', 'Publisher')} Sales Agent",
+        "page_title": f"{tenant_row.get('name', 'Publisher')} Sales Agent",
         "version": get_version(),
         "adcp_version": get_adcp_spec_version(),
     }

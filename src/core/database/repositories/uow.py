@@ -36,6 +36,7 @@ from src.core.database.database_session import get_db_session
 from src.core.database.repositories.account import AccountRepository
 from src.core.database.repositories.creative import CreativeAssignmentRepository, CreativeRepository
 from src.core.database.repositories.currency_limit import CurrencyLimitRepository
+from src.core.database.repositories.effects import begin_effects, drain_after_commit, end_effects
 from src.core.database.repositories.idempotency_attempt import IdempotencyAttemptRepository
 from src.core.database.repositories.media_buy import MediaBuyRepository
 from src.core.database.repositories.product import ProductRepository
@@ -57,12 +58,32 @@ class BaseUoW:
     The session is private (``_session``). Business logic should use
     repository methods, not raw session access.
 
+    ``dry_run`` makes the whole unit a PREVIEW: the identical write path runs
+    and every read inside the block sees its own uncommitted writes (they are
+    flushed in-session), but the transaction is ROLLED BACK instead of
+    committed on clean exit. Preview/live parity therefore holds by
+    construction -- there is no second "simulated" write path to keep in sync,
+    which is the class of bug a shadow preview state machine reintroduces
+    every time it drifts from the real one.
+
+    Rolling back disposes of the TRANSACTION only -- an outbound HTTP call, a
+    job handed to a background executor, or a write through a different unit of
+    work is not undone by it. Those effects are therefore routed through this
+    same boundary rather than gated at their call sites (see
+    ``repositories/effects.py``): register a deferrable one with
+    ``repo.after_commit(fn)`` and it runs only if this transaction commits;
+    wrap an effect whose RESULT you need with ``repo.outbound(call)`` and it is
+    suppressed for a preview. A call site inside the transaction should never
+    need to ask whether it is a preview.
+
     Args:
         tenant_id: Tenant scope for all repository queries.
+        dry_run: Roll back on clean exit instead of committing.
     """
 
-    def __init__(self, tenant_id: str) -> None:
+    def __init__(self, tenant_id: str, dry_run: bool = False) -> None:
         self._tenant_id = tenant_id
+        self._dry_run = dry_run
         self._session_cm: Any = None
         self._session: Session | None = None
 
@@ -88,6 +109,7 @@ class BaseUoW:
     def __enter__(self) -> Self:
         self._session_cm = get_db_session()
         self._session = self._session_cm.__enter__()
+        begin_effects(self._session, preview=self._dry_run)
         self._init_repos()
         return self
 
@@ -99,9 +121,18 @@ class BaseUoW:
     ) -> None:
         assert self._session is not None
         assert self._session_cm is not None
+        session = self._session
+        committed = False
         try:
             if exc_type is None:
-                self._session.commit()
+                # dry_run is a preview: discard the identical write path's work
+                # rather than skipping it, so the results the caller already
+                # built describe exactly what a live run would have persisted.
+                if self._dry_run:
+                    session.rollback()
+                else:
+                    session.commit()
+                    committed = True
         finally:
             # Always close the session CM and clear references, even if
             # commit() raises.  Without this, the get_db_session() generator
@@ -109,6 +140,18 @@ class BaseUoW:
             self._session_cm.__exit__(exc_type, exc_val, exc_tb)
             self._session = None
             self._clear_repos()
+
+        # Deferred effects run HERE -- after the session is closed, outside the
+        # finally. Every one of them opens its own unit of work, and the session
+        # is scoped: draining while this one was still open would let an inner
+        # unit close and de-register the session out from under this exit.
+        # Only a commit releases them; a rollback (preview or exception) drops
+        # the queue, which is what lets their call sites stop asking about dry_run.
+        try:
+            if committed:
+                drain_after_commit(session)
+        finally:
+            end_effects(session)
 
     def _init_repos(self) -> None:
         raise NotImplementedError
@@ -122,7 +165,7 @@ class MediaBuyUoW(BaseUoW):
 
     Wraps a database session and provides tenant-scoped repositories for
     media buys, products (read-side; create_media_buy resolves product_map
-    via this), and currency limits.
+    via this), creative assignments, and currency limits.
     Auto-commits on clean exit, rolls back on exception.
 
     Args:
@@ -132,6 +175,12 @@ class MediaBuyUoW(BaseUoW):
     media_buys: MediaBuyRepository | None
     products: ProductRepository | None
     creatives: CreativeRepository | None
+    # create_media_buy and update_media_buy both write a package's creative
+    # assignments in the same transaction as the buy itself. They used to do it
+    # through the raw session with the model imported as ``DBAssignment`` — an
+    # alias the raw-select guard cannot resolve, so four such queries were
+    # invisible to it and to its allowlist (salesagent-3cs7o.27).
+    assignments: CreativeAssignmentRepository | None
     currency_limits: CurrencyLimitRepository | None
     idempotency_attempts: IdempotencyAttemptRepository | None
 
@@ -140,6 +189,7 @@ class MediaBuyUoW(BaseUoW):
         self.media_buys = MediaBuyRepository(self._session, self._tenant_id)
         self.products = ProductRepository(self._session, self._tenant_id)
         self.creatives = CreativeRepository(self._session, self._tenant_id)
+        self.assignments = CreativeAssignmentRepository(self._session, self._tenant_id)
         self.currency_limits = CurrencyLimitRepository(self._session, self._tenant_id)
         self.idempotency_attempts = IdempotencyAttemptRepository(self._session, self._tenant_id)
 
@@ -147,6 +197,7 @@ class MediaBuyUoW(BaseUoW):
         self.media_buys = None
         self.products = None
         self.creatives = None
+        self.assignments = None
         self.currency_limits = None
         self.idempotency_attempts = None
 
@@ -271,17 +322,30 @@ class CreativeUoW(BaseUoW):
     # (find_package_with_media_buy returns it), so it needs the repository that
     # may legally write it rather than a bare attribute assignment.
     media_buys: MediaBuyRepository | None
+    workflows: WorkflowRepository | None
+    # The account the sync request names (required by the pin) decides whether the
+    # response is flagged as sandbox; read through the same transaction.
+    accounts: AccountRepository | None
 
     def _init_repos(self) -> None:
         assert self._session is not None
         self.creatives = CreativeRepository(self._session, self._tenant_id)
         self.assignments = CreativeAssignmentRepository(self._session, self._tenant_id)
         self.media_buys = MediaBuyRepository(self._session, self._tenant_id)
+        self.accounts = AccountRepository(self._session, self._tenant_id)
+        # Approval workflow steps are written by the same request that writes
+        # the creatives they approve, so they must join the same transaction:
+        # a preview's rollback has to discard them too, and the approval
+        # notification (an after_commit effect) must not be able to name a
+        # step the commit has not yet released (#2002).
+        self.workflows = WorkflowRepository(self._session, self._tenant_id)
 
     def _clear_repos(self) -> None:
         self.creatives = None
         self.assignments = None
         self.media_buys = None
+        self.workflows = None
+        self.accounts = None
 
 
 class AdminCreativeUoW(BaseUoW):

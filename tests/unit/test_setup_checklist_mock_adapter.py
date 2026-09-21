@@ -288,7 +288,7 @@ class TestSetupChecklistMockAdapter:
 
     def test_validate_setup_complete_with_all_requirements(self):
         """validate_setup_complete() passes when all requirements are met (in multi-tenant mode)."""
-        from src.services.setup_checklist_service import SetupIncompleteError, validate_setup_complete
+        from src.services.setup_checklist_service import AdCPConfigurationError, validate_setup_complete
 
         tenant_id = "test_tenant"
 
@@ -338,12 +338,12 @@ class TestSetupChecklistMockAdapter:
                 with patch("os.getenv") as mock_getenv:
                     mock_getenv.return_value = "fake-api-key"
 
-                    # This should NOT raise SetupIncompleteError when all requirements met
+                    # This should NOT raise AdCPConfigurationError when all requirements met
                     try:
                         validate_setup_complete(tenant_id)
                         # If we get here, validation passed (expected)
                         assert True
-                    except SetupIncompleteError as e:
+                    except AdCPConfigurationError as e:
                         # Should not happen when all requirements met
                         pytest.fail(
                             f"validate_setup_complete raised error unexpectedly: {e.message}. "

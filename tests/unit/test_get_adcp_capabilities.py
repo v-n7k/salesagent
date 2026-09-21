@@ -16,8 +16,10 @@ from adcp.types.generated_poc.protocol.get_adcp_capabilities_response import (
     SupportedProtocol,
 )
 
+from tests.factories.principal import PrincipalFactory
+
 if TYPE_CHECKING:
-    from src.core.resolved_identity import ResolvedIdentity
+    from src.core.resolved_identity import PublicIdentity
 
 
 class TestGetAdcpCapabilitiesSchema:
@@ -133,38 +135,16 @@ class TestGetAdcpCapabilitiesImports:
 
         assert callable(_get_adcp_capabilities_impl)
 
-    def test_mcp_wrapper_exists(self):
-        """Test that the MCP wrapper function exists."""
-        from src.core.tools.capabilities import get_adcp_capabilities
-
-        assert callable(get_adcp_capabilities)
-
-    def test_raw_function_exists(self):
-        """Test that the raw function exists."""
-        from src.core.tools.capabilities import get_adcp_capabilities_raw
-
-        assert callable(get_adcp_capabilities_raw)
-
-    def test_raw_function_exported_from_tools(self):
-        """Test that the raw function is exported from tools module."""
-        from src.core.tools import get_adcp_capabilities_raw
-
-        assert callable(get_adcp_capabilities_raw)
-
 
 class TestGetAdcpCapabilitiesImpl:
     """Test the _get_adcp_capabilities_impl function."""
 
     def test_impl_returns_response_without_context(self):
         """Test that impl returns minimal response when no context is available."""
-        from src.core.config_loader import current_tenant
         from src.core.tools.capabilities import _get_adcp_capabilities_impl
 
-        # Reset tenant context to ensure clean state (tests may have set it)
-        current_tenant.set(None)
-
         # Call without context - should return minimal response
-        response = _get_adcp_capabilities_impl(None, None)
+        response = _get_adcp_capabilities_impl(None, PrincipalFactory.make_public_identity(tenant=None))
 
         assert isinstance(response, GetAdcpCapabilitiesResponse)
         assert response.adcp is not None
@@ -181,13 +161,9 @@ class TestGetAdcpCapabilitiesImpl:
 
     def test_impl_returns_valid_adcp_response(self):
         """Test that impl response can be serialized to valid JSON."""
-        from src.core.config_loader import current_tenant
         from src.core.tools.capabilities import _get_adcp_capabilities_impl
 
-        # Reset tenant context to ensure clean state
-        current_tenant.set(None)
-
-        response = _get_adcp_capabilities_impl(None, None)
+        response = _get_adcp_capabilities_impl(None, PrincipalFactory.make_public_identity(tenant=None))
 
         # Should be able to serialize - use mode="json" for JSON-compatible output
         data = response.model_dump(mode="json")
@@ -204,78 +180,73 @@ class TestGetAdcpCapabilitiesWithTenant:
 
     def test_impl_returns_full_response_with_tenant(self):
         """Test that impl returns full capabilities when tenant context is available."""
-        from src.core.config_loader import current_tenant
         from src.core.tools.capabilities import _get_adcp_capabilities_impl
 
-        # Set up mock tenant
+        # The tenant the request addressed. It reaches the implementation on the identity
+        # and nowhere else -- the ambient ContextVar this used to seed is deleted.
         mock_tenant = {
             "tenant_id": "test-tenant-123",
             "name": "Test Publisher",
             "subdomain": "testpub",
             "advertising_policy": {"description": "Family-friendly content only"},
         }
-        current_tenant.set(mock_tenant)
 
-        try:
-            # Mock TenantConfigUoW to avoid actual DB calls
-            mock_repo = MagicMock()
-            mock_repo.list_publisher_partners.return_value = []
-            mock_uow = MagicMock()
-            mock_uow.__enter__ = MagicMock(return_value=mock_uow)
-            mock_uow.__exit__ = MagicMock(return_value=False)
-            mock_uow.tenant_config = mock_repo
+        # Mock TenantConfigUoW to avoid actual DB calls
+        mock_repo = MagicMock()
+        mock_repo.list_publisher_partners.return_value = []
+        mock_uow = MagicMock()
+        mock_uow.__enter__ = MagicMock(return_value=mock_uow)
+        mock_uow.__exit__ = MagicMock(return_value=False)
+        mock_uow.tenant_config = mock_repo
 
-            with patch("src.core.tools.capabilities.TenantConfigUoW", return_value=mock_uow):
-                from tests.factories import PrincipalFactory
+        with (
+            patch("src.core.tools.capabilities.TenantConfigUoW", return_value=mock_uow),
+            patch(
+                "src.core.tools.capabilities.get_adapter_class_for_tenant",
+                side_effect=Exception("adapter unavailable (test)"),
+            ),
+        ):
+            from tests.factories import PrincipalFactory
 
-                identity = PrincipalFactory.make_identity(
-                    principal_id=None,
-                    tenant_id="test-tenant-123",
-                    tenant=mock_tenant,
-                    protocol="mcp",
-                )
-                response = _get_adcp_capabilities_impl(None, identity)
+            identity = PrincipalFactory.make_public_identity(tenant=mock_tenant)
+            response = _get_adcp_capabilities_impl(None, identity)
 
-                # Verify full response structure
-                assert response.adcp is not None
-                assert response.adcp.major_versions[0].root == 3
-                assert SupportedProtocol.media_buy in response.supported_protocols
-                # Full response must also declare idempotency support consistently.
-                assert response.adcp.idempotency.supported is True
-                assert response.adcp.idempotency.replay_ttl_seconds == 86400
-                # Specialism declaration must be consistent across minimal and full paths.
-                assert response.specialisms is not None
-                assert AdcpSpecialism.sales_non_guaranteed in response.specialisms
+            # Verify full response structure
+            assert response.adcp is not None
+            assert response.adcp.major_versions[0].root == 3
+            assert SupportedProtocol.media_buy in response.supported_protocols
+            # Full response must also declare idempotency support consistently.
+            assert response.adcp.idempotency.supported is True
+            assert response.adcp.idempotency.replay_ttl_seconds == 86400
+            # Specialism declaration must be consistent across minimal and full paths.
+            assert response.specialisms is not None
+            assert AdcpSpecialism.sales_non_guaranteed in response.specialisms
 
-                # Should have media_buy capabilities with portfolio
-                assert response.media_buy is not None
-                assert response.media_buy.portfolio is not None
-                assert response.media_buy.portfolio.description == "Advertising inventory from Test Publisher"
+            # Should have media_buy capabilities with portfolio
+            assert response.media_buy is not None
+            assert response.media_buy.portfolio is not None
+            assert response.media_buy.portfolio.description == "Advertising inventory from Test Publisher"
 
-                # Should have features
-                assert response.media_buy.features is not None
-                assert response.media_buy.features.inline_creative_management is True
+            # Should have features
+            assert response.media_buy.features is not None
+            assert response.media_buy.features.inline_creative_management is True
 
-                # Honesty assertions: capabilities the seller can't actually fulfill
-                # MUST declare False so buyers see the gap at discovery time, not at
-                # task-dispatch time. property_list_filtering: no adapter compiles it
-                # yet — flips True via supports_property_list_filtering().
-                # catalog_management: no sync_catalogs tool ships in this codebase;
-                # admin product CRUD is NOT the spec's buyer-driven catalog sync.
-                assert response.media_buy.features.property_list_filtering is False
-                assert response.media_buy.features.catalog_management is False
+            # Honesty assertions: capabilities the seller can't actually fulfill
+            # MUST declare False so buyers see the gap at discovery time, not at
+            # task-dispatch time. property_list_filtering: no adapter compiles it
+            # yet — flips True via supports_property_list_filtering().
+            # catalog_management: no sync_catalogs tool ships in this codebase;
+            # admin product CRUD is NOT the spec's buyer-driven catalog sync.
+            assert response.media_buy.features.property_list_filtering is False
+            assert response.media_buy.features.catalog_management is False
 
-                # Should have execution with targeting
-                assert response.media_buy.execution is not None
-                assert response.media_buy.execution.targeting is not None
-        finally:
-            # Reset tenant context
-            current_tenant.set(None)
+            # Should have execution with targeting
+            assert response.media_buy.execution is not None
+            assert response.media_buy.execution.targeting is not None
 
     def test_impl_includes_targeting_from_adapter(self):
         """Test that targeting capabilities come from adapter."""
         from src.adapters.base import TargetingCapabilities
-        from src.core.config_loader import current_tenant
         from src.core.tools.capabilities import _get_adcp_capabilities_impl
 
         mock_tenant = {
@@ -283,79 +254,73 @@ class TestGetAdcpCapabilitiesWithTenant:
             "name": "GAM Publisher",
             "subdomain": "gampub",
         }
-        current_tenant.set(mock_tenant)
 
-        try:
-            # Create mock adapter with targeting capabilities
-            mock_adapter = MagicMock()
-            mock_adapter.default_channels = ["display", "video"]
-            mock_adapter.get_targeting_capabilities.return_value = TargetingCapabilities(
-                geo_countries=True,
-                geo_regions=True,
-                nielsen_dma=True,
-                us_zip=True,
+        # Create mock adapter with targeting capabilities
+        mock_adapter = MagicMock()
+        mock_adapter.default_channels = ["display", "video"]
+        mock_adapter.get_targeting_capabilities.return_value = TargetingCapabilities(
+            geo_countries=True,
+            geo_regions=True,
+            nielsen_dma=True,
+            us_zip=True,
+        )
+
+        mock_repo = MagicMock()
+        mock_repo.list_publisher_partners.return_value = []
+        mock_uow = MagicMock()
+        mock_uow.__enter__ = MagicMock(return_value=mock_uow)
+        mock_uow.__exit__ = MagicMock(return_value=False)
+        mock_uow.tenant_config = mock_repo
+
+        with patch("src.core.tools.capabilities.TenantConfigUoW", return_value=mock_uow):
+            from tests.factories import PrincipalFactory
+
+            identity = PrincipalFactory.make_identity(
+                principal_id="principal-123",
+                tenant_id="test-tenant-456",
+                tenant=mock_tenant,
             )
 
-            mock_repo = MagicMock()
-            mock_repo.list_publisher_partners.return_value = []
-            mock_uow = MagicMock()
-            mock_uow.__enter__ = MagicMock(return_value=mock_uow)
-            mock_uow.__exit__ = MagicMock(return_value=False)
-            mock_uow.tenant_config = mock_repo
+            with patch("src.core.tools.capabilities.get_adapter_class_for_tenant") as mock_get_adapter_class:
+                mock_get_adapter_class.return_value = mock_adapter
 
-            with patch("src.core.tools.capabilities.TenantConfigUoW", return_value=mock_uow):
-                from tests.factories import PrincipalFactory
+                response = _get_adcp_capabilities_impl(None, identity)
 
-                identity = PrincipalFactory.make_identity(
-                    principal_id="principal-123",
-                    tenant_id="test-tenant-456",
-                    tenant=mock_tenant,
-                    protocol="mcp",
-                )
+                # Verify targeting from adapter
+                assert response.media_buy is not None
+                assert response.media_buy.execution is not None
+                targeting = response.media_buy.execution.targeting
+                assert targeting is not None
+                assert targeting.geo_countries is True
+                assert targeting.geo_regions is True
 
-                with patch("src.core.tools.capabilities.get_principal_object") as mock_principal:
-                    mock_principal.return_value = MagicMock()
+                # Should have geo_metros with nielsen_dma
+                assert targeting.geo_metros is not None
+                assert targeting.geo_metros.nielsen_dma is True
 
-                    with patch("src.core.tools.capabilities.get_adapter") as mock_get_adapter:
-                        mock_get_adapter.return_value = mock_adapter
-
-                        response = _get_adcp_capabilities_impl(None, identity)
-
-                        # Verify targeting from adapter
-                        assert response.media_buy is not None
-                        assert response.media_buy.execution is not None
-                        targeting = response.media_buy.execution.targeting
-                        assert targeting is not None
-                        assert targeting.geo_countries is True
-                        assert targeting.geo_regions is True
-
-                        # Should have geo_metros with nielsen_dma
-                        assert targeting.geo_metros is not None
-                        assert targeting.geo_metros.nielsen_dma is True
-
-                        # Should have geo_postal_areas with us_zip
-                        assert targeting.geo_postal_areas is not None
-                        assert targeting.geo_postal_areas.us_zip is True
-        finally:
-            current_tenant.set(None)
+                # Should have geo_postal_areas with native US=["zip"] (salesagent-y9ld
+                # R4 -- native country-keyed map, never the deprecated us_zip alias).
+                assert targeting.geo_postal_areas is not None
+                assert targeting.geo_postal_areas.US is not None
+                assert "zip" in targeting.geo_postal_areas.US
+                assert targeting.geo_postal_areas.us_zip is None
 
 
 class TestGetAdcpCapabilitiesA2AIntegration:
     """Test A2A integration for get_adcp_capabilities."""
 
-    def test_skill_in_discovery_skills(self):
-        """Test that get_adcp_capabilities is in DISCOVERY_SKILLS."""
-        from src.a2a_server.adcp_a2a_server import DISCOVERY_SKILLS
+    def test_the_registry_row_makes_the_skill_dispatchable(self):
+        """A2A serves this tool because the registry row says so, not because a method exists.
 
-        assert "get_adcp_capabilities" in DISCOVERY_SKILLS
+        This asserted `hasattr(handler, "_handle_get_adcp_capabilities_skill")`. That method
+        is gone, and so is the `hasattr` filter that used it to decide dispatch -- a filter
+        that silently overrode the registry, so `list_tasks`, `get_task_status` and
+        `complete_task` appeared on the agent card and answered MethodNotFoundError. The
+        row IS the declaration now, and it is what this grades.
+        """
+        from src.core.tools.registry import TOOLS
 
-    def test_skill_handler_exists(self):
-        """Test that the skill handler method exists."""
-        from src.a2a_server.adcp_a2a_server import AdCPRequestHandler
-
-        handler = AdCPRequestHandler.__new__(AdCPRequestHandler)
-        assert hasattr(handler, "_handle_get_adcp_capabilities_skill")
-        assert callable(handler._handle_get_adcp_capabilities_skill)
+        assert TOOLS["get_adcp_capabilities"].a2a is True
 
 
 # ===========================================================================
@@ -368,29 +333,49 @@ def _make_capabilities_identity(
     principal_id: str | None = "principal-123",
     tenant_id: str = "test-tenant",
     tenant: dict | None = None,
-) -> ResolvedIdentity:
-    """Build a ResolvedIdentity for capabilities tests."""
+) -> PublicIdentity:
+    """Build the identity a capabilities call arrives with.
+
+    ``get_adcp_capabilities`` is a PUBLIC tool, so it takes a ``PublicIdentity``:
+    ``principal_id=None`` is the anonymous caller, which is a principal-less identity and
+    not a ``ResolvedIdentity`` with a ``None`` id.
+    """
     from tests.factories import PrincipalFactory
 
     if tenant is None:
         tenant = {"tenant_id": tenant_id, "name": "Test Publisher", "subdomain": "testpub"}
-    return PrincipalFactory.make_identity(
+    return PrincipalFactory.make_public_identity(
         principal_id=principal_id,
         tenant_id=tenant_id,
         tenant=tenant,
-        protocol="mcp",
     )
 
 
 def _patch_capabilities_deps(
     adapter=None,
     db_partners=None,
+    products=None,
 ):
     """Return a context manager stack patching common capabilities dependencies.
 
+    Adapter resolution is tenant-only (salesagent-dn2s / INV-4): production
+    calls ``get_adapter_class_for_tenant(tenant)`` unconditionally, regardless
+    of whether the caller is authenticated. ``adapter=None`` here reproduces
+    the "adapter unavailable" degradation path (production catches the
+    exception and falls back to display-only channels / no targeting caps) —
+    not "no principal", which no longer affects adapter resolution at all.
+
     Args:
-        adapter: Mock adapter to return from get_adapter (None = no adapter).
+        adapter: Mock adapter CLASS-equivalent to return from
+            get_adapter_class_for_tenant (None = adapter resolution raises).
         db_partners: List of mock PublisherPartner objects from DB query.
+        products: List of mock Product rows the tenant's catalog holds. The
+            portfolio's primary_channels are the union of what each product
+            effectively offers (capabilities.py ``_map_portfolio_channels``), so
+            this lookup has to be patched or the unit-test DB guard turns the
+            whole section into a degradation advisory. The default — an empty
+            catalog — is the fallback path where the adapter's own
+            ``default_channels`` decide.
     """
     from contextlib import ExitStack
 
@@ -405,15 +390,28 @@ def _patch_capabilities_deps(
     mock_uow.tenant_config = mock_repo
     stack.enter_context(patch("src.core.tools.capabilities.TenantConfigUoW", return_value=mock_uow))
 
+    # ProductUoW is imported inside _map_portfolio_channels, so it is patched on
+    # its owning module rather than on capabilities.
+    mock_product_repo = MagicMock()
+    mock_product_repo.list_all.return_value = products or []
+    mock_product_uow = MagicMock()
+    mock_product_uow.__enter__ = MagicMock(return_value=mock_product_uow)
+    mock_product_uow.__exit__ = MagicMock(return_value=False)
+    mock_product_uow.products = mock_product_repo
+    stack.enter_context(patch("src.core.database.repositories.uow.ProductUoW", return_value=mock_product_uow))
+
     # Mock log_tool_activity (no-op)
     stack.enter_context(patch("src.core.tools.capabilities.log_tool_activity"))
 
-    # Mock get_principal_object
     if adapter is not None:
-        stack.enter_context(patch("src.core.tools.capabilities.get_principal_object", return_value=MagicMock()))
-        stack.enter_context(patch("src.core.tools.capabilities.get_adapter", return_value=adapter))
+        stack.enter_context(patch("src.core.tools.capabilities.get_adapter_class_for_tenant", return_value=adapter))
     else:
-        stack.enter_context(patch("src.core.tools.capabilities.get_principal_object", return_value=None))
+        stack.enter_context(
+            patch(
+                "src.core.tools.capabilities.get_adapter_class_for_tenant",
+                side_effect=Exception("adapter unavailable (test)"),
+            )
+        )
 
     return stack
 
@@ -520,8 +518,10 @@ class TestGracefulDegradation:
         with (
             patch("src.core.tools.capabilities.TenantConfigUoW", return_value=mock_uow),
             patch("src.core.tools.capabilities.log_tool_activity"),
-            patch("src.core.tools.capabilities.get_principal_object", return_value=MagicMock()),
-            patch("src.core.tools.capabilities.get_adapter", side_effect=Exception("Adapter init failed")),
+            patch(
+                "src.core.tools.capabilities.get_adapter_class_for_tenant",
+                side_effect=Exception("Adapter init failed"),
+            ),
         ):
             response = _get_adcp_capabilities_impl(None, identity)
 
@@ -540,7 +540,10 @@ class TestGracefulDegradation:
         with (
             patch("src.core.tools.capabilities.TenantConfigUoW", side_effect=Exception("DB down")),
             patch("src.core.tools.capabilities.log_tool_activity"),
-            patch("src.core.tools.capabilities.get_principal_object", return_value=None),
+            patch(
+                "src.core.tools.capabilities.get_adapter_class_for_tenant",
+                side_effect=Exception("adapter unavailable (test)"),
+            ),
         ):
             response = _get_adcp_capabilities_impl(None, identity)
 
@@ -634,23 +637,22 @@ class TestPublisherDomains:
 class TestResponseShapeCapabilities:
     """Test response structure and serialization for get_adcp_capabilities."""
 
-    def test_last_updated_present_with_tenant(self):
-        """Response includes last_updated when tenant context is available."""
-        from src.core.tools.capabilities import _get_adcp_capabilities_impl
-
-        identity = _make_capabilities_identity(principal_id=None)
-        stack = _patch_capabilities_deps()
-
-        with stack:
-            response = _get_adcp_capabilities_impl(None, identity)
-
-        assert response.last_updated is not None
+    # test_last_updated_present_with_tenant is REMOVED: already graded by
+    # BR-UC-010-discover-seller-capabilities.feature @T-UC-010-main-timestamp ("Capabilities
+    # response includes last_updated for cache invalidation"), MEASURED passed:3 in-process
+    # (a2a/mcp/rest) AND passed:1 in-network (e2e_rest) in the box run. The scenario is strictly
+    # stronger: it asserts last_updated parses as an RFC 3339 date-time, where this asserted only
+    # "is not None".
+    #
+    # Its sibling test_last_updated_absent_without_tenant is DELIBERATELY KEPT: the no-tenant
+    # case belongs to @T-UC-010-ext-a ("no_tenant - tenant absent, minimal capabilities"), which
+    # is NOT COLLECTED at all, so nothing grades it.
 
     def test_last_updated_absent_without_tenant(self):
         """Response has no last_updated when no tenant context (minimal response)."""
         from src.core.tools.capabilities import _get_adcp_capabilities_impl
 
-        response = _get_adcp_capabilities_impl(None, None)
+        response = _get_adcp_capabilities_impl(None, PrincipalFactory.make_public_identity(tenant=None))
         assert response.last_updated is None
 
     def test_features_defaults_with_tenant(self):
@@ -694,11 +696,162 @@ class TestResponseShapeCapabilities:
         """Minimal response (no tenant) omits media_buy from serialized output."""
         from src.core.tools.capabilities import _get_adcp_capabilities_impl
 
-        response = _get_adcp_capabilities_impl(None, None)
+        response = _get_adcp_capabilities_impl(None, PrincipalFactory.make_public_identity(tenant=None))
         assert response.media_buy is None
         data = response.model_dump(mode="json")
         # media_buy is excluded from serialization when None
         assert "media_buy" not in data
+
+
+class TestAccountBlockAndSigningDeclarations:
+    """Pin the #1592 contract: account block + honest signing declarations.
+
+    Core Invariant (#1592): every field capabilities.py emits is either
+    (a) read from the exact tenant config the corresponding enforcement path reads
+    (supported_billing via resolve_supported_billing, mirroring _check_billing_policy),
+    or (b) a true constant of the current architecture (require_operator_auth=False,
+    webhook_signing/request_signing supported=False) -- never fabricated.
+
+    These are RED until src/core/tools/capabilities.py emits account/webhook_signing/
+    request_signing (salesagent-becl.15 implements this).
+    """
+
+    def test_no_tenant_response_omits_account_but_declares_signing_false(self):
+        """No-tenant (minimal) path: account block absent, signing blocks present and False.
+
+        webhook_signing/request_signing are agent-level facts (not tenant-dependent),
+        so they must appear on BOTH the no-tenant and tenant-resolved paths. account
+        stays absent on the no-tenant path (BR-RULE-052 / ext-a: no tenant to derive
+        billing/sandbox from).
+        """
+        from src.core.tools.capabilities import _get_adcp_capabilities_impl
+
+        response = _get_adcp_capabilities_impl(None, PrincipalFactory.make_public_identity(tenant=None))
+
+        assert response.account is None
+
+        assert response.webhook_signing is not None
+        assert response.webhook_signing.supported is False
+
+        assert response.request_signing is not None
+        assert response.request_signing.supported is False
+
+    def test_account_block_present_with_tenant_and_honest_constants(self):
+        """Tenant-resolved path: account block present with the exact honest-constant shape.
+
+        require_operator_auth is a true architectural constant (False) -- config
+        surfaces to make it configurable are explicitly out of scope for this task.
+        authorization_endpoint/required_for_products/account_financials are omitted
+        (not fabricated) because no config or enforcement path backs them yet.
+        """
+        from src.core.tools.capabilities import _get_adcp_capabilities_impl
+
+        tenant = {
+            "tenant_id": "t-account-1",
+            "name": "Account Block Pub",
+            "subdomain": "acctpub",
+            "supported_billing": ["operator", "advertiser"],
+            "account_sandbox": False,
+        }
+        identity = _make_capabilities_identity(principal_id=None, tenant=tenant)
+        stack = _patch_capabilities_deps()
+
+        with stack:
+            response = _get_adcp_capabilities_impl(None, identity)
+
+        assert response.account is not None
+        assert response.account.require_operator_auth is False
+        assert response.account.authorization_endpoint is None
+        assert response.account.required_for_products is None
+        assert response.account.account_financials is None
+
+    def test_account_supported_billing_matches_resolve_supported_billing(self):
+        """account.supported_billing must equal resolve_supported_billing(tenant) exactly.
+
+        This mirrors _check_billing_policy's own read of the same helper -- the
+        capability declaration and the enforcement path must never diverge.
+        """
+        from src.core.billing_policy import resolve_supported_billing
+        from src.core.tools.capabilities import _get_adcp_capabilities_impl
+
+        tenant = {
+            "tenant_id": "t-account-2",
+            "name": "Billing Pub",
+            "subdomain": "billingpub",
+            "supported_billing": ["operator", "advertiser"],
+        }
+        identity = _make_capabilities_identity(principal_id=None, tenant=tenant)
+        stack = _patch_capabilities_deps()
+
+        with stack:
+            response = _get_adcp_capabilities_impl(None, identity)
+
+        # The helper takes the typed TenantContext production reads, not the dict the
+        # identity was built from.
+        expected = resolve_supported_billing(identity.tenant)
+        assert [bp.value for bp in response.account.supported_billing] == expected
+        assert expected == ["operator", "advertiser"]
+
+    def test_account_supported_billing_defaults_to_full_enum_when_tenant_silent(self):
+        """An unconfigured tenant (no supported_billing key) declares the full 3-value enum.
+
+        Matches resolve_supported_billing's own documented semantics: None means
+        unconfigured, and unconfigured means "accept every billing model."
+        """
+        from src.core.tools.capabilities import _get_adcp_capabilities_impl
+
+        tenant = {
+            "tenant_id": "t-account-3",
+            "name": "Silent Billing Pub",
+            "subdomain": "silentpub",
+        }
+        identity = _make_capabilities_identity(principal_id=None, tenant=tenant)
+        stack = _patch_capabilities_deps()
+
+        with stack:
+            response = _get_adcp_capabilities_impl(None, identity)
+
+        assert response.account is not None
+        assert sorted(bp.value for bp in response.account.supported_billing) == [
+            "advertiser",
+            "agent",
+            "operator",
+        ]
+
+    # test_account_sandbox_reflects_tenant_column is REMOVED: already graded by
+    # @T-UC-010-v31-account-sandbox ("sandbox flag boundary"), whose row "sandbox: false in
+    # response (explicit production) -> equal to false" is MEASURED passed on a2a, mcp and rest
+    # (and its "sandbox: true" row passes on all three too). Same outcome -- account.sandbox
+    # equals the tenant's configured value rather than a constant -- asserted on real wire bytes.
+    #
+    # Note for whoever reads this next: that scenario's THIRD row, "sandbox absent in response
+    # (production account)", is MEASURED xfailed on every transport. If a unit test for the
+    # ABSENT case is ever wanted, it would be the only coverage; this test was not it.
+
+    def test_webhook_signing_and_request_signing_declared_false_with_tenant(self):
+        """Tenant-resolved path also declares webhook_signing/request_signing supported=False.
+
+        Built once (DRY) and shared with the no-tenant path -- these are agent-level
+        facts, not tenant config.
+        """
+        from src.core.tools.capabilities import _get_adcp_capabilities_impl
+
+        tenant = {
+            "tenant_id": "t-account-5",
+            "name": "Signing Pub",
+            "subdomain": "signingpub",
+        }
+        identity = _make_capabilities_identity(principal_id=None, tenant=tenant)
+        stack = _patch_capabilities_deps()
+
+        with stack:
+            response = _get_adcp_capabilities_impl(None, identity)
+
+        assert response.webhook_signing is not None
+        assert response.webhook_signing.supported is False
+
+        assert response.request_signing is not None
+        assert response.request_signing.supported is False
 
 
 class TestGeoPostalAreas:
@@ -727,12 +880,19 @@ class TestGeoPostalAreas:
 
         postal = response.media_buy.execution.targeting.geo_postal_areas
         assert postal is not None
-        assert postal.us_zip is True
-        assert postal.ca_fsa is True
-        assert postal.gb_outward is True
-        # Fields not set should be None
-        assert postal.de_plz is None
-        assert postal.fr_code_postal is None
+        # Native country-keyed map (salesagent-y9ld R4) -- production emits ONLY the
+        # native shape, never the deprecated boolean aliases (us_zip/ca_fsa/gb_outward
+        # are `deprecated: true` at v3.1.1, postal-area-support.json).
+        assert postal.US is not None and "zip" in postal.US
+        assert postal.CA is not None and "fsa" in postal.CA
+        assert postal.GB is not None and "outward" in postal.GB
+        # Countries not set should be absent
+        assert postal.DE is None
+        assert postal.FR is None
+        # Deprecated aliases are never co-emitted
+        assert postal.us_zip is None
+        assert postal.ca_fsa is None
+        assert postal.gb_outward is None
 
     def test_no_postal_targeting_means_none(self):
         """When no postal targeting capabilities, geo_postal_areas is None."""

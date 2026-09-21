@@ -9,6 +9,29 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 
+#: Referenced by tests/e2e/adcp_request_builder.py's CI_TEST_ACCOUNT. Both must agree;
+#: the E2E builders send this id and this script is what makes it resolvable.
+CI_TEST_ACCOUNT_ID = "ci-test-account"
+
+#: The subdomain the CI tenant is reachable at, and the value a caller puts in
+#: ``x-adcp-tenant`` to address it. Owned HERE, and imported by every test that names it
+#: (tests/e2e/utils.py, tests/integration/conftest_ci_seed.py,
+#: tests/storyboard/test_storyboard_conformance.py), because this script is what makes it
+#: true in the database: the tenant_id is a fresh uuid4 per seed, so the subdomain is the
+#: only stable spelling of "the CI tenant" and a second literal of it is a silent 401 the
+#: day one of them changes. The dependency runs tests -> scripts only; a script cannot
+#: import from tests/ (see scripts/ci/migration_helpers.py).
+CI_TEST_SUBDOMAIN = "ci-test"
+
+#: The credential presented to that tenant: the plaintext token this script hashes into
+#: the CI principal's row. Owned here for the same reason as the subdomain above -- this
+#: script is what makes it resolvable -- and read by tests/integration/conftest_ci_seed.py
+#: and tests/storyboard/test_storyboard_conformance.py. ``tox.ini``'s
+#: ``STORYBOARD_AUTH_TOKEN`` default cannot import a Python constant and carries a literal
+#: that must be kept in step with this one; its comment says so.
+CI_TEST_TOKEN = "ci-test-token"
+
+
 def init_db_ci():
     """Initialize database with migrations only for CI testing."""
     try:
@@ -16,21 +39,26 @@ def init_db_ci():
         import uuid
         from datetime import UTC, datetime
 
+        from adcp.types import BrandReference
         from sqlalchemy import select
 
         from scripts.ops.migrate import run_migrations
+        from src.core.credentials import hash_token
         from src.core.database.database_session import get_db_session
         from src.core.database.models import (
+            Account,
+            AgentAccountAccess,
             AuthorizedProperty,
             CurrencyLimit,
             GAMInventory,
             PricingOption,
-            Principal,
             Product,
             PropertyTag,
             Tenant,
             TenantAuthConfig,
         )
+        from src.core.database.repositories.principal import PrincipalRepository
+        from src.core.database.repositories.principal_lookup import find_principal_by_token_hash
 
         print("Applying database migrations for CI...")
         run_migrations()
@@ -41,7 +69,7 @@ def init_db_ci():
         with get_db_session() as session:
             # First, check if CI test tenant already exists
             # Note: In Docker Compose, both adcp-server and admin-ui may run this simultaneously
-            stmt = select(Tenant).filter_by(subdomain="ci-test")
+            stmt = select(Tenant).filter_by(subdomain=CI_TEST_SUBDOMAIN)
             existing_tenant = session.scalars(stmt).first()
 
             if existing_tenant:
@@ -56,26 +84,23 @@ def init_db_ci():
                     session.flush()
                     print("   ✓ Access control configured")
 
-                # Check if principal exists GLOBALLY by access_token (it's unique across all tenants)
-                stmt_principal = select(Principal).filter_by(access_token="ci-test-token")
-                existing_principal = session.scalars(stmt_principal).first()
+                # Check if principal exists GLOBALLY by token hash (it's unique across all tenants)
+                existing_principal = find_principal_by_token_hash(session, hash_token(CI_TEST_TOKEN))
                 if not existing_principal:
                     # Create principal if it doesn't exist
                     principal_id = str(uuid.uuid4())
-                    principal = Principal(
+                    PrincipalRepository(session, tenant_id).create_with_token(
+                        CI_TEST_TOKEN,
                         principal_id=principal_id,
-                        tenant_id=tenant_id,
                         name="CI Test Principal",
-                        access_token="ci-test-token",
                         platform_mappings={"mock": {"advertiser_id": "test-advertiser"}},
                     )
-                    session.add(principal)
                     print(f"Created principal (ID: {principal_id}) for existing tenant")
                 elif existing_principal.tenant_id != tenant_id:
                     principal_id = existing_principal.principal_id
                     # Principal exists but for different tenant - update it to point to new tenant
                     print(
-                        f"⚠️  Warning: Principal with token 'ci-test-token' exists for different tenant ({existing_principal.tenant_id})"
+                        f"⚠️  Warning: Principal with token '{CI_TEST_TOKEN}' exists for different tenant ({existing_principal.tenant_id})"
                     )
                     print(f"   Updating principal to point to new tenant: {tenant_id}")
                     existing_principal.tenant_id = tenant_id
@@ -129,7 +154,7 @@ def init_db_ci():
                 tenant = Tenant(
                     tenant_id=tenant_id,
                     name="CI Test Tenant",
-                    subdomain="ci-test",
+                    subdomain=CI_TEST_SUBDOMAIN,
                     billing_plan="test",
                     ad_server="mock",
                     enable_axe_signals=True,
@@ -187,7 +212,7 @@ def init_db_ci():
                     # Handle race: another container created tenant already
                     session.rollback()
                     print(f"⚠️  Tenant already exists (race condition): {e}")
-                    stmt_tenant = select(Tenant).filter_by(subdomain="ci-test")
+                    stmt_tenant = select(Tenant).filter_by(subdomain=CI_TEST_SUBDOMAIN)
                     existing_tenant = session.scalars(stmt_tenant).first()
                     if existing_tenant:
                         tenant_id = existing_tenant.tenant_id
@@ -197,18 +222,15 @@ def init_db_ci():
 
                 # Now create principal + dependencies in separate transaction
                 # Query again for principal (may have been created by other container)
-                stmt_principal = select(Principal).filter_by(access_token="ci-test-token")
-                existing_principal = session.scalars(stmt_principal).first()
+                existing_principal = find_principal_by_token_hash(session, hash_token(CI_TEST_TOKEN))
 
                 if not existing_principal:
-                    principal = Principal(
+                    PrincipalRepository(session, tenant_id).create_with_token(
+                        CI_TEST_TOKEN,
                         principal_id=principal_id,
-                        tenant_id=tenant_id,
                         name="CI Test Principal",
-                        access_token="ci-test-token",
                         platform_mappings={"mock": {"advertiser_id": "test-advertiser"}},
                     )
-                    session.add(principal)
 
                     try:
                         session.commit()
@@ -217,8 +239,7 @@ def init_db_ci():
                         session.rollback()
                         print(f"⚠️  Principal already exists (race condition): {e}")
                         # Re-query for principal created by other container
-                        stmt_principal = select(Principal).filter_by(access_token="ci-test-token")
-                        existing_principal = session.scalars(stmt_principal).first()
+                        existing_principal = find_principal_by_token_hash(session, hash_token(CI_TEST_TOKEN))
                         if existing_principal:
                             principal_id = existing_principal.principal_id
                             print(f"   Using existing principal (ID: {principal_id})")
@@ -227,7 +248,7 @@ def init_db_ci():
                     if existing_principal.tenant_id != tenant_id:
                         # Principal exists but for different tenant - update it
                         print(
-                            f"⚠️  Warning: Principal with token 'ci-test-token' exists for different tenant ({existing_principal.tenant_id})"
+                            f"⚠️  Warning: Principal with token '{CI_TEST_TOKEN}' exists for different tenant ({existing_principal.tenant_id})"
                         )
                         print(f"   Updating principal to point to new tenant: {tenant_id}")
                         existing_principal.tenant_id = tenant_id
@@ -273,6 +294,47 @@ def init_db_ci():
                     stmt_tag = select(PropertyTag).filter_by(tenant_id=tenant_id, tag_id="all_inventory")
                     existing_tag = session.scalars(stmt_tag).first()
                     print("   Using existing currency limit and property tag")
+
+            # Account for the CI principal — placed HERE, after both the existing-tenant
+            # and new-tenant branches, because this is where tenant_id and principal_id are
+            # finally settled. `account` is in /required on sync-creatives-request.json,
+            # create-media-buy-request.json and update-media-buy-request.json, so without
+            # this row every E2E call to those tools is refused with INVALID_REQUEST before
+            # reaching the behavior under test.
+            #
+            # It belongs to the CI tenant, NOT to "default": this script MOVES the
+            # ci-test-token principal into a fresh tenant when it finds it elsewhere, so a
+            # grant pinned to "default" would block that very move with a
+            # ForeignKeyViolation and take down initialization.
+            stmt_account = select(Account).filter_by(tenant_id=tenant_id, account_id=CI_TEST_ACCOUNT_ID)
+            if not session.scalars(stmt_account).first():
+                session.add(
+                    Account(
+                        tenant_id=tenant_id,
+                        account_id=CI_TEST_ACCOUNT_ID,
+                        name="CI Test Account",
+                        status="active",
+                        operator="testbrand.com",
+                        brand=BrandReference(domain="testbrand.com"),
+                    )
+                )
+                # Both parents must be ON the database before the association row: its FKs
+                # are composite and AgentAccountAccess declares no ORM relationship to
+                # either, so the unit of work has nothing to order the INSERTs by.
+                session.flush()
+
+            # Resolution is gated on the GRANT, not on the account row alone —
+            # _require_account_access rejects a principal with no grant, so the account
+            # without this would resolve to AUTHORIZATION_ERROR rather than succeed.
+            stmt_grant = select(AgentAccountAccess).filter_by(
+                tenant_id=tenant_id, principal_id=principal_id, account_id=CI_TEST_ACCOUNT_ID
+            )
+            if not session.scalars(stmt_grant).first():
+                session.add(
+                    AgentAccountAccess(tenant_id=tenant_id, principal_id=principal_id, account_id=CI_TEST_ACCOUNT_ID)
+                )
+            session.commit()
+            print(f"  ✓ CI account ready: {CI_TEST_ACCOUNT_ID} (granted to {principal_id})")
 
             # Validate prerequisites before creating products
             print("Validating prerequisites for product creation...")
@@ -362,7 +424,7 @@ def init_db_ci():
 
                     # Create corresponding pricing_option (required for pricing display)
                     pricing = p["pricing"]
-                    pricing_option = PricingOption(
+                    pricing_option = PricingOption.create(
                         tenant_id=tenant_id,
                         product_id=p["product_id"],
                         pricing_model=pricing["model"],
@@ -539,18 +601,15 @@ def init_db_ci():
                         raise ValueError("Failed to create or find isolation tenant")
 
             # Create principal for isolation tenant
-            stmt_iso_principal = select(Principal).filter_by(access_token="iso-test-token")
-            existing_iso_principal = iso_session.scalars(stmt_iso_principal).first()
+            existing_iso_principal = find_principal_by_token_hash(iso_session, hash_token("iso-test-token"))
             if not existing_iso_principal:
                 iso_principal_id = str(uuid.uuid4())
-                iso_principal = Principal(
+                PrincipalRepository(iso_session, iso_tenant_id).create_with_token(
+                    "iso-test-token",
                     principal_id=iso_principal_id,
-                    tenant_id=iso_tenant_id,
                     name="Isolation Test Principal",
-                    access_token="iso-test-token",
                     platform_mappings={"mock": {"advertiser_id": "iso-test-advertiser"}},
                 )
-                iso_session.add(iso_principal)
                 try:
                     iso_session.commit()
                     print(f"  ✓ Created isolation principal (ID: {iso_principal_id})")
@@ -637,7 +696,7 @@ def init_db_ci():
 
                     pricing = p["pricing"]
                     iso_session.add(
-                        PricingOption(
+                        PricingOption.create(
                             tenant_id=iso_tenant_id,
                             product_id=p["product_id"],
                             pricing_model=pricing["model"],

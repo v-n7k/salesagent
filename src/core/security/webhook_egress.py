@@ -1,6 +1,6 @@
 """The one place a webhook payload becomes signed bytes and those bytes go out.
 
-Core Invariant (salesagent-47n9.1): a webhook sender must never hold a signer
+Core Invariant (#1441): a webhook sender must never hold a signer
 and a body serializer as two independent decisions. One function serializes
 the body once, optionally signs those exact bytes, and transmits those exact
 bytes via ``content=`` through :mod:`src.core.security.outbound_http`. No
@@ -42,11 +42,9 @@ from typing import Any
 
 from adcp import sign_legacy_webhook
 from adcp.types import AuthenticationScheme
-from adcp.types.generated_poc.core.push_notification_config import (
-    Authentication as LibraryAuthentication,
-)
 from pydantic import ValidationError
 
+from src.core.schemas.notification import PushAuthentication
 from src.core.security.outbound_http import (
     OutboundDeliveryFailed,
     OutboundError,
@@ -64,16 +62,16 @@ logger = logging.getLogger(__name__)
 def _authentication_or_refusal(
     scheme: str | None,
     credentials: str | None,
-) -> LibraryAuthentication | WebhookDeliveryOutcome | None:
+) -> PushAuthentication | WebhookDeliveryOutcome | None:
     """Validate the stored pair, or return the refusal it earns. The ONE decision.
 
     Returns ``None`` for "no authentication block was registered" — deliver plain,
     which is what the pinned schema's "absence selects 9421" means for a seller
     that has not implemented the 9421 profile yet.
 
-    Constructing the pinned ``Authentication`` (imported here as
-    ``LibraryAuthentication``, an alias -- there is no subclass) IS the
-    validation: ``credentials`` is required with ``minLength: 32`` and ``schemes``
+    Constructing ``PushAuthentication`` (the push-config narrowing of the one local
+    Authentication concept, src/core/schemas/notification.py: ``credentials`` required, as
+    that pin declares and as signing needs) IS the validation: ``credentials`` is required with ``minLength: 32`` and ``schemes``
     has ``maxItems: 1``, and the enum is the pin's own, unwidened. A scheme
     outside it is REFUSED rather than folded, and casing is not folded either --
     ``"bearer"`` refuses exactly as ``"Digest"`` does. So there is no
@@ -98,7 +96,7 @@ def _authentication_or_refusal(
         return _NO_AUTHENTICATION
 
     try:
-        return LibraryAuthentication(schemes=[scheme], credentials=credentials)
+        return PushAuthentication(schemes=[scheme], credentials=credentials)
     except ValidationError as exc:
         reason = _reason(exc)
         return _refusal(scheme, reason)
@@ -172,7 +170,7 @@ def _refusal(scheme: str | None, reason: RefusalReason) -> WebhookDeliveryOutcom
 # Sentinel for "no authentication block was registered": deliver plain, which is
 # what the pinned schema's "absence selects 9421" means for a seller that has not
 # implemented the 9421 profile yet.
-_NO_AUTHENTICATION: LibraryAuthentication | None = None
+_NO_AUTHENTICATION: PushAuthentication | None = None
 
 
 def _canonical_body(payload: dict[str, Any]) -> bytes:
@@ -230,9 +228,7 @@ def prepare_signed_request(
 # ── The seam: one decision, one outcome ───────────────────────────────────────
 
 
-def _headers_for(
-    auth: LibraryAuthentication | None, headers: dict[str, str] | None
-) -> tuple[dict[str, str], str | None]:
+def _headers_for(auth: PushAuthentication | None, headers: dict[str, str] | None) -> tuple[dict[str, str], str | None]:
     """Turn a validated block into (headers, signing secret). Matched ONCE.
 
     Shared by both twins deliberately: if each destructured the decision itself,

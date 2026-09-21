@@ -130,7 +130,7 @@ echo "Parallelism: docker_mem=${_docker_mem_gb}GB cores=${_cores} -> unit=$UNIT_
 # The in-network path always builds the full compose stack, so it can't honor
 # the "quick == no Docker" or the targeted contracts — those delegate to the
 # verbatim host runner that already implements them (DRY, single source).
-ALL_SUITES="unit,integration,bdd,admin,e2e,ui"
+ALL_SUITES="unit,integration,bdd,admin,e2e,ui,quality,storyboard"
 DELEGATE=0
 case "${1:-ci}" in
     quick) DELEGATE=1 ;;
@@ -179,7 +179,17 @@ fi
 # different one and the results cannot be attributed to the run that produced
 # them ("no confirmed run identity to attribute local test-results/ to").
 RESULTS_DIR="test-results/innet_$(date -u +%d%m%y_%H%M)"
+# Kept in step with scripts/audit/compare_payloads.py's PAYLOAD_SUBDIR.
+PAYLOAD_SUBDIR="payloads"
+# Kept in step with scripts/audit/run_report.py's STORYBOARD_SUBDIR.
+STORYBOARD_SUBDIR="storyboard"
 mkdir -p "$RESULTS_DIR"
+# The storyboard suite publishes the runner's per-protocol summary to
+# test-results/storyboard_summary_<protocol>.json (tests/storyboard/test_storyboard_conformance.py,
+# _publish_summary) -- ONE path, overwritten by every run. Clear the previous run's copies
+# now, so that what is found after the suites ran is this run's or nothing: a storyboard
+# env that died before publishing must read as "no summary", not as last week's score.
+rm -f test-results/storyboard_summary_*.json
 
 dc() { docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT_NAME" --profile runner "$@"; }
 
@@ -201,8 +211,11 @@ trap cleanup EXIT
 echo "Building pinned creative-agent image (single-sourced)..."
 scripts/creative-agent-stack.sh build
 
+# adcp-server-storyboard is named explicitly even though it shares adcp-server's build
+# context: `dc up -d` would otherwise build it mid-bringup, after this step reported the
+# build done. Same Dockerfile, so it is a layer-cache hit, not a second real build.
 echo "Building image + bringing up the app stack in-network (project: $COMPOSE_PROJECT_NAME)..."
-dc build postgres adcp-server proxy tests
+dc build postgres adcp-server adcp-server-storyboard proxy tests
 
 # Pre-create logs/ group-writable + setgid BEFORE anything else touches the
 # bind mount: adcp-server bind-mounts .:/app and creates logs/audit.log at
@@ -292,15 +305,21 @@ scripts/dev/ensure-test-tls.sh || dc run --rm --no-deps -T tests python scripts/
 # https origins it fronts (proxy.adcp.test, creative-agent.adcp.test) pointing
 # at nothing while every scenario that depends on either reported green on the
 # http branch instead (E2E_TLS_BASE_URL / CREATIVE_AGENT_URL, salesagent-amht.2).
-dc up -d postgres adcp-server proxy tls-proxy creative-pg creative-agent
+# adcp-server-storyboard is named here for the same reason every other service is: this
+# list is EXPLICIT, so a service absent from it is built and never started. It was, once —
+# the storyboard suite then reported `overall_status=unreachable` and graded 0 checks,
+# which the ledger-fitness check turned into a wall of "stale entry" noise. Exactly the
+# shape the comment below exists to prevent, one service over.
+dc up -d postgres adcp-server adcp-server-storyboard proxy tls-proxy creative-pg creative-agent
 
 echo "Waiting for Postgres + server health (in-network)..."
 deadline=$(( $(date +%s) + 360 ))
-pg=false srv=false
+pg=false srv=false sbs=false
 while [ "$(date +%s)" -lt "$deadline" ]; do
     [ "$pg" = false ] && dc exec -T postgres pg_isready -U adcp_user >/dev/null 2>&1 && pg=true && echo "  Postgres ready"
     [ "$srv" = false ] && dc exec -T adcp-server curl -sf http://localhost:8080/health >/dev/null 2>&1 && srv=true && echo "  Server ready"
-    [ "$pg" = true ] && [ "$srv" = true ] && break
+    [ "$sbs" = false ] && dc exec -T adcp-server-storyboard curl -sf http://localhost:8080/health >/dev/null 2>&1 && sbs=true && echo "  Storyboard server ready"
+    [ "$pg" = true ] && [ "$srv" = true ] && [ "$sbs" = true ] && break
     sleep 3
 done
 [ "$pg" = true ] || { echo "Postgres never became ready"; dc logs postgres; exit 1; }
@@ -324,6 +343,18 @@ done
     echo "       (waited on http://localhost:8080/health inside adcp-server; every" >&2
     echo "        server-dependent suite would otherwise error en masse)" >&2
     dc logs --tail=120 adcp-server >&2
+    exit 1
+}
+# Same fail-fast for the storyboard's own agent. Without it an unreachable agent reaches
+# the runner, which grades 0 checks and reports overall_status=unreachable — and the
+# ledger-fitness check then declares EVERY ledger entry stale, because none of them
+# resolves to a collected check. One dead container, a hundred lines of unrelated-looking
+# failure. That is the noise this whole block exists to convert into one message.
+[ "$sbs" = true ] || {
+    echo "ERROR: adcp-server-storyboard never became healthy within the 360s deadline — aborting" >&2
+    echo "       (the storyboard suite grades this agent, not the one behind proxy:8000;" >&2
+    echo "        it runs the same image with ENVIRONMENT=production)" >&2
+    dc logs --tail=120 adcp-server-storyboard >&2
     exit 1
 }
 
@@ -565,6 +596,47 @@ for _suite in ${SUITES//,/ }; do
         _missing_reports="$_missing_reports $_suite"
     fi
 done
+
+# The dispatched-request payload artifacts (tests/bdd/payload_capture.py), one per BDD
+# suite. They go in a SUBDIRECTORY, not beside the reports: compare_runs.py globs
+# "*.json" at this level and would read a payload artifact as a pytest report, whose
+# "tests" key is absent -- printing a phantom "baseline 0 new 0 ... CLEAN" row instead of
+# failing. Out of its glob is out of its way.
+#
+# A BDD suite that produced no payload artifact is treated exactly like a suite that
+# produced no report, for the reason stated above it: a suite that produced none was not
+# measured, and a gate whose "before" is silently absent reads every later run as CLEAN.
+mkdir -p "$RESULTS_DIR/$PAYLOAD_SUBDIR"
+for _suite in ${SUITES//,/ }; do
+    case "$_suite" in bdd*) ;; *) continue ;; esac
+    if [ -f ".tox/${_suite}_payloads.json" ]; then
+        cp ".tox/${_suite}_payloads.json" "$RESULTS_DIR/$PAYLOAD_SUBDIR/${_suite}.json" \
+            || _missing_reports="$_missing_reports ${_suite}(payload-copy-failed)"
+    else
+        _missing_reports="$_missing_reports ${_suite}(no-payload-artifact)"
+    fi
+done
+
+# The storyboard runner's own summaries, one per protocol. They are the suite's SCORE:
+# the conformance suite materializes only failures and skips as pytest items, so
+# storyboard.json reads "0 passed" whatever the runner measured. Kept inside the run
+# directory (a subdirectory, for the same reason the payloads are) so the score has the
+# run's provenance instead of being overwritten at test-results/ by the next run.
+# scripts/audit/run_report.py reads them from here.
+case ",$SUITES," in
+    *,storyboard,*)
+        mkdir -p "$RESULTS_DIR/$STORYBOARD_SUBDIR"
+        for _protocol in mcp a2a; do
+            if [ -f "test-results/storyboard_summary_${_protocol}.json" ]; then
+                cp "test-results/storyboard_summary_${_protocol}.json" "$RESULTS_DIR/$STORYBOARD_SUBDIR/summary_${_protocol}.json" \
+                    || _missing_reports="$_missing_reports storyboard(summary-copy-failed-${_protocol})"
+            else
+                _missing_reports="$_missing_reports storyboard(no-runner-summary-${_protocol})"
+            fi
+        done
+        ;;
+esac
+
 if [ -n "$_missing_reports" ]; then
     echo "ERROR: no JSON report for suite(s):$_missing_reports" >&2
     echo "       The suite ran but produced no report -- it died before writing one." >&2
@@ -583,7 +655,20 @@ ls -1 "$RESULTS_DIR"/*.json 2>/dev/null || echo "  (no JSON reports extracted)"
 # run_all_tests_host.sh -- see scripts/check_truncated_reports.py for why it
 # lives in its own file rather than inline here.
 if ls "$RESULTS_DIR"/*.json >/dev/null 2>&1; then
-    if ! python3 scripts/check_truncated_reports.py "$RESULTS_DIR"; then
+    if ! python3 -m scripts.check_truncated_reports "$RESULTS_DIR"; then
+        RC=1
+    fi
+fi
+
+# Name every suite that reported failures OR errors, before the reconcile below
+# decides whether the exit code is unexplained. Errors are pytest SETUP/TEARDOWN
+# deaths and are NOT counted in summary.failed, so without this a run can print
+# "failed 0" everywhere and still exit 1 -- see scripts/report_suite_failures.py.
+SUITES_CLEAN=0
+if ls "$RESULTS_DIR"/*.json >/dev/null 2>&1; then
+    if python3 -m scripts.report_suite_failures "$RESULTS_DIR"; then
+        SUITES_CLEAN=1
+    else
         RC=1
     fi
 fi
@@ -600,20 +685,7 @@ fi
 # command inside returned. A long `-p` run that drops its CLI connection at the
 # end lands here with every suite already finished and every report written.
 if [ "$RC" -ne 0 ] && ls "$RESULTS_DIR"/*.json >/dev/null 2>&1; then
-    if python3 - "$RESULTS_DIR" <<'PYEOF'
-import glob, json, os, sys
-bad = []
-for f in sorted(glob.glob(os.path.join(sys.argv[1], "*.json"))):
-    try:
-        s = json.load(open(f)).get("summary", {})
-    except Exception:
-        bad.append(f"{os.path.basename(f)}: unreadable")
-        continue
-    if s.get("failed") or s.get("error"):
-        bad.append(f"{os.path.basename(f)}: failed={s.get('failed', 0)} error={s.get('error', 0)}")
-sys.exit(1 if bad else 0)
-PYEOF
-    then
+    if [ "$SUITES_CLEAN" -eq 1 ]; then
         echo ""
         echo "NOTE: exit code is $RC but every suite report shows 0 failures and 0 errors."
         case "$RC" in

@@ -1060,43 +1060,30 @@ function generateA2ACode() {
 }
 
 // Toggle token visibility between truncated and full
-function toggleTokenVisibility(button) {
-    const tokenDisplay = button.parentElement.querySelector('.token-display');
-    const isShowingFull = tokenDisplay.textContent === tokenDisplay.dataset.full;
-
-    if (isShowingFull) {
-        tokenDisplay.textContent = tokenDisplay.dataset.truncated;
-        button.textContent = '👁';
-        button.title = 'Show full token';
-    } else {
-        tokenDisplay.textContent = tokenDisplay.dataset.full;
-        button.textContent = '👁‍🗨';
-        button.title = 'Hide full token';
-    }
-}
-
-// Copy access token to clipboard
-function copyAccessToken(token) {
+// The server keeps only a hash of a token, so a token is shown once: at creation, and
+// here at rotation. Rotating replaces it; the old one stops resolving on the server.
+function rotateToken(principalId, principalName) {
     const button = event.target.closest('button');
-    if (!button) {
-        alert('Failed to copy to clipboard');
+    if (!confirm(`Rotate the API token for "${principalName}"? The current token stops working immediately.`)) {
         return;
     }
-
-    const originalText = button.textContent;
-
-    navigator.clipboard.writeText(token).then(() => {
-        button.textContent = '✓';
-        button.classList.add('btn-success');
-        button.classList.remove('btn-outline-secondary');
-
-        setTimeout(() => {
-            button.textContent = originalText;
-            button.classList.remove('btn-success');
-            button.classList.add('btn-outline-secondary');
-        }, 2000);
+    fetch(`${config.scriptName}/tenant/${config.tenantId}/principal/${principalId}/rotate-token`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    }).then(response => response.json()).then(data => {
+        if (!data.success) {
+            alert('Failed to rotate token: ' + (data.error || 'unknown error'));
+            return;
+        }
+        const tokenDisplay = button.parentElement.querySelector('.token-display');
+        if (tokenDisplay) {
+            tokenDisplay.textContent = data.token_prefix + '…';
+        }
+        // Shown once. prompt() gives the operator a selectable field to copy from.
+        prompt(`New API token for "${principalName}". Copy it now; it will not be shown again.`, data.token);
     }).catch(err => {
-        alert('Failed to copy to clipboard: ' + err.message);
+        alert('Failed to rotate token: ' + err.message);
     });
 }
 
@@ -1357,7 +1344,11 @@ function selectGAMAdapter() {
 }
 
 // Copy A2A configuration to clipboard
-function copyA2AConfig(principalId, principalName, accessToken) {
+// The token is not on this page (the server keeps only its hash), so the config carries a
+// placeholder the operator replaces with the token shown at creation or rotation.
+const TOKEN_PLACEHOLDER = '<token shown at creation or rotation>';
+
+function copyA2AConfig(principalId, principalName) {
     // Capture the button element before async operations
     const button = event.target.closest('button');
     if (!button) {
@@ -1389,7 +1380,7 @@ function copyA2AConfig(principalId, principalName, accessToken) {
         version: "1.0",
         auth: {
             type: "bearer",
-            token: accessToken
+            token: TOKEN_PLACEHOLDER
         }
     };
 
@@ -1414,7 +1405,7 @@ function copyA2AConfig(principalId, principalName, accessToken) {
 }
 
 // Copy MCP configuration to clipboard
-function copyMCPConfig(principalId, principalName, accessToken) {
+function copyMCPConfig(principalId, principalName) {
     // Capture the button element before async operations
     const button = event.target.closest('button');
     if (!button) {
@@ -1446,7 +1437,7 @@ function copyMCPConfig(principalId, principalName, accessToken) {
         version: "1.0",
         auth: {
             type: "bearer",
-            token: accessToken
+            token: TOKEN_PLACEHOLDER
         }
     };
 

@@ -3,40 +3,6 @@
 from __future__ import annotations
 
 
-def assert_resolve_auth_dep_passes_token(auth_token: str = "pre-extracted-token") -> None:
-    """Assert _resolve_auth_dep passes auth_ctx.auth_token to resolve_identity().
-
-    Shared assertion used by multiple test files to verify the token passthrough
-    contract: the pre-extracted token must be forwarded without redundant
-    re-extraction from headers.
-    """
-    from unittest.mock import patch
-
-    from src.core.auth_context import AuthContext, _resolve_auth_dep
-    from tests.factories.principal import PrincipalFactory
-
-    auth_ctx = AuthContext(
-        auth_token=auth_token,
-        headers={"authorization": f"Bearer {auth_token}"},
-    )
-    mock_identity = PrincipalFactory.make_identity(
-        principal_id="test_principal",
-        tenant_id="default",
-        tenant={"tenant_id": "default"},
-        protocol="rest",
-    )
-    expected_headers = {"authorization": f"Bearer {auth_token}"}
-    with patch("src.core.resolved_identity.resolve_identity", return_value=mock_identity) as mock_resolve:
-        _resolve_auth_dep(auth_ctx)
-
-    mock_resolve.assert_called_once_with(
-        headers=expected_headers,
-        auth_token=auth_token,
-        require_valid_token=False,
-        protocol="rest",
-    )
-
-
 def assert_effective_properties_normalized(
     effective: list[dict],
     raw: list[dict],
@@ -68,11 +34,17 @@ def assert_effective_properties_normalized(
 _LAZY_EXPORTS: dict[str, str] = {
     "SIGNATURE_HEADER": "tests.helpers.hmac_assertions",
     "TIMESTAMP_HEADER": "tests.helpers.hmac_assertions",
+    "admin_auth_session": "tests.helpers.admin_session",
     "assert_backoff_schedule": "tests.helpers.backoff_assertions",
     "assert_envelope_shape": "tests.helpers.envelope_assertions",
+    "assert_no_marker_in_envelope": "tests.helpers.envelope_assertions",
     "assert_no_raw_validation_leak": "tests.helpers.envelope_assertions",
+    "locate_envelope_error": "tests.helpers.envelope_assertions",
+    "locate_envelope_errors": "tests.helpers.envelope_assertions",
     "assert_delivered_unsigned": "tests.helpers.hmac_assertions",
     "assert_signature_verifies_over_wire_body": "tests.helpers.hmac_assertions",
+    "concurrent_commit_in_write_window": "tests.helpers.race_window",
+    "operator_answer": "tests.helpers.race_window",
     "create_minimal_product": "tests.helpers.adcp_factories",
     "create_product_with_empty_pricing": "tests.helpers.adcp_factories",
     "create_test_brand_manifest": "tests.helpers.adcp_factories",
@@ -89,9 +61,11 @@ _LAZY_EXPORTS: dict[str, str] = {
     "create_test_property": "tests.helpers.adcp_factories",
     "create_test_property_dict": "tests.helpers.adcp_factories",
     "load_ledger_nodeids": "tests.helpers.ledger",
+    "LegacyCachedShape": "tests.helpers.idempotency_seeds",
     "make_active_cached_success": "tests.helpers.idempotency_seeds",
     "rendered_log_calls": "tests.helpers.log_assertions",
     "seed_cached_success": "tests.helpers.idempotency_seeds",
+    "assert_construction_rejects": "tests.helpers.construction_assertions",
     "seed_media_buy": "tests.helpers.idempotency_seeds",
     "seed_principal": "tests.helpers.idempotency_seeds",
 }
@@ -111,13 +85,19 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
+    # Admin blueprint session helper
+    "admin_auth_session",
     # Auth helpers
-    "assert_resolve_auth_dep_passes_token",
     # Backoff schedule assertions
     "assert_backoff_schedule",
+    # In-process request-construction assertions
+    "assert_construction_rejects",
     # Envelope assertions
     "assert_envelope_shape",
+    "locate_envelope_error",
+    "locate_envelope_errors",
     "assert_no_raw_validation_leak",
+    "assert_no_marker_in_envelope",
     # HMAC signature assertions
     "SIGNATURE_HEADER",
     "TIMESTAMP_HEADER",
@@ -127,6 +107,9 @@ __all__ = [
     "load_ledger_nodeids",
     # Log-call assertions
     "rendered_log_calls",
+    # Concurrency harness
+    "concurrent_commit_in_write_window",
+    "operator_answer",
     # Idempotency cache seeding
     "make_active_cached_success",
     "seed_cached_success",

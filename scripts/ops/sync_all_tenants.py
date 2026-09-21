@@ -14,6 +14,7 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.admin.sync_api import initialize_superadmin_api_key
+from src.core.config import get_settings
 from src.core.database.database_session import get_db_session
 from src.core.database.models import AdapterConfig, Tenant
 
@@ -56,7 +57,7 @@ def sync_all_gam_tenants():
         try:
             # Call sync API
             response = requests.post(
-                f"http://localhost:{os.environ.get('ADCP_SALES_PORT', 8080)}/api/v1/sync/trigger/{tenant_id}",
+                f"http://localhost:{get_settings().runtime.adcp_sales_port}/api/v1/sync/trigger/{tenant_id}",
                 headers={"X-API-Key": api_key},
                 json={"sync_type": "full"},
                 timeout=300,  # 5 minute timeout per tenant

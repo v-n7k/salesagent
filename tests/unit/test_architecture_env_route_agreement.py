@@ -79,9 +79,18 @@ _OWNER_MODULE = ".".join(OWNER.with_suffix("").parts)
 _CATCH_ALL_SCENARIOS = (
     ("UC-002", "T-UC-002-alt-asap", "conftest.py:3475"),
     ("UC-003", "T-UC-003-alt-budget", "conftest.py:3586"),
-    ("UC-006", "T-UC-006-boundary-approval", "conftest.py:3617"),
-    ("UC-011", "T-UC-011-v31-error-conflict-version", "conftest.py:3665"),
-    ("UC-018", "T-UC-018-boundary-default-query", "conftest.py:3644-3647"),
+    # UC-006 has no specimen: its catch-all was replaced by rows that each named a
+    # measured blocker, and every one of those rows is empty now -- each scenario they
+    # parked was corrected to the pin and wired, or deleted as ungrounded in the sync
+    # request's schema. The row family still exists in tests/bdd/conftest.py and would
+    # pin a specimen again the day a UC-006 scenario is parked on one of them.
+    # UC-011 and UC-018 have no specimen either, for the same reason UC-006 has none: the
+    # catch-all rows they fell through to no longer park anything. Both rows survive and
+    # build the real env (they are pinned in test_architecture_measurement_floors.py's
+    # EXPECTED_WIRED_ROUTES), so a scenario of those UCs is WIRED by construction and
+    # cannot be a specimen of "falls through to an xfail". What catches an unbound step in
+    # them now is the dormancy tripwire, which fails the scenario and names the step
+    # instead of xfailing it out of sight.
 )
 
 _UC004_TAG_PREFIX = "T-UC-004-"
@@ -97,7 +106,6 @@ _MINIMUM_COLLECTED_ITEMS = 6000
 # regression, not a shrug.
 _MODULES_WITHOUT_SCENARIO_IDENTITY = frozenset(
     {
-        "tests/bdd/test_brand_shorthand_bdd.py",
         "tests/bdd/test_get_products_inventory_profile.py",
     }
 )

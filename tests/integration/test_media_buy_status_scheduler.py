@@ -29,6 +29,7 @@ from src.core.database.models import (
 )
 from src.core.database.repositories import MediaBuyRepository
 from src.services.media_buy_status_scheduler import MediaBuyStatusScheduler
+from tests.factories.principal import plaintext_token_for
 from tests.helpers.media_buy_write_seam import (
     assert_status_move_carried_bookkeeping,
     read_media_buy_state,
@@ -73,11 +74,11 @@ def _create_test_tenant(tenant_id: str = "test_tenant") -> str:
 def _create_test_principal(tenant_id: str, principal_id: str = "test_principal") -> str:
     """Create a test principal."""
     with get_db_session() as session:
-        principal = Principal(
+        principal = Principal.with_token(
+            plaintext_token_for(principal_id),
             tenant_id=tenant_id,
             principal_id=principal_id,
             name="Test Principal",
-            access_token="test_token",
             platform_mappings={"mock": {"advertiser_id": "mock_adv_123"}},
         )
         session.add(principal)

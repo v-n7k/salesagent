@@ -28,6 +28,8 @@ from tests.harness.admin_tenant_scoping import AdminTenantScopingEnv
 @pytest.fixture()
 def scoping_env(docker_services_e2e):
     """``AdminTenantScopingEnv`` in e2e mode, with the target tenant already seeded."""
-    with admin_stack_env(docker_services_e2e, lambda: AdminTenantScopingEnv(mode="e2e")) as env:
+    with admin_stack_env(
+        docker_services_e2e, lambda base_url: AdminTenantScopingEnv(mode="e2e", base_url=base_url)
+    ) as env:
         env.seed_target_tenant()
         yield env

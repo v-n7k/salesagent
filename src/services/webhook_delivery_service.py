@@ -21,11 +21,12 @@ from typing import Any
 from uuid import uuid4
 
 from adcp import get_adcp_spec_version
+from adcp.webhooks import GeneratedTaskStatus
 
-from src.core.security.egress.attempts import env_float
+from src.core.config import get_settings
 from src.core.security.webhook_egress import deliver_webhook
 from src.core.webhook_validator import webhook_url_for_log
-from src.core.webhooks.delivery import WebhookDeliveryOutcome, WebhookTaskContext
+from src.core.webhooks.delivery import WebhookDeliveryOutcome, WebhookTaskContext, build_webhook_envelope
 from src.services.webhook_conclusion import record_conclusion
 
 logger = logging.getLogger(__name__)
@@ -38,15 +39,15 @@ logger = logging.getLogger(__name__)
 DELIVERY_REPORT_TASK_TYPE = "delivery_report"
 
 
-# How long a single delivery attempt may take. Read at CALL time, not import, so a
-# test can shorten it without patching a transport — which is what lets the timeout
-# path be graded against an origin that really stalls, rather than against a mocked
-# clock. Production's value is unchanged.
-_DELIVERY_TIMEOUT_ENV = "ADCP_WEBHOOK_DELIVERY_TIMEOUT_SECONDS"
-_DEFAULT_DELIVERY_TIMEOUT_SECONDS = 10.0
+# How long a single delivery attempt may take (ADCP_WEBHOOK_DELIVERY_TIMEOUT_SECONDS on
+# the settings). Read at CALL time, not import, so a test can shorten it without
+# patching a transport — which is what lets the timeout path be graded against an
+# origin that really stalls, rather than against a mocked clock. Production's value
+# is unchanged.
 
-# The breaker's three policy parameters, read at CALL time for the same reason the
-# delivery timeout above is: an import-time read would freeze the first value.
+# The breaker's three policy parameters (ADCP_WEBHOOK_BREAKER_* on the settings), read
+# at CALL time for the same reason the delivery timeout above is: an import-time read
+# would freeze the first value.
 #
 # These are POLICY, not a test hatch. 5 / 2 / 60s is a default a deployment may
 # legitimately disagree with — a seller with flaky buyers may want to trip later,
@@ -58,20 +59,15 @@ _DEFAULT_DELIVERY_TIMEOUT_SECONDS = 10.0
 # The code path is identical in both environments — only the VALUE differs, which
 # is the line between configuration and a branch that behaves differently under
 # test. See prebid/salesagent#2094 for the general case.
-_BREAKER_FAILURE_THRESHOLD_ENV = "ADCP_WEBHOOK_BREAKER_FAILURE_THRESHOLD"
-_BREAKER_SUCCESS_THRESHOLD_ENV = "ADCP_WEBHOOK_BREAKER_SUCCESS_THRESHOLD"
-_BREAKER_TIMEOUT_ENV = "ADCP_WEBHOOK_BREAKER_TIMEOUT_SECONDS"
-_DEFAULT_BREAKER_FAILURE_THRESHOLD = 5
-_DEFAULT_BREAKER_SUCCESS_THRESHOLD = 2
-_DEFAULT_BREAKER_TIMEOUT_SECONDS = 60
 
 
 def _configured_breaker() -> "CircuitBreaker":
     """Build a breaker from the configured policy, falling back to the shipped defaults."""
+    limits = get_settings().limits
     return CircuitBreaker(
-        failure_threshold=int(env_float(_BREAKER_FAILURE_THRESHOLD_ENV, _DEFAULT_BREAKER_FAILURE_THRESHOLD)),
-        success_threshold=int(env_float(_BREAKER_SUCCESS_THRESHOLD_ENV, _DEFAULT_BREAKER_SUCCESS_THRESHOLD)),
-        timeout_seconds=int(env_float(_BREAKER_TIMEOUT_ENV, _DEFAULT_BREAKER_TIMEOUT_SECONDS)),
+        failure_threshold=limits.adcp_webhook_breaker_failure_threshold,
+        success_threshold=limits.adcp_webhook_breaker_success_threshold,
+        timeout_seconds=limits.adcp_webhook_breaker_timeout_seconds,
     )
 
 
@@ -291,8 +287,10 @@ class WebhookDeliveryService:
             if not is_final and next_expected_interval_seconds:
                 next_expected_at = (datetime.now(UTC) + timedelta(seconds=next_expected_interval_seconds)).isoformat()
 
-            # Build AdCP compliant payload with new fields
-            delivery_payload = {
+            # The delivery REPORT -- the inner ``result``, shaped by
+            # media-buy-delivery-webhook-result.json. It is not the POST body: the envelope
+            # below is (AdCP 3.1.1 L3/webhooks.mdx :217, ":254 is the counter-example").
+            delivery_result = {
                 "adcp_version": get_adcp_spec_version(),
                 "notification_type": notification_type,
                 "is_adjusted": is_adjusted,  # New field for late data
@@ -317,11 +315,11 @@ class WebhookDeliveryService:
 
             # Add optional fields
             if next_expected_at:
-                delivery_payload["next_expected_at"] = next_expected_at
+                delivery_result["next_expected_at"] = next_expected_at
 
             # Add optional metrics to totals dict
             # We know structure is valid as we just created it above
-            media_buy_delivery = delivery_payload["media_buy_deliveries"][0]  # type: ignore[index]
+            media_buy_delivery = delivery_result["media_buy_deliveries"][0]  # type: ignore[index]
             totals: dict[str, Any] = media_buy_delivery["totals"]
             if clicks is not None:
                 totals["clicks"] = clicks
@@ -334,15 +332,21 @@ class WebhookDeliveryService:
                 f"[{notification_type}{'|adjusted' if is_adjusted else ''}]"
             )
 
-            # Send webhook with enhanced security and reliability
-            success = self._send_webhook_enhanced(
+            # The values this function COMPUTED, named on the context rather than left for a
+            # downstream re-derivation off the payload. That re-derivation is what silently
+            # persisted sequence_number=1 / notification_type=None on the sibling sender.
+            ctx = WebhookTaskContext(
+                task_id=media_buy_id,
+                task_type=DELIVERY_REPORT_TASK_TYPE,
                 tenant_id=tenant_id,
                 principal_id=principal_id,
                 media_buy_id=media_buy_id,
-                delivery_payload=delivery_payload,
+                sequence_number=sequence_number,
+                notification_type=notification_type,
             )
 
-            return success
+            # Send webhook with enhanced security and reliability
+            return self._send_webhook_enhanced(ctx=ctx, result=delivery_result)
 
         except Exception as e:
             logger.error(
@@ -356,10 +360,8 @@ class WebhookDeliveryService:
         db: Any,
         config: Any,
         *,
-        tenant_id: str,
-        principal_id: str,
-        media_buy_id: str,
-        delivery_payload: dict[str, Any],
+        ctx: WebhookTaskContext,
+        result: dict[str, Any],
     ) -> bool:
         """Deliver one webhook to one configured endpoint and record the outcome.
 
@@ -383,7 +385,7 @@ class WebhookDeliveryService:
             )
             return False
 
-        endpoint_key = f"{tenant_id}:{config.url}"
+        endpoint_key = f"{ctx.tenant_id}:{config.url}"
 
         # Get or create circuit breaker for this endpoint
         if endpoint_key not in self._circuit_breakers:
@@ -418,9 +420,18 @@ class WebhookDeliveryService:
         # still lives in src/core/webhook_validator.py.)
 
         # Add to queue (bounded)
+        # The body, built HERE because its echo fields belong to THIS registration, and
+        # serialized once so the queue carries a plain dict the signer can hash.
+        payload = build_webhook_envelope(
+            task=ctx,
+            status=GeneratedTaskStatus.completed,
+            result=result,
+            operation_id=config.operation_id,
+            token=config.token,
+        )
         webhook_data = {
             "config": config,
-            "payload": delivery_payload,
+            "payload": payload.model_dump(mode="json", exclude_none=True),
             "timestamp": datetime.now(UTC),
         }
 
@@ -433,7 +444,7 @@ class WebhookDeliveryService:
         # ONE conclusion per config. The outcome arrives from the
         # delivery function; what to DO about it — write it down, feed
         # the breaker, count it — is decided here, once, for every kind.
-        # Splitting that across the delivery function's arms is how this
+        # Splitting that across the delivery function's branches is how this
         # sender ended up feeding a breaker but recording nothing.
         outcome = self._deliver_with_backoff(endpoint_key, queue)
         if outcome is None:
@@ -441,15 +452,6 @@ class WebhookDeliveryService:
             # outcome to record and no signal to give the breaker.
             return False
 
-        ctx = WebhookTaskContext(
-            task_id=media_buy_id,
-            task_type=DELIVERY_REPORT_TASK_TYPE,
-            tenant_id=tenant_id,
-            principal_id=principal_id,
-            media_buy_id=media_buy_id,
-            sequence_number=delivery_payload.get("sequence_number", 1),
-            notification_type=delivery_payload.get("notification_type"),
-        )
         # Persistence is observability; it does not get a vote on
         # delivery. Without this swallow a DB error would be caught by
         # this method's outer bare ``except`` and turn a webhook that WAS
@@ -459,9 +461,10 @@ class WebhookDeliveryService:
         # (expire_on_commit is True, so `config` re-loads after this — safe,
         # the session is still open, and safe_url was computed above.)
         try:
+            assert ctx.tenant_id
             record_conclusion(
                 db,
-                tenant_id=tenant_id,
+                tenant_id=ctx.tenant_id,
                 ctx=ctx,
                 log_id=str(uuid4()),
                 webhook_url=config.url,
@@ -483,18 +486,19 @@ class WebhookDeliveryService:
 
     def _send_webhook_enhanced(
         self,
-        tenant_id: str,
-        principal_id: str,
-        media_buy_id: str,
-        delivery_payload: dict[str, Any],
+        ctx: WebhookTaskContext,
+        result: dict[str, Any],
     ) -> bool:
-        """Send webhook with enhanced security and reliability features.
+        """Send one delivery report to every endpoint this principal registered.
+
+        Takes the REPORT, not a finished body, because the envelope is per-registration:
+        ``operation_id`` and ``token`` are echoed from the config being delivered to, so two
+        endpoints registered by the same principal receive the same report inside two
+        different envelopes.
 
         Args:
-            tenant_id: Tenant identifier
-            principal_id: Principal identifier
-            media_buy_id: Media buy identifier
-            delivery_payload: AdCP delivery payload
+            ctx: The delivery's task identity, from the caller that computed it.
+            result: The delivery report, shaped by media-buy-delivery-webhook-result.json.
 
         Returns:
             True if sent successfully, False otherwise
@@ -507,24 +511,18 @@ class WebhookDeliveryService:
                 PushNotificationConfigRepository,
             )
 
+            assert ctx.tenant_id and ctx.principal_id
             with get_db_session() as db:
-                configs = PushNotificationConfigRepository(db, tenant_id).list_active_by_principal(principal_id)
+                configs = PushNotificationConfigRepository(db, ctx.tenant_id).list_active_by_principal(ctx.principal_id)
 
                 if not configs:
-                    logger.debug(f"⚠️ No webhooks configured for {tenant_id}/{principal_id}")
+                    logger.debug(f"⚠️ No webhooks configured for {ctx.tenant_id}/{ctx.principal_id}")
                     return False
 
                 # Send to all configured webhooks
                 sent_count = 0
                 for config in configs:
-                    if self._deliver_to_config(
-                        db,
-                        config,
-                        tenant_id=tenant_id,
-                        principal_id=principal_id,
-                        media_buy_id=media_buy_id,
-                        delivery_payload=delivery_payload,
-                    ):
+                    if self._deliver_to_config(db, config, ctx=ctx, result=result):
                         sent_count += 1
 
                 if sent_count > 0:
@@ -574,7 +572,7 @@ class WebhookDeliveryService:
         # serialization as two independent things to keep in sync.
         #
         # The auth DECISION above that transport is owned entirely by
-        # deliver_webhook/adeliver_webhook (salesagent-47n9.24, GH #1894). This
+        # deliver_webhook/adeliver_webhook (#1894). This
         # sender used to make
         # it inline and made it wrong four ways at once: it read webhook_secret (a
         # column with zero writers in src/, so the signing branch was unreachable
@@ -614,7 +612,7 @@ class WebhookDeliveryService:
                 scheme=config.authentication_type,
                 credentials=config.authentication_token,
                 headers=headers,
-                timeout=env_float(_DELIVERY_TIMEOUT_ENV, _DEFAULT_DELIVERY_TIMEOUT_SECONDS),
+                timeout=get_settings().limits.adcp_webhook_delivery_timeout_seconds,
                 max_attempts=3,
             )
         except Exception as e:
@@ -624,9 +622,9 @@ class WebhookDeliveryService:
             # The pinned transport's own wrong-host guard raises a bare RuntimeError,
             # which belongs here rather than escaping into the poller thread.
             logger.error("Unexpected error delivering to %s: %s", safe_url, e, exc_info=True)
-            # No outcome kind covers a NON-transport failure, so this arm builds
+            # No outcome kind covers a NON-transport failure, so this branch builds
             # the one it means. It no longer feeds the breaker itself — every kind
-            # reaches the caller's single conclusion, so no arm can be the one that
+            # reaches the caller's single conclusion, so no branch can be the one that
             # forgets.
             return WebhookDeliveryOutcome.unexpected(type(e).__name__)
 

@@ -8,7 +8,7 @@ In single-tenant mode, most of these functions are not needed since there's
 no subdomain routing. In multi-tenant mode, you must set SALES_AGENT_DOMAIN.
 """
 
-import os
+from src.core.config import get_settings
 
 
 def _is_localhost(domain: str | None) -> bool:
@@ -32,7 +32,7 @@ def get_sales_agent_domain() -> str | None:
         The configured SALES_AGENT_DOMAIN, or None if not configured.
         Multi-tenant mode requires this to be set.
     """
-    return os.getenv("SALES_AGENT_DOMAIN")
+    return get_settings().runtime.sales_agent_domain
 
 
 def get_admin_domain() -> str | None:
@@ -42,13 +42,7 @@ def get_admin_domain() -> str | None:
         The configured ADMIN_DOMAIN, or constructs from SALES_AGENT_DOMAIN,
         or None if neither is configured.
     """
-    # First check for explicit ADMIN_DOMAIN
-    if domain := os.getenv("ADMIN_DOMAIN"):
-        return domain
-    # Fall back to constructing from sales agent domain if available
-    if sales_domain := get_sales_agent_domain():
-        return f"admin.{sales_domain}"
-    return None
+    return get_settings().runtime.admin_domain_or_derived
 
 
 def get_super_admin_domain() -> str | None:
@@ -57,7 +51,7 @@ def get_super_admin_domain() -> str | None:
     Returns:
         The configured SUPER_ADMIN_DOMAIN, or None if not configured.
     """
-    return os.getenv("SUPER_ADMIN_DOMAIN")
+    return get_settings().runtime.super_admin_domain
 
 
 def get_sales_agent_url(protocol: str = "https") -> str | None:
@@ -194,9 +188,8 @@ def get_oauth_redirect_uri(protocol: str = "https") -> str | None:
         The OAuth callback URL (e.g., https://sales-agent.example.com/admin/auth/google/callback)
         or None if not configured.
     """
-    # Allow override via environment variable
-    if env_uri := os.getenv("GOOGLE_OAUTH_REDIRECT_URI"):
-        return env_uri
+    if configured := get_settings().auth.google_oauth_redirect_uri:
+        return configured
 
     if url := get_sales_agent_url(protocol):
         return f"{url}/admin/auth/google/callback"
@@ -224,4 +217,4 @@ def get_support_email() -> str:
         The configured SUPPORT_EMAIL, or a placeholder if not set.
         Configure via environment variable for production deployments.
     """
-    return os.getenv("SUPPORT_EMAIL", "support@example.com")
+    return get_settings().runtime.support_email

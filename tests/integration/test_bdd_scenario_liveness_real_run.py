@@ -239,10 +239,12 @@ def test_provenance_tag_is_a_recorded_field_not_a_collection_filter(tmp_path: Pa
     on the record as data.
 
     Graded on the two retagged members specifically, and on what the artifact
-    then says about them: both are genuinely DORMANT today (pytest-bdd raises
-    ``StepDefinitionNotFoundError`` on their first Given), so honest measurement
-    must report them ``steps_bound=False`` with the unbound step named — the
-    exact fact the current filter hides.
+    then says about them. One is genuinely DORMANT today (pytest-bdd raises
+    ``StepDefinitionNotFoundError`` on its first Given), so honest measurement
+    must report it ``steps_bound=False`` with the unbound step named — the exact
+    fact the old filter hid. The other is wired now (its Givens are the shared
+    ones), and the record must say THAT: a retag can neither hide a scenario nor
+    invent dormancy for one that runs.
     """
     data = _run_bdd_slice(tmp_path, UC006_FILE, UC006_MARKER)
     scenarios = {s["scenario_id"]: s for s in data["scenarios"]}
@@ -261,22 +263,24 @@ def test_provenance_tag_is_a_recorded_field_not_a_collection_filter(tmp_path: Pa
         "T-UC-006-storyboard-provenance-claim-contradicted": (
             'the Buyer Agent submits a creative claiming digital_source_type "digital_capture"'
         ),
-        "T-UC-006-storyboard-creative-reception-stateful-render": (
-            "the Buyer Agent pushes creative assets to a stateful sales agent"
-        ),
     }
 
     for scenario in retagged:
         record = scenarios[scenario.identifier]
         # The provenance tag is DATA on the record, not the membership predicate.
         assert set(record["tags"]) == {t.lstrip("@") for t in scenario.tags}
-        # Dormancy, measured — this is what the collection filter currently hides.
-        assert record["steps_bound"] is False
-        assert unbound_given[scenario.identifier] in record["unbound_steps"]
-        assert record["harness_wired"] is None
         assert {o["transport"] for o in record["observations"]} == IN_PROCESS_TRANSPORTS
-        assert all(o["outcome"] == "xfailed" for o in record["observations"])
-        assert all(o["reason_category"] == "no_steps_bound" for o in record["observations"])
+        if scenario.identifier in unbound_given:
+            # Dormancy, measured — this is what the collection filter used to hide.
+            assert record["steps_bound"] is False
+            assert unbound_given[scenario.identifier] in record["unbound_steps"]
+            assert record["harness_wired"] is None
+            assert all(o["outcome"] == "xfailed" for o in record["observations"])
+            assert all(o["reason_category"] == "no_steps_bound" for o in record["observations"])
+        else:
+            # Wired and running: the record says so, whatever its provenance tag.
+            assert record["steps_bound"] is True
+            assert not record["unbound_steps"]
 
 
 # Scoped budget, NOT a global relaxation. Every other test here shells out to ONE
