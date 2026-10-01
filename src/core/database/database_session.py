@@ -6,7 +6,6 @@ management across the entire application.
 """
 
 import logging
-import os
 from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
@@ -17,7 +16,8 @@ from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import DisconnectionError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, scoped_session, sessionmaker
 
-from src.core.database.db_config import DatabaseConfig, int_env
+from src.core.config import get_settings
+from src.core.database.db_config import DatabaseConfig
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +53,8 @@ def _is_pgbouncer_connection(connection_string: str) -> bool:
     Returns:
         True if PgBouncer is detected, False otherwise
     """
-    # Check environment variable first (explicit override)
-    if os.environ.get("USE_PGBOUNCER", "false").lower() == "true":
+    # The explicit override first
+    if get_settings().database.use_pgbouncer:
         return True
 
     # Parse connection string to check port
@@ -72,9 +72,9 @@ def get_engine():
     global _engine, _session_factory, _scoped_session
 
     if _engine is None:
-        # In test mode without DATABASE_URL, we should NOT create a real connection
-        # Unit tests should mock database access, not use real connections
-        if os.environ.get("ADCP_TESTING") and not os.environ.get("DATABASE_URL"):
+        # Under test with no database configured, opening an engine is a test bug, not a
+        # fallback: unit tests mock database access.
+        if get_settings().unit_tests_may_not_open_a_database:
             raise RuntimeError(
                 "Unit tests should not create real database connections. "
                 "Either mock get_db_session() or set DATABASE_URL for integration tests. "
@@ -87,10 +87,10 @@ def get_engine():
         if "postgresql" not in connection_string:
             raise ValueError("Only PostgreSQL is supported. Use DATABASE_URL=postgresql://...")
 
-        # Get timeout configuration from environment
-        query_timeout = int_env("DATABASE_QUERY_TIMEOUT", "30")  # 30s default
-        connect_timeout = int_env("DATABASE_CONNECT_TIMEOUT", "10")  # 10s default
-        pool_timeout = int_env("DATABASE_POOL_TIMEOUT", "30")  # 30s default
+        db = get_settings().database
+        query_timeout = db.database_query_timeout
+        connect_timeout = db.database_connect_timeout
+        pool_timeout = db.database_pool_timeout
 
         # Detect PgBouncer usage (typically port 6543)
         # PgBouncer requires different pooling strategy since it manages connections
@@ -119,13 +119,12 @@ def get_engine():
         else:
             logger.info("Direct PostgreSQL connection - using standard connection pool settings")
             # Direct PostgreSQL settings (no PgBouncer).
-            # DB_POOL_SIZE / DB_MAX_OVERFLOW env vars allow CI to tune the pool
-            # down (e.g. DB_POOL_SIZE=4 DB_MAX_OVERFLOW=8) without code changes,
-            # preventing postgres max_connections exhaustion in GHA runners (D40).
+            # DB_POOL_SIZE / DB_MAX_OVERFLOW let CI tune the pool down (e.g. 4 / 8)
+            # without code changes, so a GHA runner does not exhaust max_connections (D40).
             _engine = create_engine(
                 connection_string,
-                pool_size=int_env("DB_POOL_SIZE", "10"),
-                max_overflow=int_env("DB_MAX_OVERFLOW", "20"),
+                pool_size=db.db_pool_size,
+                max_overflow=db.db_max_overflow,
                 pool_timeout=pool_timeout,  # Seconds to wait for connection from pool
                 pool_recycle=3600,  # Recycle connections after 1 hour
                 pool_pre_ping=True,  # Test connections before use

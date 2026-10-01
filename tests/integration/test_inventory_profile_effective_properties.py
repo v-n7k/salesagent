@@ -18,7 +18,8 @@ from decimal import Decimal
 import pytest
 
 from src.core.database.database_session import get_db_session
-from src.core.database.models import InventoryProfile, PricingOption, Product, Tenant
+from src.core.database.models import InventoryProfile, Product, Tenant
+from tests.factories import PricingOptionFactory
 from tests.helpers import assert_effective_properties_normalized
 from tests.helpers.adcp_factories import create_test_db_product
 
@@ -101,7 +102,7 @@ def test_product_custom(integration_db, test_tenant):
         )
 
         # Add required pricing option
-        pricing = PricingOption(
+        pricing = PricingOptionFactory.build(
             tenant_id=test_tenant.tenant_id,
             product_id="custom_product",
             pricing_model="cpm",
@@ -139,7 +140,7 @@ def test_product_with_profile(integration_db, test_tenant, test_profile):
         )
 
         # Add required pricing option
-        pricing = PricingOption(
+        pricing = PricingOptionFactory.build(
             tenant_id=test_tenant.tenant_id,
             product_id="profile_product",
             pricing_model="cpm",
@@ -439,7 +440,7 @@ class TestEffectiveImplementationConfig:
             product_id = product.product_id
 
             # Add required pricing option
-            pricing = PricingOption(
+            pricing = PricingOptionFactory.build(
                 tenant_id=test_tenant.tenant_id,
                 product_id="test_profile_fallback",
                 pricing_model="cpm",

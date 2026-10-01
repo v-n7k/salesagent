@@ -15,6 +15,7 @@ import pytest
 from src.core.database.database_session import get_db_session
 from src.core.database.models import Principal, Tenant
 from src.core.database.repositories import MediaBuyRepository, MediaBuyUoW
+from tests.factories.principal import plaintext_token_for
 from tests.integration.conftest import cleanup_tenant, make_media_buy, make_package
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
@@ -58,11 +59,11 @@ def principal_a(tenant_a):
     """Create a principal in tenant A."""
     principal_id = "write_principal_a"
     with get_db_session() as session:
-        principal = Principal(
+        principal = Principal.with_token(
+            plaintext_token_for(principal_id),
             tenant_id=tenant_a,
             principal_id=principal_id,
             name="Write Advertiser A",
-            access_token="write_token_a",
             platform_mappings={"mock": {"advertiser_id": "adv_write_a"}},
         )
         session.add(principal)
@@ -75,11 +76,11 @@ def principal_b(tenant_b):
     """Create a principal in tenant B."""
     principal_id = "write_principal_b"
     with get_db_session() as session:
-        principal = Principal(
+        principal = Principal.with_token(
+            plaintext_token_for(principal_id),
             tenant_id=tenant_b,
             principal_id=principal_id,
             name="Write Advertiser B",
-            access_token="write_token_b",
             platform_mappings={"mock": {"advertiser_id": "adv_write_b"}},
         )
         session.add(principal)

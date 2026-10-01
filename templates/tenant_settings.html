@@ -2107,16 +2107,11 @@ Exclude any products that don't match the brand's tone.</pre>
                                     <td><code>{{ principal.principal_id }}</code></td>
                                     <td>
                                         <div class="d-flex align-items-center gap-1">
-                                            <code class="token-display" data-full="{{ principal.access_token }}" data-truncated="{{ principal.access_token[:12] }}...">{{ principal.access_token[:12] }}...</code>
+                                            <code class="token-display" title="Only the first characters are kept in a readable form; the token itself is stored hashed">{{ principal.token_prefix }}…</code>
                                             <button class="btn btn-outline-secondary btn-sm py-0 px-1"
-                                                    onclick="toggleTokenVisibility(this)"
-                                                    title="Show/hide full token">
-                                                👁
-                                            </button>
-                                            <button class="btn btn-outline-secondary btn-sm py-0 px-1"
-                                                    onclick="copyAccessToken('{{ principal.access_token }}')"
-                                                    title="Copy token">
-                                                📋
+                                                    onclick="rotateToken('{{ principal.principal_id }}', '{{ principal.name }}')"
+                                                    title="Rotate token: issues a new one, shown once; the old one stops working">
+                                                🔄
                                             </button>
                                         </div>
                                     </td>
@@ -2149,13 +2144,13 @@ Exclude any products that don't match the brand's tone.</pre>
                                     <td>
                                         <div class="btn-group btn-group-sm">
                                             <button class="btn btn-outline-primary btn-sm"
-                                                    onclick="copyA2AConfig('{{ principal.principal_id }}', '{{ principal.name }}', '{{ principal.access_token }}')"
-                                                    title="Copy A2A Configuration">
+                                                    onclick="copyA2AConfig('{{ principal.principal_id }}', '{{ principal.name }}')"
+                                                    title="Copy A2A configuration (fill in the token you were shown at creation or rotation)">
                                                 A2A
                                             </button>
                                             <button class="btn btn-outline-primary btn-sm"
-                                                    onclick="copyMCPConfig('{{ principal.principal_id }}', '{{ principal.name }}', '{{ principal.access_token }}')"
-                                                    title="Copy MCP Configuration">
+                                                    onclick="copyMCPConfig('{{ principal.principal_id }}', '{{ principal.name }}')"
+                                                    title="Copy MCP configuration (fill in the token you were shown at creation or rotation)">
                                                 MCP
                                             </button>
                                         </div>
@@ -2636,7 +2631,7 @@ Exclude any products that don't match the brand's tone.</pre>
 from fastmcp.client.transports import StreamableHttpTransport
 
 headers = {
-    "x-adcp-auth": "YOUR_ACCESS_TOKEN"{% if not tenant.virtual_host %},
+    "Authorization": "Bearer YOUR_ACCESS_TOKEN"{% if not tenant.virtual_host %},
     "x-adcp-tenant": "{{ tenant.subdomain }}"{% endif %}
 
 }

@@ -7,20 +7,6 @@
     "source_url": "http://localhost:9999/api/creative-agent"
   },
   "agent_url": "https://creative.adcontextprotocol.org",
-  "legacy_id_map": {
-    "display_300x250": "https://creative.adcontextprotocol.org",
-    "display_728x90": "https://creative.adcontextprotocol.org",
-    "display_160x600": "https://creative.adcontextprotocol.org",
-    "display_300x600": "https://creative.adcontextprotocol.org",
-    "display_320x50": "https://creative.adcontextprotocol.org",
-    "display_970x250": "https://creative.adcontextprotocol.org",
-    "video_640x480": "https://creative.adcontextprotocol.org",
-    "video_1280x720": "https://creative.adcontextprotocol.org",
-    "video_1920x1080": "https://creative.adcontextprotocol.org",
-    "audio_30s": "https://creative.adcontextprotocol.org",
-    "audio_60s": "https://creative.adcontextprotocol.org",
-    "native_1x1": "https://creative.adcontextprotocol.org"
-  },
   "formats": [
     {
       "format_id": {

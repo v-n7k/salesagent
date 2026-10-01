@@ -5,18 +5,17 @@ standard FastAPI routes so they are served by the unified FastAPI app.
 """
 
 import logging
-import os
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import select
 
-from src.core.config_loader import get_tenant_by_virtual_host
+from src.core.config_loader import get_tenant_by_virtual_host, tenant_id_for
 from src.core.database.database_session import get_db_session
-from src.core.database.models import Principal as ModelPrincipal
 from src.core.database.models import Product as ModelProduct
 from src.core.database.models import Tenant
+from src.core.database.repositories.principal import PrincipalRepository
 from src.core.domain_config import extract_subdomain_from_host, is_sales_agent_domain
 from src.landing import generate_tenant_landing_page
 
@@ -25,13 +24,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def require_testing_mode() -> None:
-    """FastAPI dependency that restricts access to testing environments only."""
-    if os.environ.get("ADCP_TESTING") != "true":
-        raise HTTPException(status_code=404, detail="Not found")
-
-
-debug_router = APIRouter(dependencies=[Depends(require_testing_mode)])
+# The routes on this router exist only where the deployment allows them: ``src/app.py``
+# includes it when ``get_settings().debug_routes_enabled`` says so, and nowhere else does it
+# exist at all. No per-request check: a route that is not mounted cannot be reached.
+debug_router = APIRouter()
 
 
 @router.get("/health")
@@ -40,18 +36,14 @@ async def health(request: Request):
     return JSONResponse({"status": "healthy", "service": "mcp"})
 
 
-@router.post("/_internal/reset-db-pool")
+@debug_router.post("/_internal/reset-db-pool")
 async def reset_db_pool(request: Request):
     """Reset database connection pool after external data changes.
 
-    This is a testing-only endpoint that flushes the SQLAlchemy connection pool,
-    ensuring fresh connections see recently committed data. Only works when
-    ADCP_TESTING environment variable is set to 'true'.
+    A testing-only endpoint that flushes the SQLAlchemy connection pool, so fresh
+    connections see recently committed data. On the debug router, so it exists only where
+    the deployment mounts that router.
     """
-    if os.getenv("ADCP_TESTING") != "true":
-        logger.warning("Attempted to reset DB pool outside testing mode")
-        return JSONResponse({"error": "This endpoint is only available in testing mode"}, status_code=403)
-
     try:
         from src.core.database.database_session import reset_engine
 
@@ -59,14 +51,6 @@ async def reset_db_pool(request: Request):
 
         reset_engine()
         logger.info("  ✓ Database connection pool reset")
-
-        from src.core.config_loader import current_tenant
-
-        try:
-            current_tenant.set(None)
-            logger.info("  ✓ Cleared tenant context (will force fresh lookup on next request)")
-        except Exception as ctx_error:
-            logger.warning(f"  ⚠️ Could not clear tenant context: {ctx_error}")
 
         return JSONResponse(
             {
@@ -87,8 +71,14 @@ async def debug_db_state(request: Request):
             product_stmt = select(ModelProduct)
             all_products = session.scalars(product_stmt).all()
 
-            principal_stmt = select(ModelPrincipal).filter_by(access_token="ci-test-token")
-            principal = session.scalars(principal_stmt).first()
+            # The CI seed is identified the way the resolver identifies a caller: tenant
+            # first, by its stable subdomain, then the principal inside it. No token is
+            # turned into a principal here; the seed tenant holds exactly one principal,
+            # and this route only reports whether the seed exists.
+            seed_tenant_id = tenant_id_for(subdomain="ci-test")
+            principal = (
+                next(iter(PrincipalRepository(session, seed_tenant_id).list_all()), None) if seed_tenant_id else None
+            )
 
             principal_info = None
             tenant_info = None
@@ -139,10 +129,10 @@ async def debug_tenant(request: Request):
     detection_method = None
 
     if apx_host:
-        tenant = get_tenant_by_virtual_host(apx_host)
-        if tenant:
-            tenant_id = tenant.get("tenant_id")
-            tenant_name = tenant.get("name")
+        tenant_row = get_tenant_by_virtual_host(apx_host)
+        if tenant_row:
+            tenant_id = tenant_row.get("tenant_id")
+            tenant_name = tenant_row.get("name")
             detection_method = "apx-incoming-host"
 
     if not tenant_id and host_header:
@@ -176,21 +166,21 @@ async def debug_root(request: Request):
 
     virtual_host = apx_host or host_header
 
-    tenant = get_tenant_by_virtual_host(virtual_host) if virtual_host else None
+    tenant_row = get_tenant_by_virtual_host(virtual_host) if virtual_host else None
 
     debug_info = {
         "all_headers": headers,
         "apx_host": apx_host,
         "host_header": host_header,
         "virtual_host": virtual_host,
-        "tenant_found": tenant is not None,
-        "tenant_id": tenant.get("tenant_id") if tenant else None,
-        "tenant_name": tenant.get("name") if tenant else None,
+        "tenant_found": tenant_row is not None,
+        "tenant_id": tenant_row.get("tenant_id") if tenant_row else None,
+        "tenant_name": tenant_row.get("name") if tenant_row else None,
     }
 
-    if tenant:
+    if tenant_row:
         try:
-            html_content = generate_tenant_landing_page(tenant, virtual_host)
+            html_content = generate_tenant_landing_page(tenant_row, virtual_host)
             debug_info["landing_page_generated"] = True
             debug_info["landing_page_length"] = len(html_content)
         except Exception as e:
@@ -210,10 +200,10 @@ async def debug_landing(request: Request):
     virtual_host = apx_host or host_header
 
     if virtual_host:
-        tenant = get_tenant_by_virtual_host(virtual_host)
-        if tenant:
+        tenant_row = get_tenant_by_virtual_host(virtual_host)
+        if tenant_row:
             try:
-                html_content = generate_tenant_landing_page(tenant, virtual_host)
+                html_content = generate_tenant_landing_page(tenant_row, virtual_host)
                 return HTMLResponse(content=html_content)
             except Exception as e:
                 return JSONResponse({"error": f"Landing page generation failed: {e}"}, status_code=500)
@@ -240,10 +230,10 @@ async def debug_root_logic(request: Request):
     if virtual_host:
         debug_info["step"] = "virtual_host_found"
 
-        tenant = get_tenant_by_virtual_host(virtual_host)
-        debug_info["exact_tenant_lookup"] = tenant is not None
+        tenant_row = get_tenant_by_virtual_host(virtual_host)
+        debug_info["exact_tenant_lookup"] = tenant_row is not None
 
-        if not tenant and is_sales_agent_domain(virtual_host) and not virtual_host.startswith("admin."):
+        if not tenant_row and is_sales_agent_domain(virtual_host) and not virtual_host.startswith("admin."):
             debug_info["step"] = "subdomain_fallback"
             subdomain = extract_subdomain_from_host(virtual_host)
             debug_info["extracted_subdomain"] = subdomain
@@ -259,13 +249,13 @@ async def debug_root_logic(request: Request):
             except Exception as e:
                 debug_info["subdomain_error"] = str(e)
 
-        if tenant:
+        if tenant_row:
             debug_info["step"] = "tenant_found"
-            debug_info["tenant_id"] = tenant.get("tenant_id")
-            debug_info["tenant_name"] = tenant.get("name")
+            debug_info["tenant_id"] = tenant_row.get("tenant_id")
+            debug_info["tenant_name"] = tenant_row.get("name")
 
             try:
-                html_content = generate_tenant_landing_page(tenant, virtual_host)
+                html_content = generate_tenant_landing_page(tenant_row, virtual_host)
                 debug_info["step"] = "landing_page_success"
                 debug_info["landing_page_length"] = len(html_content)
                 debug_info["would_return"] = "HTMLResponse"

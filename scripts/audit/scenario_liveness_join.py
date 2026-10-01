@@ -42,12 +42,12 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from scripts.audit import storyboard_spec
+from src.core.config import ToolingSettings
 
 #: The artifact field carrying the scenario's marker set — the join's only
 #: marker source, and why the plugin persists it.
@@ -126,8 +126,8 @@ def registry_wired(marker_names: Any, env_routes: Any) -> bool:
 
 def default_artifact_path() -> Path:
     """The artifact path, from the ONE owner of the env var and default name."""
-    override = os.environ.get(storyboard_spec.ARTIFACT_ENV_VAR)
-    return Path(override) if override else _ARTIFACT_DEFAULT
+    override = ToolingSettings().bdd_liveness_artifact  # storyboard_spec.ARTIFACT_ENV_VAR
+    return override if override else _ARTIFACT_DEFAULT
 
 
 def load_artifact(path: Path) -> dict[str, dict[str, Any]]:

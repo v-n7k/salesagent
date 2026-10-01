@@ -96,16 +96,15 @@ class TestMockAdapterPublisherSync:
 
         from src.admin.app import create_app
         from src.admin.blueprints.publisher_partners import sync_publisher_partners
-        from src.core.config import AppConfig
+        from src.core.config import get_settings
 
-        # Mock config to return development environment (triggers auto-verify)
-        mock_config = AppConfig()
-        mock_config.environment = "development"
-
+        # Auto-verify is a NAMED allowance on the settings -- "anywhere that is not
+        # production" -- read per call; the AppConfig object with an ``environment``
+        # string this used to build is gone, and nothing compares that string any more.
         app = create_app()
 
         with app.test_request_context():
-            with patch("src.admin.blueprints.publisher_partners.get_config", return_value=mock_config):
+            with patch.object(type(get_settings()), "publisher_auto_verify_allowed", property(lambda _self: True)):
                 with patch(
                     "src.admin.blueprints.publisher_partners.get_tenant_url",
                     return_value="http://test.example.com",
@@ -131,15 +130,12 @@ class TestMockAdapterPublisherSync:
 
         from src.admin.app import create_app
         from src.admin.blueprints.publisher_partners import sync_publisher_partners
-        from src.core.config import AppConfig
-
-        mock_config = AppConfig()
-        mock_config.environment = "development"
+        from src.core.config import get_settings
 
         app = create_app()
 
         with app.test_request_context():
-            with patch("src.admin.blueprints.publisher_partners.get_config", return_value=mock_config):
+            with patch.object(type(get_settings()), "publisher_auto_verify_allowed", property(lambda _self: True)):
                 with patch(
                     "src.admin.blueprints.publisher_partners.get_tenant_url",
                     return_value="http://test.example.com",
@@ -173,15 +169,12 @@ class TestMockAdapterPublisherSync:
 
         from src.admin.app import create_app
         from src.admin.blueprints.publisher_partners import sync_publisher_partners
-        from src.core.config import AppConfig
-
-        mock_config = AppConfig()
-        mock_config.environment = "development"
+        from src.core.config import get_settings
 
         app = create_app()
 
         with app.test_request_context():
-            with patch("src.admin.blueprints.publisher_partners.get_config", return_value=mock_config):
+            with patch.object(type(get_settings()), "publisher_auto_verify_allowed", property(lambda _self: True)):
                 with patch(
                     "src.admin.blueprints.publisher_partners.get_tenant_url",
                     return_value="http://test.example.com",
@@ -204,16 +197,13 @@ class TestMockAdapterPublisherSync:
 
         from src.admin.app import create_app
         from src.admin.blueprints.publisher_partners import sync_publisher_partners
-        from src.core.config import AppConfig
-
-        mock_config = AppConfig()
-        mock_config.environment = "development"
+        from src.core.config import get_settings
 
         app = create_app()
 
         # Run sync twice
         with app.test_request_context():
-            with patch("src.admin.blueprints.publisher_partners.get_config", return_value=mock_config):
+            with patch.object(type(get_settings()), "publisher_auto_verify_allowed", property(lambda _self: True)):
                 with patch(
                     "src.admin.blueprints.publisher_partners.get_tenant_url",
                     return_value="http://test.example.com",

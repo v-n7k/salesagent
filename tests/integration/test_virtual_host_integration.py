@@ -3,6 +3,7 @@
 import pytest
 
 from src.core.config_loader import get_tenant_by_virtual_host
+from tests.helpers.credentials import credential_headers
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
@@ -19,7 +20,9 @@ class TestVirtualHostIntegration:
                 self.meta = {"headers": headers}
 
         # Test basic header extraction
-        context = MockContext({"apx-incoming-host": "ad-sales.testcompany.com", "x-adcp-auth": "test-token"})
+        context = MockContext(
+            {"apx-incoming-host": "ad-sales.testcompany.com", **credential_headers(token="test-token")}
+        )
 
         # Act - simulate how main.py extracts the header
         headers = context.meta.get("headers", {})

@@ -14,6 +14,7 @@ from src.core.json_validators import (
     ensure_json_array,
     ensure_json_object,
 )
+from tests.factories.principal import plaintext_token_for
 from tests.integration.conftest import (
     add_required_setup_data,
     create_test_product_with_pricing,
@@ -235,11 +236,11 @@ class TestJSONValidation:
             session.add(tenant)
 
             # Valid principal with platform mappings
-            principal = Principal(
+            principal = Principal.with_token(
+                plaintext_token_for("test_principal"),
                 tenant_id="test_tenant",
                 principal_id="test_principal",
                 name="Test Principal",
-                access_token="token123",
                 platform_mappings={"mock": {"enabled": True}},
                 created_at=now,
             )
@@ -254,16 +255,15 @@ class TestJSONValidation:
         """Test WorkflowStep comments validation."""
         with get_db_session() as session:
             # Create tenant and principal first (required for foreign key)
-            import uuid
 
             tenant = Tenant(tenant_id="test", name="Test Tenant", subdomain="test", ad_server="mock", is_active=True)
             session.add(tenant)
-            principal = Principal(
+            principal = Principal.with_token(
+                plaintext_token_for("test"),
                 tenant_id="test",
                 principal_id="test",
                 name="Test Principal",
                 platform_mappings={"mock": {"advertiser_id": "test"}},  # Use valid platform mapping
-                access_token=str(uuid.uuid4()),  # Required field
             )
             session.add(principal)
             session.commit()
@@ -340,11 +340,11 @@ class TestIntegration:
                 )
 
                 # Create principal
-                principal = Principal(
+                principal = Principal.with_token(
+                    plaintext_token_for("buyer_1"),
                     tenant_id="workflow_test",
                     principal_id="buyer_1",
                     name="Test Buyer",
-                    access_token="buyer_token_123",
                     platform_mappings={"google_ad_manager": {"advertiser_id": "12345"}, "mock": {"test_mode": True}},
                     created_at=now,
                 )

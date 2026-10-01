@@ -17,13 +17,13 @@ import json
 from unittest.mock import patch
 
 import pytest
-from adcp.types import Error as AdCPResponseError
 from sqlalchemy import select
 
 from src.admin.app import create_app
 from src.core.creative_agent_registry import FormatFetchResult
 from src.core.database.database_session import get_db_session
 from src.core.database.models import AuthorizedProperty, CurrencyLimit, Product, PropertyTag, Tenant
+from src.core.schemas import Error as AdCPResponseError
 from src.core.schemas import Format
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]

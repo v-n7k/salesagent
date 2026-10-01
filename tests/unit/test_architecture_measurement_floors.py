@@ -33,10 +33,11 @@ sys.path.insert(0, str(REPO_ROOT))
 # node ids by identity rather than by size.
 #
 # The set spans BOTH sources, deliberately. The literal `ENV_ROUTES` block holds
-# 20 wired rows; `ENV_ROUTES +=` appends 5 more from `_UC_BUCKET_ROUTES` at
-# import time. "How many wired rows are there" therefore has two answers (20 and
-# 25), and a floor that does not say which it means is itself an ambiguous
-# counter. This pins the runtime set — what actually routes scenarios.
+# 31 wired tags; `ENV_ROUTES +=` then appends the UC-010 dormancy rows (all
+# xfailing) and 6 more wired ones from `_UC_BUCKET_ROUTES` at import time. "How
+# many wired tags are there" therefore has two answers (31 and 37), and a floor
+# that does not say which it means is itself an ambiguous counter. This pins the
+# runtime set — what actually routes scenarios.
 #
 # Discipline, matching EXPECTED_LEDGER in test_storyboard_ledger_state.py:
 # graduating a placeholder to wired ADDS a tag here in the same change, as a
@@ -48,13 +49,41 @@ EXPECTED_WIRED_ROUTES: frozenset[str] = frozenset(
         "COMPAT",
         "UC-005",
         "UC-019",
+        # UC-026 was disconnected in two places at once: no ENV_ROUTES row, and its
+        # step module unregistered, so all 75 scenarios graded nothing while the file
+        # was still being maintained. Both are connected now, which is a graduation
+        # and so belongs in this pin -- deleting the row again would silently
+        # dormant every one of those scenarios.
+        "UC-026",
         "UC-GET-PRODUCTS",
         # literal ENV_ROUTES block
+        "admin-tenant-scoping",
+        "codes-declared-code-reaches-buyer",
+        # The context echo, graded on every outcome across all four transports. Three routes.
+        # Two because the scenarios need both a read tool and a write tool: a schema rejection
+        # and a seller's own refusal do not both reach the buyer from one tool.
+        "ctxecho-media-buys",
+        "ctxecho-products",
+        # The third is a different OBLIGATION, not a third tool for the same one. Those two
+        # grade the ENVELOPE's context, which one seam reads off the request root and writes
+        # onto the response root. AdCP declares the same opaque object on models nested INSIDE
+        # a response (Package, and likewise MediaBuy, PackageUpdate, Results,
+        # MediaBuyDeliveryWebhookResult), where no seam can reach it -- the boundary has no
+        # notion of a collection -- so an element echo is carried by whoever builds the
+        # element. create_media_buy is the cheapest request-element -> response-element pair.
+        "ctxecho-packages",
+        "predispatch",
+        # BR-PROTOCOL-001: inbound version negotiation, graded on a tool that is not
+        # get_adcp_capabilities. Pinned in the same change that registered the route.
+        "protocol-version-negotiation",
         "egress-create",
         "egress-get-products",
         "egress-sync",
         "egress-sync-creds",
         "egress-update",
+        "get-products-pricing-options",
+        "security-wire-error-safety",
+        "security-tenant-isolation",
         "uc002-account",
         "uc002-ext",
         "uc002-idempotency",
@@ -66,10 +95,25 @@ EXPECTED_WIRED_ROUTES: frozenset[str] = frozenset(
         "uc004-create",
         "uc004-poll",
         "uc006-creative-sync",
+        # UC-010's wired row, graduated on the signing branch: it builds a real
+        # `CapabilitiesEnv` (`_build_capabilities_env`) with `xfail_reason=None`
+        # and routes every tag in the UC-010 wired set. The UC's placeholder rows
+        # (`uc010-parked-*`, `uc010-not-wired`) stay unpinned, as placeholders
+        # must.
+        "uc010-capabilities",
         "uc019-post-create-poll",
         "uc011-list",
         "uc011-sync",
         "uc018-list",
+        # The two former catch-all PARKS, now wired: their rows build the same env their
+        # UC's other rows do and carry no xfail_reason, so every scenario of UC-011 and
+        # UC-018 executes. They are pinned here for the same reason as any other wired
+        # route — deleting one would silently dormant every scenario that falls through to
+        # it — and an unbound step in those UCs now fails through the dormancy tripwire
+        # (tests/bdd/dormant_scenarios.txt), which names the missing step, rather than
+        # xfailing invisibly.
+        "uc011-not-wired",
+        "uc018-not-wired",
     }
 )
 
@@ -139,9 +183,22 @@ EXPECTED_GATED_STORYBOARDS: frozenset[str] = frozenset(
 )
 
 #: Floor under the record count itself. A count, not a set — the records are the
-#: thing being counted, and 1351 individual ids would be a second index rather
+#: thing being counted, and 1303 individual ids would be a second index rather
 #: than a floor. It catches wholesale collapse; the SET above catches a misroute.
-MINIMUM_INDEX_CHECKS = 1351
+#:
+#: 1351 -> 1303 (salesagent-b341x.22). The 48 records that left belonged to three
+#: storyboards — universal/error-compliance-signals.yaml,
+#: universal/get-signals-pagination-integrity.yaml and
+#: universal/schema-validation-signals.yaml — that were on-path ONLY because the
+#: coverage map's hand-maintained ADVERTISED_TOOLS claimed `get_signals` and
+#: `activate_signal`, which no transport registers. Deriving the set from
+#: src/core/tools/registry.py took them off the path, so those 48 were never
+#: gradable and were inflating the denominator every conformance number here is
+#: quoted against. Lowering a floor is normally the thing this file exists to
+#: prevent; it is correct here because the drop was MEASURED and its cause named,
+#: which is the same discipline EXPECTED_GATED_STORYBOARDS above states for a
+#: deliberate reclassification.
+MINIMUM_INDEX_CHECKS = 1303
 
 
 @requires_pinned_bundle

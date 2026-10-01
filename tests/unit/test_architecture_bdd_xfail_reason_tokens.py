@@ -75,9 +75,19 @@ _LIVE_PER_TRANSPORT_REASON = (
     "own when #1607 lands."
 )
 
-# The same reason with ONLY the token retyped. The prose sentence is left intact,
-# which is exactly the shape the substring predicate could not see.
-_RETYPED_TOKEN_REASON = _LIVE_PER_TRANSPORT_REASON.replace("scope=per-transport ref=", "scope=per_transport ref=", 1)
+
+def _retyped_token_reason() -> str:
+    """The live reason with ONLY the scope token retyped.
+
+    The prose sentence is left intact, which is exactly the shape the substring
+    predicate could not see. DERIVED from the live reason rather than transcribed,
+    so the mutation cannot drift away from what it mutates -- and derived inside a
+    function rather than at module scope, because ``str.replace`` at import time is
+    indistinguishable by attribute name from ``Path.replace`` (a rename) and trips
+    the import-time filesystem-I/O guard.
+    """
+    return _LIVE_PER_TRANSPORT_REASON.replace("scope=per-transport ref=", "scope=per_transport ref=", 1)
+
 
 # A free-text reason that HAPPENS to contain a k= pair. One of the three real ones
 # (tests/bdd/conftest.py, UC-006 PACKAGE_NOT_FOUND) — the reason the parser must
@@ -147,7 +157,7 @@ class TestTheTypedReasonParse:
         parse_xfail_reason, XfailReasonError = _parser()
 
         with pytest.raises(XfailReasonError) as excinfo:
-            parse_xfail_reason(_RETYPED_TOKEN_REASON)
+            parse_xfail_reason(_retyped_token_reason())
 
         assert "per_transport" in str(excinfo.value), (
             f"the rejection does not name the offending value, so an author cannot see the typo: {excinfo.value}"

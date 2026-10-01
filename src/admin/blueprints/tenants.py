@@ -15,14 +15,16 @@ from babel import numbers as babel_numbers
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, session, url_for
 from sqlalchemy import func, select
 
+from src.admin.form_validation import sanitize_form_data, validate_form_data
 from src.admin.services import DashboardService
 from src.admin.utils import get_tenant_config_from_db, require_tenant_access
 from src.admin.utils.audit_decorator import log_admin_action
+from src.core.config import get_settings
 from src.core.config_loader import is_single_tenant_mode
 from src.core.database.database_session import get_db_session
-from src.core.database.models import Principal, Tenant
+from src.core.database.models import Tenant
+from src.core.database.repositories.principal import PrincipalRepository
 from src.core.domain_config import get_sales_agent_domain
-from src.core.validation import sanitize_form_data, validate_form_data
 from src.services.setup_checklist_service import SetupChecklistService
 from src.services.slack_notifier import SlackNotifier
 
@@ -217,16 +219,13 @@ def tenant_settings(tenant_id, section=None):
             if adapter_config_obj and adapter_config_obj.adapter_type == "google_ad_manager":
                 oauth_configured = bool(adapter_config_obj.gam_refresh_token)
 
-            # Check if GAM OAuth environment variables are configured
-            gam_oauth_configured = bool(
-                os.environ.get("GAM_OAUTH_CLIENT_ID") and os.environ.get("GAM_OAUTH_CLIENT_SECRET")
-            )
+            # Check if GAM OAuth credentials are configured
+            gam_oauth_configured = get_settings().auth.gam_oauth_configured
 
             # Get advertiser data for the advertisers section
-            from src.core.database.models import GAMInventory, Principal
+            from src.core.database.models import GAMInventory
 
-            stmt = select(Principal).filter_by(tenant_id=tenant_id)
-            principals = db_session.scalars(stmt).all()
+            principals = PrincipalRepository(db_session, tenant_id).list_all()
             advertiser_count = len(principals)
             active_advertisers = len(principals)  # For now, assume all are active
 
@@ -286,8 +285,9 @@ def tenant_settings(tenant_id, section=None):
                 }
 
             # Get environment info for URL generation
-            is_production = os.environ.get("PRODUCTION") == "true"
-            mcp_port = int(os.environ.get("ADCP_SALES_PORT", 8080)) if not is_production else None
+            runtime = get_settings().runtime
+            is_production = runtime.is_production
+            mcp_port = runtime.adcp_sales_port if not is_production else None
 
             # JSON fields are automatically deserialized by JSONType
             # These are now guaranteed to be lists (or None) from the database
@@ -353,7 +353,7 @@ def tenant_settings(tenant_id, section=None):
                 custom_targeting_values_count = 0
 
             # All services (MCP, A2A, Admin) run on the same unified port
-            admin_port = int(os.environ.get("ADCP_SALES_PORT", 8080)) if not is_production else None
+            admin_port = runtime.adcp_sales_port if not is_production else None
             a2a_port = admin_port
 
             # Get currency limits for this tenant
@@ -518,7 +518,7 @@ def test_slack(tenant_id):
             )
 
             if not sent:
-                # Same contract the OutboundError arm used to serve: 400 with an
+                # Same contract the OutboundError branch used to serve: 400 with an
                 # opaque message. Slack's own response body is a counterparty
                 # response and is never echoed back to the operator.
                 return jsonify({"success": False, "error": "Slack webhook delivery failed"}), 400
@@ -635,8 +635,7 @@ def media_buys_list(tenant_id):
                 # Get principal name
                 principal = None
                 if media_buy.principal_id:
-                    stmt = select(Principal).filter_by(tenant_id=tenant_id, principal_id=media_buy.principal_id)
-                    principal = db_session.scalars(stmt).first()
+                    principal = PrincipalRepository(db_session, tenant_id).get(media_buy.principal_id)
 
                 # Get product names from packages
                 product_names = []

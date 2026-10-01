@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from src.core.database.database_session import get_db_session
 from src.core.database.models import MediaBuy, Principal, Tenant
+from tests.factories.principal import plaintext_token_for
 
 
 @pytest.mark.requires_db
@@ -52,11 +53,11 @@ class TestTenantDashboard:
             db_session.add(tenant)
 
             # Create principal with valid platform mapping
-            principal = Principal(
+            principal = Principal.with_token(
+                plaintext_token_for("test_principal"),
                 tenant_id="test_dashboard",
                 principal_id="test_principal",
                 name="Test Principal",
-                access_token="test_token",
                 platform_mappings={"mock": {"advertiser_id": "test_advertiser"}},  # Valid mapping
             )
             db_session.add(principal)
@@ -106,11 +107,11 @@ class TestTenantDashboard:
 
             # Create principals first (required for foreign key)
             for i in range(3):
-                principal = Principal(
+                principal = Principal.with_token(
+                    plaintext_token_for(f"principal_{i}"),
                     tenant_id="test_metrics",
                     principal_id=f"principal_{i}",
                     name=f"Principal {i}",
-                    access_token=f"token_{i}",
                     platform_mappings={"mock": {"id": f"advertiser_{i}"}},
                 )
                 db_session.add(principal)

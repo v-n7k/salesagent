@@ -19,10 +19,9 @@ from adcp.types import (
 )
 from adcp.types.generated_poc.core.format import Dimensions, Renders  # TODO: no stable alias in adcp.types
 
-from src.core.exceptions import AdCPAuthenticationError
 from src.core.schemas import Format, FormatId, ListCreativeFormatsRequest
 from tests.factories import TenantFactory
-from tests.harness import CreativeFormatsEnv, make_identity
+from tests.harness import CreativeFormatsEnv
 
 DEFAULT_AGENT_URL = "https://creative.adcontextprotocol.org"
 
@@ -46,23 +45,16 @@ def _make_format(
     )
 
 
-_make_identity = make_identity  # Canonical version from tests.harness
-
-
-# ---------------------------------------------------------------------------
-# Auth Tests — Covers: UC-005-EXT-A-01
-# ---------------------------------------------------------------------------
-
-
-class TestFormatsAuth:
-    """list_creative_formats requires tenant in identity."""
-
-    def test_no_tenant_raises_auth_error(self, integration_db):
-        """Covers: UC-005-EXT-A-01 — tenant=None → AdCPAuthenticationError."""
-        identity = _make_identity(principal_id="p1", tenant=None)
-        with CreativeFormatsEnv() as env:
-            with pytest.raises(AdCPAuthenticationError, match="tenant"):
-                env.call_impl(identity=identity)
+# (Deleted) TestFormatsAuth::test_no_tenant_raises_auth_error, which built an identity
+# carrying a resolved principal and NO tenant and expected list_creative_formats to refuse
+# it. Neither half of that state is reachable: a principal is a row in a tenant, so the
+# resolver performs no principal lookup when the request names no seller
+# (src/core/resolved_identity._resolve_identity step 4), and ResolvedIdentity declares
+# `tenant` required. The tenant-less DISCOVERY request that IS reachable -- anonymous,
+# PublicIdentity(principal=None, tenant=None) -- is answered with an empty catalog by
+# design, not refused (creative_formats.py, 76c2a96fb). UC-005-EXT-A-01's "no tenant
+# resolves -> error" obligation is therefore ungraded here; it can only be graded at the
+# boundary, on the wire, with no tenant header.
 
 
 # ---------------------------------------------------------------------------

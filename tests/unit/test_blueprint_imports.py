@@ -17,7 +17,8 @@ class TestBlueprintSQLAlchemyImports:
         """Validate api.py has required SQLAlchemy imports."""
         from src.admin.blueprints import api
 
-        assert hasattr(api, "func"), "Missing required import: func from sqlalchemy"
+        # func() aggregates left api.py when its counting queries moved into
+        # repositories; text is the one SQLAlchemy name the module still calls.
         assert hasattr(api, "text"), "Missing required import: text from sqlalchemy"
 
     def test_core_blueprint_imports(self):

@@ -44,10 +44,11 @@ def validate_startup_requirements() -> None:
     This is useful for health checks and lightweight validation.
     """
     try:
-        from src.core.config import get_config
+        from src.core.config import load_settings
 
-        # Just check that config can be loaded
-        get_config()
+        # The composition root for a server started through run_server.py: the environment
+        # is read here, once, and a bad value fails here.
+        load_settings()
 
         # Note: SUPER_ADMIN_EMAILS is no longer required at startup.
         # Per-tenant OIDC with Setup Mode is the default authentication flow.

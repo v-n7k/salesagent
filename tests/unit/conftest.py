@@ -39,7 +39,21 @@ def mock_all_external_dependencies():
     with patch("src.core.database.database_session.get_db_session") as mock_db:
         mock_db.return_value = mock_session
 
-        # Mock external services
+        # Mock external services. This is an egress GUARD, not a test double: it
+        # exists so a unit test cannot dial off this machine. Production egress no
+        # longer runs through ``requests`` at all — every outbound call goes through
+        # src/core/security/outbound_http.py (httpx) behind the SSRF gate — so what
+        # this catches now is a stray ``requests.post`` from a test or a third-party
+        # library, and a test asserting on it is asserting on nothing production does.
+        #
+        # Never grade a test against the canned response below. It answers 200 and
+        # captures nothing worth asserting on — no URL, no headers, no bytes — so a
+        # test leaning on it cannot tell a signed POST from an unsigned one
+        # (#1291). A test that needs to control or observe an outbound POST says so
+        # at its own site: capture_outbound_webhooks (tests/helpers/webhook_wire)
+        # patches over this stub — and over httpx.Client/AsyncClient, which is where
+        # the real delivery goes — for the duration of its block, and records the
+        # real wire bytes (salesagent-og9k.6).
         real_post = requests.post
 
         def _post(url, *args, **kwargs):
@@ -106,30 +120,45 @@ def fast_password_hashing():
 
 
 @pytest.fixture
-def make_auth_test_client():
+def make_auth_test_client(monkeypatch):
     """Factory fixture: context manager yielding (client, mock_session) with auth DB patched.
+
+    The environment is read once when the app is composed (src/core/config.py), and the
+    test-credential login path is a blueprint create_app registers or omits from it. So
+    the environment a test wants is passed HERE, as ``env``: the factory sets it, drops the
+    cached settings object, and only then builds the app. A ``patch.dict(os.environ)``
+    around a request made through an already-built client changes nothing.
 
     Usage::
 
-        with make_auth_test_client(auth_setup_mode=True) as (client, mock_session):
-            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true", ...}):
-                response = client.post("/test/auth", ...)
+        with make_auth_test_client(auth_setup_mode=True, env={"ADCP_AUTH_TEST_MODE": "true"}) as (client, _):
+            response = client.post("/test/auth", ...)
     """
     from contextlib import contextmanager
 
+    import src.core.config as config_module
     from src.admin.app import create_app
 
     @contextmanager
-    def _factory(auth_setup_mode: bool = True):
+    def _factory(auth_setup_mode: bool = True, env: dict[str, str] | None = None):
+        for name, value in (env or {}).items():
+            monkeypatch.setenv(name, value)
+        monkeypatch.setattr(config_module, "_settings", None)
         app = create_app({"TESTING": True, "SECRET_KEY": "test-secret", "WTF_CSRF_ENABLED": False})
         client = app.test_client()
         mock_tenant = MagicMock()
         mock_tenant.auth_setup_mode = auth_setup_mode
         mock_session = MagicMock()
         mock_session.scalars.return_value.first.return_value = mock_tenant
-        with patch("src.admin.blueprints.auth.get_db_session") as mock_db:
-            mock_db.return_value.__enter__ = MagicMock(return_value=mock_session)
-            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+        # The login pages query the tenant through the auth blueprint; /test/auth through
+        # the test-credential blueprint. Both see the same mocked session.
+        with (
+            patch("src.admin.blueprints.auth.get_db_session") as mock_auth_db,
+            patch("src.admin.blueprints.test_auth.get_db_session") as mock_test_db,
+        ):
+            for mock_db in (mock_auth_db, mock_test_db):
+                mock_db.return_value.__enter__ = MagicMock(return_value=mock_session)
+                mock_db.return_value.__exit__ = MagicMock(return_value=False)
             yield client, mock_session
 
     return _factory

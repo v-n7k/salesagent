@@ -192,13 +192,13 @@ Example MCP client configuration:
 # Subdomain-based routing
 transport = StreamableHttpTransport(
     url="https://acme.sales-agent.yourdomain.com/mcp/",
-    headers={"x-adcp-auth": "advertiser-token"}
+    headers={"Authorization": "Bearer advertiser-token"}
 )
 
 # Or with custom domain
 transport = StreamableHttpTransport(
     url="https://sales.acmepublisher.com/mcp/",
-    headers={"x-adcp-auth": "advertiser-token"}
+    headers={"Authorization": "Bearer advertiser-token"}
 )
 ```
 

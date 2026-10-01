@@ -2,6 +2,11 @@
 
 Complete reference for all environment variables supported by the Prebid Sales Agent.
 
+The environment is read once, when the application is composed, into the typed settings
+object in `src/core/config.py`. Every variable below is a field there, and the code reads
+named facts off that object rather than the environment: a request never asks what
+environment it is in. If a variable is missing from `src/core/config.py`, nothing reads it.
+
 ## Contents
 
 - [Quick start](#quick-start)
@@ -176,8 +181,14 @@ The SSO requirement varies based on deployment mode:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ENVIRONMENT` | `development` | `development` (strict validation) or `production` (lenient) |
+| `ENVIRONMENT` | `development` | `development` or `production` |
 | `PRODUCTION` | `false` | Set to `true` for production deployments |
+| `FLY_APP_NAME` | unset | Set by Fly.io; its presence also marks the deployment as production |
+
+Any one of `PRODUCTION=true`, `ENVIRONMENT=production` or a `FLY_APP_NAME` makes the
+deployment production, and every production-dependent behaviour reads that one answer:
+lenient request validation, structured JSON logging, secure session cookies, the trust in
+proxy headers, and the absence of verbose auth logging.
 | `ADMIN_UI_URL` | `http://localhost:8001` | Public URL for the Admin UI (used in notifications) |
 
 ### Demo data
@@ -212,16 +223,21 @@ The SSO requirement varies based on deployment mode:
 |----------|---------|-------------|
 | `FLASK_DEBUG` | `0` | Enable Flask debug mode |
 | `FLASK_ENV` | `production` | Flask environment |
-| `ADCP_DRY_RUN` | `false` | Run operations without making actual changes |
-| `ADCP_TESTING` | `false` | Testing mode: serve checked-in reference creative formats instead of calling external services |
+| `ADCP_TESTING` | `false` | A test deployment. Selects, at composition: the reference-formats creative registry (no creative agent is dialled), the debug and reset routes, loopback webhook targets, the mock ad server's seeded delivery rows, the setup checklist counting the mock adapter as configured, and relaxed brand validation in `get_products`. Each is a named property on the settings; nothing reads the flag itself. |
 
 ### Service startup
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ADCP_SALES_PORT` | `8080` | Port the unified application listens on (nginx proxies to it) |
+| `ADCP_SALES_HOST` | `0.0.0.0` | Bind address for `scripts/run_server.py` (production always binds all interfaces) |
 | `SKIP_NGINX` | `false` | Skip nginx in deployment scripts |
 | `SKIP_CRON` | `false` | Skip cron job scheduling |
+
+Every variable above is read once, by `src/core/config.py`, when a process is composed; an
+empty value means unset. Knobs that only the repo's own scripts read (`ADCP_HOME`,
+`ADCP_REQ_PATH`, `BDD_LIVENESS_ARTIFACT`, `STORYBOARD_LEDGER_PATH`,
+`ALLOW_LIVE_CREATIVE_AGENT`) are fields on `ToolingSettings` in the same module.
 
 `CONDUCTOR_PORT` (default `8000`) is read by `docker-compose.yml` only - it sets the host port the nginx proxy publishes, which is useful when running multiple worktrees.
 

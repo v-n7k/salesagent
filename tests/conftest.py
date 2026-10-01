@@ -104,7 +104,6 @@ _ENTITY_PATTERNS: dict[str, list[str]] = {
         "formatid",
         "build_creative_data",
         "extract_url_from_assets",
-        "normalize_agent_url",
         "list_creative_formats",
     ],
     "product": [
@@ -166,9 +165,7 @@ _ENTITY_PATTERNS: dict[str, list[str]] = {
         "annotated_type",
         "all_response_str",
         "openapi_surface",
-        "manual_vs_generated",
         "json_serialization",
-        "version_compat",
         "signals_response",
         "discovery_endpoint",
     ],
@@ -186,7 +183,6 @@ _ENTITY_PATTERNS: dict[str, list[str]] = {
         "no_toolerror_in_impl",
         "transport_agnostic_impl",
         "impl_resolved_identity",
-        "no_model_dump_in_impl",
         "inspect_bdd_steps",
         "ruff_egress_bans",
     ],
@@ -272,6 +268,12 @@ _PATH_ENTITY_MAP: dict[str, str] = {
 }
 
 
+#: What pytest-playwright's --output defaults to, and where this repo sends it instead.
+#: Module constants so the guard test and the redirect below read one definition.
+PLAYWRIGHT_DEFAULT_OUTPUT = "test-results"
+PLAYWRIGHT_ARTIFACTS_DIR = ".playwright-artifacts"
+
+
 def pytest_configure(config):
     """Register entity markers and configure test environment.
 
@@ -284,6 +286,20 @@ def pytest_configure(config):
     # --- Entity marker registration ---
     for marker in sorted(_ENTITY_MARKERS):
         config.addinivalue_line("markers", f"{marker}: Entity marker (auto-applied by filename/path)")
+
+    # --- pytest-playwright must not be pointed at test-results/ ---
+    # The plugin's --output defaults to test-results and it shutil.rmtree()s that
+    # directory at the start of EVERY session, UI suite or not (pytest_playwright.py,
+    # the _pw_artifacts_folder fixture). test-results/ is where run_all_tests.sh and
+    # the CI-box runner write the per-run JSON reports -- the baselines every
+    # failing-nodeid membership diff is made against -- so a plain
+    # `pytest tests/unit/<one file>` in the dev venv deleted every recorded run on
+    # the machine. Redirected HERE, not in pytest.ini addopts: the tox envs do not
+    # install the plugin, and an addopts `--output` is an unrecognized argument
+    # there, which is how one attempt refused every suite but ui on the box.
+    # Pinned by tests/unit/test_pytest_playwright_output_dir.py.
+    if config.pluginmanager.hasplugin("playwright") and config.getoption("--output") == PLAYWRIGHT_DEFAULT_OUTPUT:
+        config.option.output = PLAYWRIGHT_ARTIFACTS_DIR
 
     # --- Environment setup ---
     os.environ.setdefault("FASTMCP_DEPRECATION_WARNINGS", "false")
@@ -308,14 +324,12 @@ from tests.conftest_db import *  # noqa: F401,F403
 # See test_environment fixture below for configuration
 # Import fixtures modules
 from tests.fixtures import (
-    CreativeFactory,
     MediaBuyFactory,
     MockAdapter,
     MockDatabase,
     MockOAuthProvider,
     PrincipalFactory,
     ProductFactory,
-    RequestBuilder,
     ResponseBuilder,
     TargetingBuilder,
     TenantFactory,
@@ -373,6 +387,14 @@ def test_environment(monkeypatch, request):
     # Set testing flags
     monkeypatch.setenv("ADCP_TESTING", "true")
     monkeypatch.setenv("ADCP_AUTH_TEST_MODE", "true")  # Enable test mode for auth
+
+    # The settings are read once and cached (src/core/config.py). Drop the cached object
+    # so this test's first read sees the environment above, and let monkeypatch restore
+    # the previous object afterwards so no stale settings leak between tests. A test that
+    # changes the environment mid-test calls load_settings() (or resets this again).
+    import src.core.config as config_module
+
+    monkeypatch.setattr(config_module, "_settings", None)
 
     # Check if this is a test that needs the database
     is_integration_test = "integration" in str(request.fspath) or "bdd" in str(request.fspath)
@@ -452,12 +474,6 @@ def media_buy_factory():
 
 
 @pytest.fixture
-def creative_factory():
-    """Provide creative factory."""
-    return CreativeFactory
-
-
-@pytest.fixture
 def sample_tenant():
     """Provide a sample tenant."""
     return TenantFactory.create(tenant_id="test_tenant", name="Test Publisher", subdomain="test")
@@ -466,11 +482,13 @@ def sample_tenant():
 @pytest.fixture
 def sample_principal(sample_tenant):
     """Provide a sample principal."""
+    # No access_token: the row stores sha256(token) and a prefix, and the factory derives
+    # both from the principal_id, so the token a test PRESENTS comes from
+    # plaintext_token_for(principal_id) rather than from a column.
     return PrincipalFactory.create(
         tenant_id=sample_tenant["tenant_id"],
         principal_id="test_principal",
         name="Test Advertiser",
-        access_token="test_token_123",
     )
 
 
@@ -573,12 +591,6 @@ def mock_gemini_test_scenarios():
 
 
 @pytest.fixture
-def request_builder():
-    """Provide request builder."""
-    return RequestBuilder()
-
-
-@pytest.fixture
 def response_builder():
     """Provide response builder."""
     return ResponseBuilder()
@@ -593,12 +605,6 @@ def targeting_builder():
 # ============================================================================
 # Authentication Fixtures
 # ============================================================================
-
-
-@pytest.fixture
-def auth_headers(sample_principal):
-    """Provide authentication headers."""
-    return {"x-adcp-auth": sample_principal["access_token"]}
 
 
 @pytest.fixture
@@ -672,25 +678,6 @@ def authenticated_client(flask_client, admin_session):
     with flask_client.session_transaction() as sess:
         sess.update(admin_session)
     return flask_client
-
-
-# ============================================================================
-# MCP Context Fixtures
-# ============================================================================
-
-
-@pytest.fixture
-def mcp_context(auth_headers):
-    """Provide MCP context object."""
-
-    class MockContext:
-        def __init__(self, headers):
-            self.headers = headers
-
-        def get_header(self, name, default=None):
-            return self.headers.get(name, default)
-
-    return MockContext(auth_headers)
 
 
 # ============================================================================

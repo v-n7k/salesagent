@@ -17,6 +17,7 @@ from src.core.database.models import (
     Product,
     Tenant,
 )
+from tests.factories.principal import plaintext_token_for
 
 
 @contextmanager
@@ -43,6 +44,62 @@ def bind_factories_to_session(session):
     finally:
         for f, prev in zip(ALL_FACTORIES, previous, strict=True):
             f._meta.sqlalchemy_session = prev
+
+
+@contextmanager
+def bound_factory_session():
+    """A session on the current engine, bound to every factory for the block, then closed.
+
+    Owns the session as well as the binding: it creates it, binds it through
+    :func:`bind_factories_to_session` (which restores the previous binding rather than
+    nulling it) and closes it, because a caller that only borrowed the binding would
+    still have to manage the session itself, and that is where hand-rolled versions
+    diverge. The ``bound_factory_session`` fixture in tests/integration/conftest.py and
+    the admin harnesses both come through here.
+    """
+    from sqlalchemy.orm import Session as SASession
+
+    from src.core.database.database_session import get_engine
+
+    session = SASession(bind=get_engine())
+    try:
+        with bind_factories_to_session(session):
+            yield session
+    finally:
+        session.close()
+
+
+@contextmanager
+def production_db_pointed_at(url: str):
+    """Point production's cached DB engine at ``url`` for the block.
+
+    The e2e counterpart of ``integration_db``'s engine repoint: over a live stack the
+    test's factories must write to the SERVER's database, but the process's
+    ``DATABASE_URL`` targets the in-process test base, so any production call made from
+    the test (a Then step's read-back, a harness seeding through ``get_engine()``) would
+    otherwise use a different database than the one the server reads. Repoints
+    ``DATABASE_URL`` and resets the cached engine on entry, restores both on exit
+    (mirrors tests/conftest_db.py). Shared by the BDD e2e_rest scope and
+    ``admin_stack_env`` in tests/e2e/conftest.py.
+    """
+    import os
+
+    import src.core.context_manager as _context_manager_module
+    from src.core.database.database_session import reset_engine
+
+    original_url = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = url
+    reset_engine()
+    _context_manager_module._context_manager_instance = None
+    try:
+        yield
+    finally:
+        if original_url is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = original_url
+        reset_engine()
+        _context_manager_module._context_manager_instance = None
 
 
 def get_utc_now():
@@ -132,11 +189,11 @@ def create_principal_with_platform_mappings(
         # Default to mock adapter with test advertiser
         platform_mappings = {"mock": {"advertiser_id": "test_advertiser"}}
 
-    return Principal(
+    return Principal.with_token(
+        plaintext_token_for(principal_id),
         tenant_id=tenant_id,
         principal_id=principal_id,
         name=name,
-        access_token=access_token,
         platform_mappings=platform_mappings,
         **kwargs,
     )
@@ -197,7 +254,17 @@ def seed_targeting_test_tenant(
     max_daily_package_spend: Decimal = Decimal("50000.00"),
     currency_code: str = "USD",
 ) -> None:
-    """Seed the canonical targeting-test tenant: Tenant + PropertyTag + CurrencyLimit + Principal.
+    """Seed the canonical targeting-test tenant, SET UP as the checklist defines it.
+
+    Tenant + PropertyTag + CurrencyLimit + Principal, plus the two rows
+    ``validate_setup_complete`` grades: an AuthorizedProperty, and an SSO config
+    with setup mode off (single-tenant mode makes ``sso_configuration`` a
+    critical task — see SetupChecklistService._check_critical_tasks).
+
+    ``_create_media_buy_impl`` calls ``validate_setup_complete`` unconditionally.
+    It used to be skipped for a caller that set the testing context's ``dry_run``;
+    that channel is gone (a1b79d22d), so a tenant a create_media_buy test drives
+    needs the real rows rather than a flag that bypassed the gate.
 
     Uses factory-boy factories per tests/CLAUDE.md (Pattern #8). Binds the passed
     session to factories for the duration of the call so callers outside the
@@ -205,9 +272,11 @@ def seed_targeting_test_tenant(
     Caller is responsible for adding products, pricing options, and committing.
     """
     from tests.factories import (
+        AuthorizedPropertyFactory,
         CurrencyLimitFactory,
         PrincipalFactory,
         PropertyTagFactory,
+        TenantAuthConfigFactory,
         TenantFactory,
     )
 
@@ -220,6 +289,7 @@ def seed_targeting_test_tenant(
             name=tenant_name,
             subdomain=subdomain,
             ad_server="mock",
+            auth_setup_mode=False,
         )
         session.flush()
 
@@ -248,9 +318,10 @@ def seed_targeting_test_tenant(
             tenant_id=tenant_id,
             principal_id=principal_id,
             name=principal_name,
-            access_token=access_token,
             platform_mappings={"mock": {"advertiser_id": "mock_adv_1"}},
         )
+        AuthorizedPropertyFactory(tenant=tenant, tenant_id=tenant_id)
+        TenantAuthConfigFactory(tenant=tenant, tenant_id=tenant_id, oidc_enabled=True)
 
 
 def add_targeting_test_product(
