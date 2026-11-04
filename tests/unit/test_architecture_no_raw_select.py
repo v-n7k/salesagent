@@ -244,13 +244,10 @@ ALLOWLIST: set[tuple[str, str]] = {
     ("src/admin/tenant_management_api.py", "delete_tenant"),
     ("src/admin/tenant_management_api.py", "get_tenant"),
     ("src/admin/tenant_management_api.py", "update_tenant"),
-    ("src/admin/utils/helpers.py", "decorated_function"),
-    ("src/admin/utils/helpers.py", "decorator"),
     ("src/admin/utils/helpers.py", "get_custom_targeting_mappings"),
     ("src/admin/utils/helpers.py", "get_tenant_config_from_db"),
     ("src/admin/utils/helpers.py", "is_super_admin"),
     ("src/admin/utils/helpers.py", "is_tenant_admin"),
-    ("src/admin/utils/helpers.py", "require_tenant_access"),
     # ── Core ──
     ("src/core/audit_logger.py", "log_operation"),
     ("src/core/audit_logger.py", "log_security_violation"),

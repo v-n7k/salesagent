@@ -39,6 +39,7 @@ from src.core.database.repositories.uow import (
     TrustRootUoW,
     WorkflowUoW,
 )
+from src.core.database.repositories.user import UserRepository
 from src.core.database.repositories.workflow import WorkflowRepository
 
 __all__ = [
@@ -59,6 +60,7 @@ __all__ = [
     "PushNotificationConfigUoW",
     "ReplayNonceRepository",
     "SigningKeyRepository",
+    "UserRepository",
     "SigningKeyUoW",
     "TenantConfigRepository",
     "TenantConfigUoW",

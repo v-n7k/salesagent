@@ -45,6 +45,7 @@ from src.core.database.repositories.product import ProductRepository
 from src.core.database.repositories.push_notification_config import PushNotificationConfigRepository
 from src.core.database.repositories.signing_key import SigningKeyRepository
 from src.core.database.repositories.tenant_config import TenantConfigRepository
+from src.core.database.repositories.user import UserRepository
 from src.core.database.repositories.workflow import WorkflowRepository
 
 logger = logging.getLogger(__name__)
@@ -435,6 +436,18 @@ class SigningKeyUoW(BaseUoW):
     signing_keys: SigningKeyRepository | None
 
     _REPOSITORIES: ClassVar[Mapping[str, type]] = {"signing_keys": SigningKeyRepository}
+
+
+class TenantAccessUoW(BaseUoW):
+    """Unit of Work for the admin's tenant-access decision: is the caller an active member?
+
+    One tenant-scoped ``UserRepository``; opened and closed inside ``tenant_access_decision``
+    so the guard holds no session while the view runs.
+    """
+
+    users: UserRepository | None
+
+    _REPOSITORIES: ClassVar[Mapping[str, type]] = {"users": UserRepository}
 
 
 class CapabilitiesUoW(BaseUoW):

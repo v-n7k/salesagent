@@ -7,11 +7,17 @@ DECORATOR ORDER CONVENTION:
     @require_tenant_access()  # First: Check authorization
     @log_admin_action()       # Second: Log authorized actions only
 
-This order ensures we only log actions by authorized users.
+This order ensures we only log actions by authorized users. The FastAPI side
+(``src.admin.web.audit``) gets the same order structurally: the guard is a dependency the
+route declares, and the audit wrapper sits directly under the route decorator, so it runs
+only once the guard has let the request through. Both sides write the record through
+:func:`record_admin_action`, read the caller through :func:`audit_principal`, strip the
+form through :func:`sanitize_request_data` and fold a handled refusal through
+:func:`fold_handled_failure`: one definition each, so the two cannot drift.
 """
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import wraps
 from typing import Any
 
@@ -92,28 +98,67 @@ def _sanitize_value(value: Any) -> str:
     return value_str[:100] if len(value_str) > 100 else value_str
 
 
+def sanitize_request_data(data: Mapping[str, Any]) -> dict[str, str]:
+    """The non-sensitive fields of a submitted form or JSON body, each value truncated."""
+    return {key: _sanitize_value(value) for key, value in data.items() if not _is_sensitive_field(key)}
+
+
 def _extract_safe_request_data() -> dict[str, str]:
-    """Extract non-sensitive data from request (form or JSON).
-
-    Returns:
-        Dictionary of safe field names to sanitized values
-    """
-    safe_fields: dict[str, str] = {}
-
-    # Form data
+    """Extract non-sensitive data from the Flask request (form or JSON)."""
     if request.form:
-        for key, value in request.form.items():
-            if not _is_sensitive_field(key):
-                safe_fields[key] = _sanitize_value(value)
+        return sanitize_request_data(request.form)
+    if request.is_json:
+        return sanitize_request_data(request.get_json() or {})
+    return {}
 
-    # JSON data
-    elif request.is_json:
-        json_data = request.get_json() or {}
-        for key, value in json_data.items():
-            if not _is_sensitive_field(key):
-                safe_fields[key] = _sanitize_value(value)
 
-    return safe_fields
+def audit_principal(session_data: Mapping[str, Any]) -> str:
+    """The email the audit row names: the session's ``user``, or ``"unknown"``."""
+    user_info = session_data.get("user", {})
+    if isinstance(user_info, dict):
+        return str(user_info.get("email", "unknown"))
+    return str(user_info) if user_info else "unknown"
+
+
+def fold_handled_failure(handled: object | None, success: bool, error_message: str | None) -> tuple[bool, str | None]:
+    """A refusal the handler declared (see :func:`record_admin_action_failure`) is a failed action."""
+    if handled is None:
+        return success, error_message
+    return False, str(handled)
+
+
+def record_admin_action(
+    audit_logger: Any,
+    tenant_id: str,
+    operation_name: str,
+    *,
+    user_email: str,
+    method: str,
+    request_data: Mapping[str, str],
+    success: bool,
+    error_message: str | None,
+    extra_details: Mapping[str, Any] | None = None,
+) -> None:
+    """Write one admin audit row. A failed audit write never fails the request."""
+    try:
+        details: dict[str, Any] = {"user": user_email, "action": operation_name, "method": method}
+        if extra_details:
+            details.update(extra_details)
+        if request_data:
+            details["request_data"] = dict(request_data)
+        audit_logger.log_operation(
+            operation=operation_name,
+            principal_name=user_email,
+            principal_id=user_email,
+            adapter_id="admin_ui",
+            success=success,
+            details=details,
+            error=error_message,
+            tenant_id=tenant_id,
+        )
+    except Exception as e:
+        # Don't fail the request if audit logging fails
+        logger.warning(f"Failed to write admin audit log for {operation_name}: {e}")
 
 
 def _get_or_create_audit_logger(tenant_id: str):
@@ -167,10 +212,23 @@ def _apply_handled_failure(success: bool, error_message: str | None) -> tuple[bo
     the C901 ceiling the repo ratchets (ADR-009 / GH #1610).
     """
     handled = getattr(g, _HANDLED_FAILURE_KEY, None)
-    if handled is None:
-        return success, error_message
-    g.__delattr__(_HANDLED_FAILURE_KEY)
-    return False, str(handled)
+    if handled is not None:
+        g.__delattr__(_HANDLED_FAILURE_KEY)
+    return fold_handled_failure(handled, success, error_message)
+
+
+def _extracted_details(
+    extract_details: Callable[..., dict[str, Any]] | None, operation_name: str, result: Any, kwargs: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The caller's extra details for the audit row, or ``None``; a failing extractor is logged, not raised."""
+    if not (extract_details and callable(extract_details)):
+        return None
+    try:
+        extracted = extract_details(result, **kwargs)
+    except Exception as e:
+        logger.warning(f"Failed to extract details for {operation_name}: {e}")
+        return None
+    return extracted if isinstance(extracted, dict) else None
 
 
 def log_admin_action(
@@ -199,12 +257,7 @@ def log_admin_action(
     def decorator(f: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(f)
         def decorated_function(*args: Any, **kwargs: Any) -> Any:
-            # Get user from session
-            user_info = session.get("user", {})
-            if isinstance(user_info, dict):
-                user_email: str = user_info.get("email", "unknown")
-            else:
-                user_email = str(user_info) if user_info else "unknown"
+            user_email = audit_principal(session)
 
             # The tenant this action belongs to, resolved so it survives either decorator
             # ORDER. Flask hands URL parameters to the OUTERMOST wrapper as kwargs, so
@@ -239,44 +292,17 @@ def log_admin_action(
 
                 # Log the admin action (even if it failed)
                 if tenant_id:
-                    try:
-                        # Use cached audit logger to reduce DB connections
-                        audit_logger = _get_or_create_audit_logger(tenant_id)
-
-                        # Extract additional details if provided
-                        details: dict[str, Any] = {
-                            "user": user_email,
-                            "action": operation_name,
-                            "method": request.method,
-                        }
-
-                        if extract_details and callable(extract_details):
-                            try:
-                                extracted = extract_details(result, **kwargs)
-                                if isinstance(extracted, dict):
-                                    details.update(extracted)
-                            except Exception as e:
-                                logger.warning(f"Failed to extract details for {operation_name}: {e}")
-
-                        # Add request data for POST requests (sanitized)
-                        if request.method == "POST":
-                            safe_fields = _extract_safe_request_data()
-                            if safe_fields:
-                                details["request_data"] = safe_fields
-
-                        audit_logger.log_operation(
-                            operation=operation_name,
-                            principal_name=user_email,
-                            principal_id=user_email,
-                            adapter_id="admin_ui",
-                            success=success,
-                            details=details,
-                            error=error_message,
-                            tenant_id=tenant_id,
-                        )
-                    except Exception as e:
-                        # Don't fail the request if audit logging fails
-                        logger.warning(f"Failed to write admin audit log for {operation_name}: {e}")
+                    record_admin_action(
+                        _get_or_create_audit_logger(tenant_id),
+                        tenant_id,
+                        operation_name,
+                        user_email=user_email,
+                        method=request.method,
+                        request_data=_extract_safe_request_data() if request.method == "POST" else {},
+                        success=success,
+                        error_message=error_message,
+                        extra_details=_extracted_details(extract_details, operation_name, result, kwargs),
+                    )
 
             return result
 

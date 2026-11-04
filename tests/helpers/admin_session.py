@@ -14,6 +14,11 @@ whether the flag happened to be set, which is how two template tests came to pas
 box and fail on a laptop. A test that needs an admin session now STATES one, and the
 deployment has one fewer password path.
 
+A third client, the ASGI test client over the admin sub-application
+(``tests/admin/conftest.py::asgi_admin_client``), carries the same cookie the HTTP client
+does, stated through :func:`asgi_auth_session`; what the server writes back is read with
+:func:`session_cookie_payload` and :func:`cookie_flashes`.
+
 Nine older blueprint test modules still carry their own private ``_auth_session`` copy
 (pre-existing duplication debt); new modules must import from here.
 """
@@ -21,6 +26,7 @@ Nine older blueprint test modules still carry their own private ``_auth_session`
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from typing import Any
 
 #: The secret the test stacks sign session cookies with. A deployment generates a random
@@ -64,13 +70,71 @@ def admin_session_cookie(tenant_id: str, *, auth_method: str | None = None, secr
     :data:`TEST_FLASK_SECRET_KEY` — the value the test compose stacks set.
     """
     from flask import Flask
-    from flask.sessions import SecureCookieSessionInterface
 
     app = Flask(__name__)
     app.secret_key = secret_key or os.environ.get("FLASK_SECRET_KEY") or TEST_FLASK_SECRET_KEY
-    serializer = SecureCookieSessionInterface().get_signing_serializer(app)
+    return signed_session_cookie(app, _session_payload(tenant_id, auth_method=auth_method))
+
+
+def signed_session_cookie(flask_app: Any, payload: Mapping[str, Any]) -> str:
+    """*payload* signed as a session cookie by *flask_app*'s own session interface."""
+    serializer = flask_app.session_interface.get_signing_serializer(flask_app)
     assert serializer is not None, "Flask refused to build a session serializer without a secret key"
-    return serializer.dumps(_session_payload(tenant_id, auth_method=auth_method))
+    return serializer.dumps(dict(payload))
+
+
+def admin_auth_cookie(flask_app: Any, tenant_id: str, *, auth_method: str | None = None) -> str:
+    """The super-admin session as a cookie signed by *flask_app*: one payload, two carriers."""
+    return signed_session_cookie(flask_app, _session_payload(tenant_id, auth_method=auth_method))
+
+
+def asgi_auth_session(client: Any, flask_app: Any, tenant_id: str, *, auth_method: str | None = None) -> None:
+    """Give an ASGI test client (``fastapi.testclient.TestClient``) the super-admin session.
+
+    The ASGI twin of :func:`admin_auth_session`. The cookie is stated under the domain
+    ``testserver.local`` ON PURPOSE: ``http.cookiejar`` turns the dotless test host
+    ``testserver`` into the effective host ``testserver.local``, files a host-only
+    ``Set-Cookie`` from the server under that domain, and returns a stated cookie only when
+    its domain matches. Stating the cookie under the same domain is what makes the server's
+    later ``Set-Cookie`` REPLACE it instead of sitting next to it, so a flash the server
+    wrote is the one the next request carries (the problem
+    :func:`drop_stated_session_cookie` solves after the fact for the HTTP client, solved at
+    the source here).
+    """
+    client.cookies.set(
+        flask_app.config["SESSION_COOKIE_NAME"],
+        admin_auth_cookie(flask_app, tenant_id, auth_method=auth_method),
+        domain="testserver.local",
+    )
+
+
+def session_cookie_payload(flask_app: Any, response: Any) -> dict[str, Any]:
+    """The session the response's own ``Set-Cookie`` carries; ``{}`` when it set none.
+
+    Decoded with *flask_app*'s serializer and the app's own lifetime, the way Flask's
+    ``open_session`` does; a cookie it cannot read (tampered, expired, another secret) is an
+    empty session, not an error.
+    """
+    from itsdangerous import BadSignature
+
+    value = response.cookies.get(flask_app.config["SESSION_COOKIE_NAME"])
+    if value is None:
+        return {}
+    serializer = flask_app.session_interface.get_signing_serializer(flask_app)
+    assert serializer is not None, "Flask refused to build a session serializer without a secret key"
+    try:
+        return dict(serializer.loads(value, max_age=int(flask_app.permanent_session_lifetime.total_seconds())))
+    except BadSignature:
+        return {}
+
+
+def cookie_flashes(flask_app: Any, response: Any) -> list[tuple[str, str]]:
+    """The ``(category, message)`` pairs the response queued for the next rendered page.
+
+    The ASGI twin of ``operator_answer`` (``tests/helpers/race_window.py``) and of the ingest
+    helper's ``flashes()``: read from the session the server wrote, not from rendered HTML.
+    """
+    return [tuple(pair) for pair in session_cookie_payload(flask_app, response).get("_flashes", [])]
 
 
 def authenticate_http_session(session: Any, base_url: str, tenant_id: str, *, auth_method: str | None = None) -> Any:

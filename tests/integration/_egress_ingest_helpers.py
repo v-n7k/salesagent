@@ -30,6 +30,17 @@ def flashes(client) -> list[tuple[str, str]]:
         return list(session.get("_flashes", []))
 
 
+def asgi_flashes(client, response) -> list[tuple[str, str]]:
+    """The ASGI twin of :func:`flashes`: the pairs the response's own session cookie queued.
+
+    A ``TestClient`` keeps the app it serves on ``.app``; the sub-application keeps the Flask
+    app whose serializer signs the cookie on ``.state.flask_app``.
+    """
+    from tests.helpers.admin_session import cookie_flashes
+
+    return cookie_flashes(client.app.state.flask_app, response)
+
+
 def post_register_hmac_webhook(
     client, url: str, secret: str, *, tenant_id: str = TENANT_ID, principal_id: str = PRINCIPAL_ID
 ):
