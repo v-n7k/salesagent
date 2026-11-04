@@ -737,8 +737,9 @@ returns a FastAPI sub-application (`openapi_url=None`, `docs_url=None`) that:
 4. mounts the Flask app, wrapped in `a2wsgi.WSGIMiddleware`, at `""` as its
    LAST route, so any path no router claims falls through to Flask exactly
    as today;
-5. installs the Flask-side `url_build_error_handlers` fallback (§ 5.12.4)
-   on the Flask app it was given.
+5. registers itself on the Flask app it was given (`flask_app.extensions`),
+   so the Flask-side `url_build_error_handlers` fallback that `create_app`
+   installs (§ 5.12.4) resolves against this sub-application's routers.
 
 `src/app.py` builds it once from `flask_admin_app` and `_install_admin_mounts()`
 mounts it at `/admin` and at `""`, in the same two places and the same last
@@ -820,10 +821,13 @@ bound to the same prefix (`flask_app.url_map.bind(host, script_name=admin_prefix
 which also covers `static`. So a migrated page's `base.html` links to
 `auth.logout` or `core.index` keep working while those are Flask routes.
 The other direction: Flask's `url_for` raises `BuildError` for an endpoint
-that moved; the handler `build_admin_app` installs on
+that moved; the handler `create_app` installs on
 `flask_app.url_build_error_handlers` resolves the name against the
-sub-application's router under `request.script_root` and returns the path.
-Four pages link to the pilot's endpoints today; none changes. A redirect's
+registered routers (or the sub-application built over the app, when there
+is one) under `request.script_root` and returns the path. The Flask app
+owns the handler so that every composition of it, including a test's bare
+`create_app()`, builds a link to a migrated route. Four pages link to the
+pilot's endpoints today; none changes. A redirect's
 `Location` on the ASGI side is always a `url_for` result (§ 5.2.7), so
 `CustomProxyFix`'s rewrite has nothing to do there and is not reproduced.
 
@@ -1016,6 +1020,10 @@ section:
     instead of the generic "Error adding creative agent".
 11. Submitted text fields are trimmed (`"  Spaced  "` is stored as
     `"Spaced"`) and unknown form fields are ignored, on both kinds.
+12. the Flask tenant guard no longer runs the view inside its own `try`, so
+    a view's HTTP error keeps its status for tenant users.
+13. the slashless list URL answers 404 where Flask answered a 308. The pull
+    request lists each in full.
 
 ### 6.5 Measurements to report before and after
 
