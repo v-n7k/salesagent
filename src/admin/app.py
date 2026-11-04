@@ -35,6 +35,7 @@ from src.admin.blueprints.signing_keys import signing_keys_bp
 from src.admin.blueprints.tenants import tenants_bp
 from src.admin.blueprints.users import users_bp
 from src.admin.blueprints.workflows import workflows_bp
+from src.admin.web.app import install_migrated_endpoint_resolver
 from src.core.config import load_settings
 from src.core.config_loader import is_single_tenant_mode
 from src.core.domain_config import (
@@ -340,6 +341,11 @@ def create_app(config=None, settings=None):
 
     # Register adapter-specific routes
     register_adapter_routes(app)
+
+    # A Flask page's url_for reaches a route that has migrated to a FastAPI router through this
+    # handler (src/admin/web/app.py); the sub-application built over this app widens it to its
+    # own routers.
+    install_migrated_endpoint_resolver(app)
 
     # Register GAM inventory endpoints
     try:

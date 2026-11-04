@@ -358,3 +358,15 @@ def test_refuse_json_answers_the_refusals_status_and_audits_the_failure(client, 
 def test_an_unauthenticated_request_never_reaches_the_audit(client, tenant, factory_session):
     assert client.post(f"/tenant/{tenant.tenant_id}/probe/audited", data={"name": "x"}).status_code == 302
     assert _audit(factory_session, tenant.tenant_id, "probe_action") == []
+
+
+def test_a_bare_flask_app_resolves_a_migrated_endpoint(flask_app):
+    """A Flask page's link to a migrated route builds on the Flask app alone.
+
+    ``tenant_settings.html`` links to the agent pages from a Flask-rendered page, and the test
+    compositions that drive Flask blueprints never build the sub-application over the app. The
+    resolver is therefore the Flask app's own, installed by ``create_app``; a sub-application
+    built over the app only widens it to the routers it was given.
+    """
+    with flask_app.test_request_context():
+        assert flask_url_for("creative_agents.list_creative_agents", tenant_id="t1") == "/tenant/t1/creative-agents/"

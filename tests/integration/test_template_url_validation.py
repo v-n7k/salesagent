@@ -15,7 +15,7 @@ from werkzeug.routing.converters import NumberConverter
 from werkzeug.routing.exceptions import BuildError
 
 from src.admin.app import create_app
-from src.admin.web.app import build_admin_app
+from src.admin.routers import ADMIN_ROUTERS
 
 # Every blueprint this app composes, composed the one way it composes them. The scanners
 # below are Jinja-blind by construction -- they regex templates for ``url_for('...')`` and
@@ -23,12 +23,6 @@ from src.admin.web.app import build_admin_app
 # because one blueprint was registered only under a test-mode flag and one template branch
 # named it. Both are gone, so there is one blueprint set and the scan grades the templates.
 admin_app = create_app()
-
-# Composed the way ``src/app.py`` composes it: the admin sub-application wraps the Flask app
-# and installs the Flask-side ``url_build_error_handlers`` fallback, which is how a Flask
-# page's ``url_for`` reaches a route that has migrated to a FastAPI router. Grading the
-# templates against the bare Flask app would report every migrated endpoint as broken.
-asgi_admin_app = build_admin_app(admin_app)
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db, pytest.mark.admin]
 
@@ -92,13 +86,15 @@ class TestTemplateUrlValidation:
 
     @staticmethod
     def migrated_placeholder_params(endpoint: str, tenant_id: str) -> dict[str, object]:
-        """The same derivation for an endpoint that lives on the admin sub-application's routers.
+        """The same derivation for an endpoint that has migrated to a FastAPI router.
 
+        The Flask app resolves such a name through the handler ``create_app`` installs, but
         Starlette's ``url_path_for`` refuses a parameter set that is not exactly the route's,
         so the values come from the route's own convertors. An endpoint on neither side
         returns no values and lets ``url_for`` raise the BuildError that names it.
         """
-        route = next((r for r in asgi_admin_app.routes if isinstance(r, Route) and r.name == endpoint), None)
+        routes = (r for router in ADMIN_ROUTERS for r in router.routes if isinstance(r, Route))
+        route = next((r for r in routes if r.name == endpoint), None)
         if route is None:
             return {}
 
