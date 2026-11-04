@@ -732,7 +732,8 @@ lives in `src/admin/web/`.
 returns a FastAPI sub-application (`openapi_url=None`, `docs_url=None`) that:
 
 1. carries the session middleware (§ 5.12.3);
-2. includes every admin router (the pilot's two) at their own paths;
+2. includes every admin router (the pilot's two) at their own paths, each
+   GET route answering HEAD as a Flask rule does;
 3. registers the three exception handlers of § 5.8.2;
 4. mounts the Flask app, wrapped in `a2wsgi.WSGIMiddleware`, at `""` as its
    LAST route, so any path no router claims falls through to Flask exactly
