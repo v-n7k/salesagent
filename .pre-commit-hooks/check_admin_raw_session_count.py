@@ -59,6 +59,7 @@ NON_SESSION_RECEIVERS = frozenset(
         "next_ids",
         "processed_currencies",
         "repository",
+        "route.methods",
         "seen_tenant_ids",
         "selected_format_ids",
         "sizes",
