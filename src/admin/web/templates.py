@@ -19,8 +19,11 @@ from src.core.domain_config import get_support_email
 
 
 def _is_plain_path(value: str) -> bool:
-    """A prefix a proxy may set: one leading slash, never a scheme or a host."""
-    return value.startswith("/") and not value.startswith("//") and "://" not in value
+    """A prefix a proxy may set: one leading slash, never a scheme or a host.
+
+    A backslash is refused too: browsers read ``/\\host`` as ``//host``, an off-host redirect.
+    """
+    return value.startswith("/") and not value.startswith("//") and "://" not in value and "\\" not in value
 
 
 def admin_prefix(request: Request) -> str:

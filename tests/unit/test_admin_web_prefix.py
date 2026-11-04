@@ -34,6 +34,7 @@ def _request(headers: dict[str, str], root_path: str, path: str = "/tenant/t1/pr
         ({"x-script-name": "/x", "x-forwarded-prefix": "/admin"}, "", "/x"),
         ({"x-forwarded-prefix": "https://attacker.example"}, "", ""),
         ({"x-forwarded-prefix": "//attacker.example"}, "/admin", "/admin"),
+        ({"x-forwarded-prefix": "/\\attacker.example"}, "/admin", "/admin"),
     ],
 )
 def test_admin_prefix_precedence_and_plain_path_rule(headers, root_path, expected):

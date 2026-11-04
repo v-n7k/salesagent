@@ -20,6 +20,7 @@ from src.admin.services.agents import (
     CREATIVE,
     SIGNALS,
     AgentKind,
+    agent_repository,
     create_agent,
     delete_agent,
     probe_agent,
@@ -87,12 +88,6 @@ def _tenant(uow: AgentUoW) -> Any:
     return uow.tenant_config.get_tenant()
 
 
-def _repository(uow: AgentUoW, pages: _Pages) -> Any:
-    repository = getattr(uow, pages.kind.repository)
-    assert repository is not None
-    return repository
-
-
 def _no_tenant(request: Request) -> Response:
     return refuse_form(request, AdminNotFound("Tenant not found"), url_for(request, "core.index"))
 
@@ -111,7 +106,7 @@ def _list_page(request: Request, pages: _Pages, tenant_id: str) -> Response:
         tenant = _tenant(uow)
         if tenant is None:
             return _no_tenant(request)
-        rows = _repository(uow, pages).list_all()
+        rows = agent_repository(uow, pages.kind).list_all()
         return render(
             request,
             pages.list_template,
@@ -146,7 +141,7 @@ def _edit(request: Request, pages: _Pages, tenant_id: str, agent_id: int, form: 
             tenant = _tenant(uow)
             if tenant is None:
                 return _no_tenant(request)
-            row = _repository(uow, pages).get(agent_id)
+            row = agent_repository(uow, pages.kind).get(agent_id)
             if row is None:
                 return refuse_form(request, AdminNotFound(f"{pages.kind.label} agent not found"), list_url)
             agent = {"id": row.id, **{name: getattr(row, name) for name in pages.form_fields}}

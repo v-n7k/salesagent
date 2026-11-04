@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.testclient import TestClient
+from flask import abort as flask_abort
 from flask import flash as flask_flash
 from flask import get_flashed_messages as flask_get_flashed_messages
 from flask import jsonify
@@ -130,6 +131,11 @@ def flask_app(integration_db):
         "/tenant/<tenant_id>/probe/flask-guarded",
         "probe_flask_guarded",
         flask_require_tenant_access()(lambda tenant_id: "ok"),
+    )
+    app.add_url_rule(
+        "/tenant/<tenant_id>/probe/flask-abort",
+        "probe_flask_abort",
+        flask_require_tenant_access()(lambda tenant_id: flask_abort(400)),
     )
     return app
 
@@ -314,10 +320,16 @@ def test_guard_allows_an_active_member(client, flask_app, tenant):
 
 @pytest.mark.parametrize(
     "payload_for",
-    [lambda tid: _session_payload(tid), lambda tid: {}, lambda tid: {"user": {"email": "nobody@example.com"}}],
-    ids=["super-admin", "anonymous", "stranger"],
+    [
+        lambda tid: _session_payload(tid),
+        lambda tid: {},
+        lambda tid: {"user": {"email": "nobody@example.com"}},
+        lambda tid: {"user": {"email": "member@example.com"}},
+    ],
+    ids=["super-admin", "anonymous", "stranger", "member"],
 )
 def test_guard_answers_the_same_on_both_carriers(client, flask_client, flask_app, tenant, payload_for):
+    UserFactory(tenant=tenant, email="member@example.com", is_active=True)
     payload = payload_for(tenant.tenant_id)
     with flask_client.session_transaction() as sess:
         sess.update(payload)
@@ -328,6 +340,18 @@ def test_guard_answers_the_same_on_both_carriers(client, flask_client, flask_app
         asgi_answer.status_code,
         urlsplit(asgi_answer.headers.get("location", "")).path,
     )
+
+
+def test_a_members_flask_view_keeps_its_own_status(flask_client, flask_app, tenant):
+    """The Flask decorator runs the view outside its ``try``: a member's ``abort(400)`` stays a 400.
+
+    Before the decision was extracted, a member's view ran inside the decorator's
+    ``try``/``except Exception`` and its own ``abort`` came out as a 500.
+    """
+    UserFactory(tenant=tenant, email="member@example.com", is_active=True)
+    with flask_client.session_transaction() as sess:
+        sess["user"] = {"email": "member@example.com"}
+    assert flask_client.get(f"/tenant/{tenant.tenant_id}/probe/flask-abort").status_code == 400
 
 
 def test_audited_route_writes_one_row_with_the_sanitized_form(client, flask_app, tenant, factory_session):

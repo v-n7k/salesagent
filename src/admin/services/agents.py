@@ -71,7 +71,8 @@ def _fields(form: AgentFormBase) -> dict[str, Any]:
     return {name: getattr(form, name) for name in type(form).model_fields}
 
 
-def _repository(uow: AgentUoW, kind: AgentKind) -> Any:
+def agent_repository(uow: AgentUoW, kind: AgentKind) -> Any:
+    """The repository *uow* carries for *kind*; the router reads rows through the same one."""
     repository = getattr(uow, kind.repository)
     assert repository is not None
     return repository
@@ -88,7 +89,7 @@ def create_agent(tenant_id: str, kind: AgentKind, form: AgentFormBase) -> str:
     """Store a new agent; returns the stored name."""
     raise_if_url_blocked(form.agent_url, _URL_LABEL)
     with AgentUoW(tenant_id) as uow:
-        repository = _repository(uow, kind)
+        repository = agent_repository(uow, kind)
         row = repository.add(kind.model(tenant_id=tenant_id, **_fields(form)))
         return str(row.name)
 
@@ -96,7 +97,7 @@ def create_agent(tenant_id: str, kind: AgentKind, form: AgentFormBase) -> str:
 def update_agent(tenant_id: str, kind: AgentKind, agent_id: int, form: AgentFormBase) -> str:
     """Overwrite an agent's fields from the form; a blank credential keeps the stored one."""
     with AgentUoW(tenant_id) as uow:
-        row = _existing(_repository(uow, kind), kind, agent_id)
+        row = _existing(agent_repository(uow, kind), kind, agent_id)
         raise_if_url_blocked(form.agent_url, _URL_LABEL)
         for name, value in _fields(form).items():
             if name == "auth_credentials" and value is None:
@@ -108,7 +109,7 @@ def update_agent(tenant_id: str, kind: AgentKind, agent_id: int, form: AgentForm
 def delete_agent(tenant_id: str, kind: AgentKind, agent_id: int) -> str:
     """Delete an agent; returns the deleted name."""
     with AgentUoW(tenant_id) as uow:
-        repository = _repository(uow, kind)
+        repository = agent_repository(uow, kind)
         row = _existing(repository, kind, agent_id)
         repository.delete(row)
         return str(row.name)
@@ -121,7 +122,7 @@ def probe_agent(tenant_id: str, kind: AgentKind, agent_id: int) -> ProbeResult:
     request once they are closed; the stored URL is asked again, at probe time.
     """
     with AgentUoW(tenant_id) as uow:
-        row = _existing(_repository(uow, kind), kind, agent_id)
+        row = _existing(agent_repository(uow, kind), kind, agent_id)
         raise_if_url_blocked(row.agent_url, _URL_LABEL)
         probe: ProbeResult = asyncio.run(kind.registry().probe_agent(row))
     return probe

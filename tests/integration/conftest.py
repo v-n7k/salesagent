@@ -686,7 +686,7 @@ def authenticated_asgi_admin_client(test_admin_app):
     from src.admin.web.app import build_admin_app
     from tests.helpers.admin_session import asgi_auth_session
 
-    client = TestClient(build_admin_app(test_admin_app), raise_server_exceptions=False, follow_redirects=False)
+    client = TestClient(build_admin_app(test_admin_app), follow_redirects=False)
     asgi_auth_session(client, test_admin_app, "default")
 
     yield client
