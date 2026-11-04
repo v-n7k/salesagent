@@ -9,10 +9,13 @@ from pathlib import Path
 
 import pytest
 from flask import url_for
+from starlette.convertors import IntegerConvertor
+from starlette.routing import Route
 from werkzeug.routing.converters import NumberConverter
 from werkzeug.routing.exceptions import BuildError
 
 from src.admin.app import create_app
+from src.admin.web.app import build_admin_app
 
 # Every blueprint this app composes, composed the one way it composes them. The scanners
 # below are Jinja-blind by construction -- they regex templates for ``url_for('...')`` and
@@ -20,6 +23,12 @@ from src.admin.app import create_app
 # because one blueprint was registered only under a test-mode flag and one template branch
 # named it. Both are gone, so there is one blueprint set and the scan grades the templates.
 admin_app = create_app()
+
+# Composed the way ``src/app.py`` composes it: the admin sub-application wraps the Flask app
+# and installs the Flask-side ``url_build_error_handlers`` fallback, which is how a Flask
+# page's ``url_for`` reaches a route that has migrated to a FastAPI router. Grading the
+# templates against the bare Flask app would report every migrated endpoint as broken.
+asgi_admin_app = build_admin_app(admin_app)
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db, pytest.mark.admin]
 
@@ -66,7 +75,7 @@ class TestTemplateUrlValidation:
         """
         rule = next((r for r in admin_app.url_map.iter_rules() if r.endpoint == endpoint), None)
         if rule is None:
-            return {}  # unknown endpoint: let url_for raise the BuildError that says so
+            return TestTemplateUrlValidation.migrated_placeholder_params(endpoint, tenant_id)
 
         params: dict[str, object] = {}
         for argument in rule.arguments:
@@ -77,6 +86,28 @@ class TestTemplateUrlValidation:
                 params[argument] = tenant_id
             elif argument == "filename":
                 params[argument] = "test.js"
+            else:
+                params[argument] = f"test_{argument}"
+        return params
+
+    @staticmethod
+    def migrated_placeholder_params(endpoint: str, tenant_id: str) -> dict[str, object]:
+        """The same derivation for an endpoint that lives on the admin sub-application's routers.
+
+        Starlette's ``url_path_for`` refuses a parameter set that is not exactly the route's,
+        so the values come from the route's own convertors. An endpoint on neither side
+        returns no values and lets ``url_for`` raise the BuildError that names it.
+        """
+        route = next((r for r in asgi_admin_app.routes if isinstance(r, Route) and r.name == endpoint), None)
+        if route is None:
+            return {}
+
+        params: dict[str, object] = {}
+        for argument, convertor in route.param_convertors.items():
+            if isinstance(convertor, IntegerConvertor):
+                params[argument] = 1
+            elif argument == "tenant_id":
+                params[argument] = tenant_id
             else:
                 params[argument] = f"test_{argument}"
         return params
