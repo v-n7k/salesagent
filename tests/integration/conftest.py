@@ -678,6 +678,20 @@ def authenticated_admin_client(test_admin_app):
     # Clean up test mode
 
 
+@pytest.fixture
+def authenticated_asgi_admin_client(test_admin_app):
+    """The ASGI twin of ``authenticated_admin_client``: the sub-application over the same app."""
+    from fastapi.testclient import TestClient
+
+    from src.admin.web.app import build_admin_app
+    from tests.helpers.admin_session import asgi_auth_session
+
+    client = TestClient(build_admin_app(test_admin_app), follow_redirects=False)
+    asgi_auth_session(client, test_admin_app, "default")
+
+    yield client
+
+
 # ``test_media_buy_workflow`` was here and is DELETED along with the dict
 # ``CreativeFactory`` it seeded from (tests/fixtures/factories.py). It had zero consumers
 # and could not have run for any of them: ``CreativeFactory.create_batch`` was never

@@ -56,13 +56,15 @@ Covers:
   (RFC 9421 notification-proof policy — "can an endpoint under this host ever be
   PROVEN?" — which the egress seam has no notion of and deliberately does not
   want)
-- Flask endpoint-level wiring for signals agents add/edit handlers (routes
-  through ``src.admin.utils.url_policy`` -> ``outbound_http.validate_url``,
-  never called ``check_url_ssrf`` directly)
+- the seam the admin agent routes refuse through (``src.admin.utils.url_policy``
+  -> ``outbound_http.validate_url``): that one vector is refused, opaquely. The
+  endpoint wiring itself is graded against a real database by
+  ``tests/integration/test_admin_ingest_url_policy.py`` and
+  ``tests/admin/test_agents.py``
+  (``test_add_refuses_a_url_egress_policy_blocks_and_audits_the_refusal``,
+  ``test_edit_*``): a test that mocks the session to watch the handler is a test
+  of the mock (tests/CLAUDE.md § Which kind of test).
 """
-
-import os
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -111,60 +113,34 @@ class TestReservedTldPolicy:
 
 # A public, non-reserved address as a literal: the ingest gate's verdict on it is
 # decided entirely by address policy, with no DNS lookup to go missing offline.
-# (The mirror image of the reject cases' 169.254.169.254 / host.docker.internal.)
+# (The mirror image of the reject case's host.docker.internal.)
 SAFE_PUBLIC_URL = "https://93.184.216.34/agent"
 
-# The URL both reject-path wiring tests submit. Named once so the seam-linkage
-# test below and the endpoint tests cannot drift onto different vectors — a
-# redirect proves the handler refused, not WHY, and the two only compose into
-# "the seam is what refused it" while they are the same URL.
+# The vector the seam test pins: a docker-internal hostname on a private port,
+# refused by address policy alone, so the verdict needs no DNS.
 BLOCKED_INGEST_URL = "http://host.docker.internal:9999"
 
 
-def _make_signals_agent_client():
-    """Create a Flask test client authenticated as super admin for signals agent endpoints."""
-    from src.admin.app import create_app
-    from tests.helpers.admin_session import admin_auth_session
-
-    app = create_app({"TESTING": True, "SECRET_KEY": "test-secret", "WTF_CSRF_ENABLED": False})
-    client = app.test_client()
-    admin_auth_session(client, "default")
-    return client
-
-
-def _mock_db_for_signals_add(mock_db, tenant_id="default"):
-    """Wire mock_db so the add handler can query Tenant."""
-    mock_tenant = MagicMock()
-    mock_tenant.tenant_id = tenant_id
-    mock_session = MagicMock()
-    mock_session.scalars.return_value.first.return_value = mock_tenant
-    mock_db.return_value.__enter__ = MagicMock(return_value=mock_session)
-    mock_db.return_value.__exit__ = MagicMock(return_value=False)
-    return mock_session
-
-
 class TestSignalsAgentEndpointSSRFWiring:
-    """Flask endpoint-level tests confirming the ingest egress gate is wired into handlers.
+    """The seam the agent routes' ingest refusal rests on.
 
-    These tests exercise the actual POST /tenant/<id>/signals-agents/add and
-    POST /tenant/<id>/signals-agents/<id>/edit endpoints so that removing or
-    bypassing the ingest check in the handler would cause a real failure. The
-    handlers no longer call ``check_url_ssrf`` directly: they go through
-    ``src.admin.utils.url_policy`` -> ``src.core.security.outbound_http.validate_url``,
-    whose address policy is the live ``adcp.signing`` validator. The accepted URL is
-    therefore a public IP literal rather than a fixture hostname: nothing here patches
-    a resolver any more, so a hostname would make the accept case depend on this
-    machine's DNS, and the verdict must be a pure address-policy fact.
+    The routes' own tests grade the handler end to end against a real database
+    (``tests/integration/test_admin_ingest_url_policy.py``,
+    ``tests/admin/test_agents.py``). The three mock-session endpoint tests that
+    used to live here are gone: they patched the handler's session factory and
+    asserted on the mock, which grades the mock, not the handler
+    (tests/CLAUDE.md § Which kind of test). What stays is the one fact those
+    route tests assume and cannot grade themselves: that the seam refuses the
+    vector, and refuses it opaquely.
     """
 
     def test_the_seam_raises_on_the_url_the_endpoints_reject(self):
-        """The redirect assertions below are caused by the seam REFUSING, not by luck.
+        """A 302-back-to-the-form grades "something went wrong", not "egress policy said no".
 
-        A 302-back-to-the-form is what this handler does for any failure at all, so
-        on its own it grades "something went wrong", not "egress policy said no".
-        This pins the missing half: for the exact URL those tests submit, the seam
-        raises ``OutboundRequestBlocked`` — a raise, not a ``(bool, str)`` verdict,
-        which is the contract change ``check_url_ssrf`` -> ``validate_url`` made.
+        This pins the missing half: for a vector of the kind the route tests
+        submit, the seam raises ``OutboundRequestBlocked`` — a raise, not a
+        ``(bool, str)`` verdict, which is the contract change ``check_url_ssrf``
+        -> ``validate_url`` made.
 
         The refusal is also asserted to be OPAQUE (AdCP 3.1.1,
         ``building/by-layer/L1/security.mdx`` point 6): the sentence handed back
@@ -186,109 +162,3 @@ class TestSignalsAgentEndpointSSRFWiring:
         # Non-vacuity: the same call admits the URL the accept-path test submits, so
         # the raise above is a verdict on the vector and not a blanket refusal.
         assert validate_url(SAFE_PUBLIC_URL) is None
-
-    def test_add_endpoint_rejects_docker_internal_url(self):
-        """POST /signals-agents/add with host.docker.internal URL must return a redirect with error flash."""
-        client = _make_signals_agent_client()
-
-        with patch("src.admin.blueprints.signals_agents.get_db_session") as mock_db:
-            _mock_db_for_signals_add(mock_db)
-            with patch.dict(os.environ, {}):
-                response = client.post(
-                    "/tenant/default/signals-agents/add",
-                    data={
-                        "agent_url": BLOCKED_INGEST_URL,
-                        "name": "SSRF Test Agent",
-                        "enabled": "on",
-                        "timeout": "30",
-                    },
-                    follow_redirects=False,
-                )
-
-        # Must redirect back to add form (not to list — which would mean success)
-        assert response.status_code == 302
-        assert "add" in response.headers.get("Location", "")
-
-    def test_add_endpoint_accepts_safe_public_url(self):
-        """POST /signals-agents/add with a safe public URL must proceed past the SSRF check.
-
-        ``SAFE_PUBLIC_URL`` is an https IP literal in public space, so the gate's verdict
-        needs no DNS and the agent row really is created — the redirect goes to the list.
-        """
-        client = _make_signals_agent_client()
-
-        with patch("src.admin.blueprints.signals_agents.get_db_session") as mock_db:
-            mock_session = _mock_db_for_signals_add(mock_db)
-            # Make session.add() and commit() no-ops
-            mock_session.add = MagicMock()
-            mock_session.commit = MagicMock()
-            with patch.dict(os.environ, {}):
-                response = client.post(
-                    "/tenant/default/signals-agents/add",
-                    data={
-                        "agent_url": SAFE_PUBLIC_URL,
-                        "name": "Safe Agent",
-                        "enabled": "on",
-                        "timeout": "30",
-                    },
-                    follow_redirects=False,
-                )
-
-        # Must redirect to list (success) — not back to add form
-        assert response.status_code == 302
-        assert "add" not in response.headers.get("Location", "")
-        # And the row was actually written — proving it reached the endpoint-add path,
-        # not merely that it failed somewhere past the gate. Assert on WHAT was added,
-        # not just that add() fired: a bare assert_called_once() would stay green if a
-        # regression wrote the wrong row.
-        #
-        # ONE assertion, not a count-then-dissect pair. The earlier form —
-        # assert_called_once_with(ANY) followed by a call_args read — pinned the count
-        # and nothing about the argument, which is the split shape the weak-mock guard
-        # bans; routing it through ANY only disguised it.
-        assert len(mock_session.add.call_args_list) == 1, (
-            f"expected exactly one row to be added, got {mock_session.add.call_args_list!r}"
-        )
-        added = mock_session.add.call_args.args[0]
-        assert str(getattr(added, "agent_url", None)) == SAFE_PUBLIC_URL, (
-            f"the persisted row must carry the URL that passed the gate; got {added!r}"
-        )
-        mock_session.commit.assert_called_once_with()
-
-    def test_edit_endpoint_rejects_unsafe_url_on_update(self):
-        """POST /signals-agents/<id>/edit updating URL to host.docker.internal must be rejected.
-
-        This is the exact scenario the reviewer asked about: editing from a safe URL
-        to an unsafe one. The handler assigns agent.agent_url from the form value first,
-        then validates it — so it is the new submitted value being checked.
-        """
-        client = _make_signals_agent_client()
-
-        existing_agent = MagicMock()
-        existing_agent.id = 1
-        existing_agent.agent_url = "https://safe.example.com/agent"
-        existing_agent.auth_credentials = None
-
-        mock_session = MagicMock()
-        mock_session.scalars.return_value.first.return_value = existing_agent
-
-        with patch("src.admin.blueprints.signals_agents.get_db_session") as mock_db:
-            mock_db.return_value.__enter__ = MagicMock(return_value=mock_session)
-            mock_db.return_value.__exit__ = MagicMock(return_value=False)
-            with patch.dict(os.environ, {}):
-                response = client.post(
-                    "/tenant/default/signals-agents/1/edit",
-                    data={
-                        "agent_url": BLOCKED_INGEST_URL,
-                        "name": "Existing Agent",
-                        "enabled": "on",
-                        "timeout": "30",
-                    },
-                    follow_redirects=False,
-                )
-
-        # Must redirect back to edit form (not to list — which would mean success)
-        assert response.status_code == 302
-        assert "edit" in response.headers.get("Location", "")
-        # Confirm the agent URL was NOT committed as the unsafe value
-        mock_session.commit.assert_not_called()

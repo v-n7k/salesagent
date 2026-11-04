@@ -242,14 +242,10 @@ class TestAdminCompatibilityMount:
     def test_fastapi_mounts_admin_at_admin_and_root(self):
         from starlette.routing import Mount
 
-        from src.app import _install_admin_mounts, app
+        from src.app import _install_admin_mounts, admin_app, app
 
         _install_admin_mounts()
-        admin_mounts = [
-            route.path
-            for route in app.routes
-            if isinstance(route, Mount) and route.app.__class__.__name__ == "WSGIMiddleware"
-        ]
+        admin_mounts = [route.path for route in app.routes if isinstance(route, Mount) and route.app is admin_app]
 
         assert "/admin" in admin_mounts
         assert "" in admin_mounts

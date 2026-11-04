@@ -15,7 +15,6 @@ from src.admin.blueprints.api import api_bp
 from src.admin.blueprints.auth import auth_bp, init_oauth
 from src.admin.blueprints.authorized_properties import authorized_properties_bp
 from src.admin.blueprints.core import core_bp
-from src.admin.blueprints.creative_agents import creative_agents_bp
 from src.admin.blueprints.creatives import creatives_bp
 from src.admin.blueprints.format_search import bp as format_search_bp
 from src.admin.blueprints.gam import gam_bp
@@ -30,13 +29,13 @@ from src.admin.blueprints.public import public_bp
 from src.admin.blueprints.publisher_partners import publisher_partners_bp
 from src.admin.blueprints.schemas import schemas_bp
 from src.admin.blueprints.settings import settings_bp, tenant_management_settings_bp
-from src.admin.blueprints.signals_agents import signals_agents_bp
 from src.admin.blueprints.signing_keys import signing_keys_bp
 
 # from src.admin.blueprints.tasks import tasks_bp  # Disabled - tasks eliminated in favor of workflow system
 from src.admin.blueprints.tenants import tenants_bp
 from src.admin.blueprints.users import users_bp
 from src.admin.blueprints.workflows import workflows_bp
+from src.admin.web.app import install_migrated_endpoint_resolver
 from src.core.config import load_settings
 from src.core.config_loader import is_single_tenant_mode
 from src.core.domain_config import (
@@ -307,8 +306,6 @@ def create_app(config=None, settings=None):
         adapters_bp
     )  # No url_prefix - routes define their own paths like /adapters/{adapter}/config/{tenant_id}/{product_id}
     app.register_blueprint(authorized_properties_bp, url_prefix="/tenant")
-    app.register_blueprint(creative_agents_bp, url_prefix="/tenant/<tenant_id>/creative-agents")
-    app.register_blueprint(signals_agents_bp, url_prefix="/tenant/<tenant_id>/signals-agents")
     app.register_blueprint(signing_keys_bp, url_prefix="/tenant/<tenant_id>/signing-keys")
     app.register_blueprint(inventory_bp)  # Has its own internal routing
     app.register_blueprint(inventory_profiles_bp, url_prefix="/tenant/<tenant_id>/inventory-profiles")
@@ -344,6 +341,11 @@ def create_app(config=None, settings=None):
 
     # Register adapter-specific routes
     register_adapter_routes(app)
+
+    # A Flask page's url_for reaches a route that has migrated to a FastAPI router through this
+    # handler (src/admin/web/app.py); the sub-application built over this app widens it to its
+    # own routers.
+    install_migrated_endpoint_resolver(app)
 
     # Register GAM inventory endpoints
     try:

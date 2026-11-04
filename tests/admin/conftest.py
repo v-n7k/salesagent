@@ -35,6 +35,31 @@ def admin_client(monkeypatch):
 
 
 @pytest.fixture
+def asgi_admin_app():
+    """The ASGI admin sub-application over the real admin Flask app (no DB mocking, CSRF off).
+
+    The Flask app it wraps is reachable as ``asgi_admin_app.state.flask_app``.
+    """
+    from src.admin.web.app import build_admin_app
+    from tests.helpers.admin_session import admin_test_app
+
+    return build_admin_app(admin_test_app())
+
+
+@pytest.fixture
+def asgi_admin_client(asgi_admin_app):
+    """The one client every migrated domain's test module uses.
+
+    ``raise_server_exceptions=False`` so a 500 is observed as a 500; ``follow_redirects=False``
+    so a 302 is observed as a 302. The Flask ``admin_client`` stays for the modules that still
+    test Flask blueprints and goes with the last of them.
+    """
+    from fastapi.testclient import TestClient
+
+    return TestClient(asgi_admin_app, raise_server_exceptions=False, follow_redirects=False)
+
+
+@pytest.fixture
 def test_users():
     """Provide test user credentials."""
     return {

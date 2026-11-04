@@ -13,7 +13,6 @@ from typing import Any
 from a2a.server.request_handlers.response_helpers import agent_card_to_dict
 from a2a.server.routes import create_jsonrpc_routes
 from a2a.types import AgentCard as A2AAgentCard
-from a2wsgi import WSGIMiddleware
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +28,7 @@ from src.a2a_server.adcp_a2a_server import (
 )
 from src.a2a_server.context_builder import AdCPCallContextBuilder
 from src.admin.app import create_app
+from src.admin.web.app import build_admin_app
 from src.core.agent_identity import AGENT_CARD_PATH
 from src.core.auth_middleware import AuthChallengeResponder
 from src.core.config import load_settings
@@ -59,32 +59,25 @@ settings = load_settings()
 
 
 def _install_admin_mounts() -> None:
-    """Ensure Flask admin mounts are the final routes in the FastAPI app.
+    """Ensure the admin sub-application mounts are the final routes in the FastAPI app.
 
     The root fallback mount must stay last so dynamically-added FastAPI test
-    routes (and any later app routes) are matched before Flask catches all
-    remaining paths.
+    routes (and any later app routes) are matched before the admin (and the
+    Flask app inside it) catches all remaining paths.
     """
 
-    from a2wsgi import WSGIMiddleware
     from starlette.routing import Mount
 
     filtered_routes = []
     for route in app.router.routes:
         # Remove any prior compatibility mounts so we can re-add them at the end.
-        if isinstance(route, Mount) and isinstance(route.app, WSGIMiddleware) and route.path in {"/admin", ""}:
+        if isinstance(route, Mount) and route.app is admin_app and route.path in {"/admin", ""}:
             continue
         filtered_routes.append(route)
 
     app.router.routes = filtered_routes
-    # WSGIMiddleware is an ASGI-compatible adapter that Starlette accepts at runtime,
-    # but mypy sees a protocol mismatch with Starlette.mount's ASGIApp expectation.
-    # ``unused-ignore`` keeps both environments happy: CI's mypy (full project venv
-    # with starlette stubs) flags the arg-type error so we suppress it; pre-commit's
-    # isolated mypy hook env lacks starlette and reports the type:ignore as unused,
-    # which the ``unused-ignore`` category suppresses too.
-    app.mount("/admin", admin_wsgi)  # type: ignore[arg-type, unused-ignore]
-    app.mount("/", admin_wsgi)  # type: ignore[arg-type, unused-ignore]
+    app.mount("/admin", admin_app)
+    app.mount("/", admin_app)
 
 
 @asynccontextmanager
@@ -587,11 +580,11 @@ app.add_middleware(
 app.add_middleware(AuthChallengeResponder)
 
 # ---------------------------------------------------------------------------
-# Admin UI — mount Flask admin via WSGIMiddleware
+# Admin UI — the ASGI admin sub-application, with the Flask admin as its fallback
 # ---------------------------------------------------------------------------
 
 flask_admin_app = create_app(settings=settings)
-admin_wsgi = WSGIMiddleware(flask_admin_app)
+admin_app = build_admin_app(flask_admin_app)
 
 
 # ---------------------------------------------------------------------------
