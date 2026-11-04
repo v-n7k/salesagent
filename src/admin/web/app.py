@@ -14,6 +14,7 @@ import flask
 from a2wsgi import WSGIMiddleware
 from fastapi import APIRouter, FastAPI
 from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
 from flask import Flask
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
@@ -79,6 +80,11 @@ def build_admin_app(flask_app: Flask, *, routers: Sequence[APIRouter] | None = N
     app.add_middleware(AdminSessionMiddleware, flask_app=flask_app)
     for router in ADMIN_ROUTERS if routers is None else routers:
         app.include_router(router)
+    # Flask answers HEAD for every GET rule and a migrated page keeps that (link checkers,
+    # ``curl -I``); FastAPI registers GET alone, so the composition widens each GET route once.
+    for route in app.routes:
+        if isinstance(route, APIRoute) and "GET" in route.methods:
+            route.methods.add("HEAD")
     app.add_exception_handler(RequestValidationError, answer_not_found)
     app.add_exception_handler(AuthRequired, answer_auth_required)
     app.add_exception_handler(AccessDenied, answer_access_denied)

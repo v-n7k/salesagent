@@ -42,6 +42,7 @@ from tests.helpers.admin_session import (
     admin_test_app,
     asgi_auth_session,
     cookie_flashes,
+    copy_session_cookie,
     session_cookie_payload,
     signed_session_cookie,
 )
@@ -160,10 +161,6 @@ def tenant(factory_session):
     return TenantFactory()
 
 
-def _flask_cookie_to_asgi(flask_client, client) -> None:
-    client.cookies.set("session", flask_client.get_cookie("session").value, domain="testserver.local")
-
-
 def _asgi_cookie_to_flask(response, flask_client) -> None:
     flask_client.set_cookie("session", response.cookies["session"])
 
@@ -181,7 +178,7 @@ def _audit(factory_session, tenant_id: str, operation: str) -> list[tuple]:
 
 def test_router_reads_the_session_the_flask_client_wrote(client, flask_client):
     admin_auth_session(flask_client, "t1")
-    _flask_cookie_to_asgi(flask_client, client)
+    copy_session_cookie(flask_client, client)
     assert client.get("/tenant/t1/probe/session").json() == {"success": True, "email": "test@example.com"}
 
 
@@ -202,7 +199,7 @@ def test_flash_set_by_flask_shows_on_a_router_rendered_page(client, flask_client
     response = flask_client.get("/tenant/t1/probe/set-flash")
     # Flask resolved a migrated endpoint through the url_build_error_handlers fallback.
     assert (response.status_code, response.headers["Location"]) == (302, "/tenant/t1/probe/page")
-    _flask_cookie_to_asgi(flask_client, client)
+    copy_session_cookie(flask_client, client)
     page = client.get("/tenant/t1/probe/page")
     assert page.status_code == 200 and "from-flask" in page.text
     # Rendering popped the flash and the cookie was written back without it.
@@ -340,6 +337,12 @@ def test_guard_answers_the_same_on_both_carriers(client, flask_client, flask_app
         asgi_answer.status_code,
         urlsplit(asgi_answer.headers.get("location", "")).path,
     )
+
+
+def test_a_get_route_answers_head_as_flask_does(client, tenant):
+    """Flask answers HEAD for every GET rule; a migrated page must too (link checkers, ``curl -I``)."""
+    response = client.head(f"/tenant/{tenant.tenant_id}/probe/links")
+    assert (response.status_code, response.content) == (200, b"")
 
 
 def test_a_members_flask_view_keeps_its_own_status(flask_client, flask_app, tenant):

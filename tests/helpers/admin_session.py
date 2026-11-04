@@ -183,6 +183,31 @@ def drop_stated_session_cookie(session: Any) -> None:
             session.cookies.clear(cookie.domain, cookie.path, cookie.name)
 
 
+def copy_session_cookie(flask_client: Any, asgi_client: Any) -> None:
+    """Carry *flask_client*'s session cookie over to *asgi_client* (the domain rule of
+    :func:`asgi_auth_session`), so one session drives both carriers."""
+    name = flask_client.application.config["SESSION_COOKIE_NAME"]
+    cookie = flask_client.get_cookie(name)
+    if cookie is not None:
+        asgi_client.cookies.set(name, cookie.value, domain="testserver.local")
+
+
+def admin_composition_client(flask_client: Any) -> Any:
+    """The admin as production serves it, over the app *flask_client* drives, with its session.
+
+    A link on a Flask-rendered page may point at a route that has migrated to a FastAPI
+    router; only the sub-application built over the Flask app (``build_admin_app``) serves
+    both sides, so a test that follows links follows them here.
+    """
+    from fastapi.testclient import TestClient
+
+    from src.admin.web.app import build_admin_app
+
+    client = TestClient(build_admin_app(flask_client.application), follow_redirects=False)
+    copy_session_cookie(flask_client, client)
+    return client
+
+
 def admin_test_app() -> Any:
     """The admin Flask app a test drives in process: ONE composition, every harness.
 
