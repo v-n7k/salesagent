@@ -222,7 +222,7 @@ _DERIVED_BLOCKS: dict[str, str] = {
 #                  What actually backs the protocol is the signals-AGENT integration:
 #                  src/services/dynamic_products.py queries signals agents to generate
 #                  product variants (reachable through get_products), and
-#                  src/admin/blueprints/signals_agents.py manages them. Still graded by the
+#                  src/admin/routers/agents.py manages them. Still graded by the
 #                  `signal-owned` accept scenario, which needs it as the parent protocol.
 #                  NOTE the failure mode this row demonstrates: backing was checked by
 #                  "does an implementation file exist" rather than "can a buyer reach it".

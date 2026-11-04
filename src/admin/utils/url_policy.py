@@ -11,8 +11,9 @@ this application implements no SSRF protection, ever — the policy belongs to
 ``adcp.signing``, reached through the one seam.)
 
 The admin surface answers in two shapes — a form post that flashes and
-redirects, and a JSON API that returns 400 — so there are two functions here
-over one refusal decision. There were previously nine copies of that decision
+redirects, and a JSON API that returns 400 — so there are two Flask functions here
+over one refusal decision, plus :func:`raise_if_url_blocked`, the Flask-free third:
+a service under the ASGI admin raises the refusal and its router answers it. There were previously nine copies of that decision
 spread across five modules, which is how a call site ends up with a policy the
 others do not have.
 
@@ -40,6 +41,7 @@ from typing import Any
 from flask import Response, flash, jsonify, redirect
 from werkzeug.wrappers import Response as WerkzeugResponse
 
+from src.admin.errors import AdminInvalidInput
 from src.core.security.outbound_http import OutboundRequestBlocked, validate_url
 
 logger = logging.getLogger(__name__)
@@ -98,3 +100,14 @@ def json_error_if_url_blocked(url: Any, label: str, **payload_extra: Any) -> tup
     if _is_allowed(url, label):
         return None
     return jsonify({**payload_extra, "error": _REJECTION_MESSAGE.format(label=label)}), 400
+
+
+def raise_if_url_blocked(url: Any, label: str) -> None:
+    """Raise ``AdminInvalidInput`` with the one rejection sentence when *url* fails egress policy.
+
+    The Flask-free form of the decision above, for a service called from a migrated route:
+    the router answers the refusal (flash and redirect, or a 400 JSON body) and this function
+    does not need to know which.
+    """
+    if not _is_allowed(url, label):
+        raise AdminInvalidInput(_REJECTION_MESSAGE.format(label=label))

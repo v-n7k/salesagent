@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 
 from src.core.database.database_session import get_db_session
 from src.core.database.repositories.account import AccountRepository
+from src.core.database.repositories.agent import CreativeAgentRepository, SignalsAgentRepository
 from src.core.database.repositories.authorized_property import AuthorizedPropertyRepository
 from src.core.database.repositories.creative import CreativeAssignmentRepository, CreativeRepository
 from src.core.database.repositories.currency_limit import CurrencyLimitRepository
@@ -448,6 +449,24 @@ class TenantAccessUoW(BaseUoW):
     users: UserRepository | None
 
     _REPOSITORIES: ClassVar[Mapping[str, type]] = {"users": UserRepository}
+
+
+class AgentUoW(BaseUoW):
+    """Unit of Work for the admin's creative-agent and signals-agent pages.
+
+    ``tenant_config`` is here because every admin page renders ``tenant``; the two agent
+    repositories because the pair's routes read and write both kinds through one service.
+    """
+
+    tenant_config: TenantConfigRepository | None
+    creative_agents: CreativeAgentRepository | None
+    signals_agents: SignalsAgentRepository | None
+
+    _REPOSITORIES: ClassVar[Mapping[str, type]] = {
+        "tenant_config": TenantConfigRepository,
+        "creative_agents": CreativeAgentRepository,
+        "signals_agents": SignalsAgentRepository,
+    }
 
 
 class CapabilitiesUoW(BaseUoW):

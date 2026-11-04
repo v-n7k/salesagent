@@ -44,10 +44,12 @@ KEYS = ("admin_get_db_session", "admin_session_add")
 #: raw-session debt this ratchet is paying down.
 SESSION_RECEIVERS = frozenset({"db_session", "session"})
 
-#: Receivers of ``.add(`` that are NOT sessions. Every one of these is a set, and
-#: ``set.add`` has nothing to do with the UoW migration. Pinned rather than filtered by a
-#: name pattern so a new receiver lands in neither set and forces a decision instead of
-#: being silently classified by whichever regex happens to match it.
+#: Receivers of ``.add(`` that are NOT sessions. Every one of these is a set, except
+#: ``repository``: a repository's ``add`` is where the UoW migration SENDS a row, the
+#: destination of the debt rather than the debt. ``set.add`` has nothing to do with the
+#: migration at all. Pinned rather than filtered by a name pattern so a new receiver lands
+#: in neither set and forces a decision instead of being silently classified by whichever
+#: regex happens to match it.
 NON_SESSION_RECEIVERS = frozenset(
     {
         "ancestor_ids",
@@ -56,6 +58,7 @@ NON_SESSION_RECEIVERS = frozenset(
         "indices",
         "next_ids",
         "processed_currencies",
+        "repository",
         "seen_tenant_ids",
         "selected_format_ids",
         "sizes",

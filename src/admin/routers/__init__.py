@@ -10,6 +10,8 @@ session factory, and catches nothing but ``AdminRefusal``.
 
 from fastapi import APIRouter
 
+from src.admin.routers.agents import creative_agents, signals_agents
+
 #: Every migrated router, in registration order. ``build_admin_app`` includes these when it is
 #: given no explicit list; a test passes its own probe router instead.
-ADMIN_ROUTERS: tuple[APIRouter, ...] = ()
+ADMIN_ROUTERS: tuple[APIRouter, ...] = (creative_agents, signals_agents)
