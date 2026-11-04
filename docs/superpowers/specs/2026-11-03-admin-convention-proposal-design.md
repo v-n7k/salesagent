@@ -1020,10 +1020,9 @@ section:
     instead of the generic "Error adding creative agent".
 11. Submitted text fields are trimmed (`"  Spaced  "` is stored as
     `"Spaced"`) and unknown form fields are ignored, on both kinds.
-12. the Flask tenant guard no longer runs the view inside its own `try`, so
+12. The Flask tenant guard no longer runs the view inside its own `try`, so
     a view's HTTP error keeps its status for tenant users.
-13. the slashless list URL answers 404 where Flask answered a 308. The pull
-    request lists each in full.
+13. The slashless list URL answers 404 where Flask answered a 308.
 
 ### 6.5 Measurements to report before and after
 
