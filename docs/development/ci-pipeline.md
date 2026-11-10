@@ -55,8 +55,8 @@ advisory. See [Tests redden on base](#tests-redden-on-base).
 
 ## Tests redden on base
 
-The `tests-redden-on-base` job (`CI / Tests Redden On Base`) runs the tests that a pull
-request (PR) adds or changes twice. It checks that a `fix`, `feat`, or `security` PR
+The `tests-redden-on-base` job (`CI / Tests Redden On Base`) runs twice the tests that a
+pull request (PR) adds or changes. It checks that a `fix`, `feat`, or `security` PR
 brings a test that fails without its production change. The job runs on `pull_request`
 only, because a push has no PR base to compare with. Its verdicts are advisory: see
 [What blocks a merge](#what-blocks-a-merge).
@@ -121,7 +121,12 @@ A suite is hosted when this job runs its tests. The job hosts the following suit
 |-----------|--------|-----|
 | `tests/unit/` and `tests/harness/` | Yes | One run |
 | `tests/integration/` | Yes, except the creative group and `skip_ci` tests | One run on the job's Postgres service, with `-m "not creative and not skip_ci"` |
-| `tests/bdd/`, `tests/admin/`, `tests/e2e/`, `tests/ui/`, and any other directory | No | Listed as `unhosted`, with `-` in both outcome cells |
+| `tests/e2e/`, `tests/admin/`, `tests/ui/`, and any other directory | No | A `test_` function is listed as `unhosted`, with `-` in both outcome cells |
+| `tests/bdd/` | No | A scenario or step module holds no `test_` function, so the touched file appears only under "Touched without a changed test function" |
+
+A BDD scenario is a `.feature` file that a `scenarios(...)` call binds. The job lists no
+change for it, so the verdict counts a touched path under `tests/bdd/` as a changed test
+in an unhosted suite.
 
 The creative integration group needs the
 [reference creative agent](#reference-creative-agent), so CI runs it in-network, inside
@@ -145,10 +150,10 @@ of the following rules that fits:
 
 | Order | Verdict | When |
 |-------|---------|------|
-| 1 | `error` | A suite with changed tests has no report for a run, or its report records a pytest exit code other than 0, 1, or 5. |
+| 1 | `error` | A suite with a hosted added or changed test has no report, or its report records an exit code other than 0, 1, or 5. |
 | 2 | `advisory` | The Conventional Commits type of the PR title is not `fix`, `feat`, or `security`, or no production root changed. The gate does not grade the PR. |
 | 3 | `fail` | The PR touches no file under `tests/`. |
-| 4 | `skip` | Every changed test is deleted, unhosted, or not collected on the head. |
+| 4 | `skip` | Every changed test is deleted, unhosted, or not collected on the head. A touched path under `tests/bdd/` counts as an unhosted changed test. |
 | 5 | `pass` | Some hosted changed test is red (`failed` or `error`) on the base and `passed` on the head. |
 | 6 | `fail` | None of the earlier rules applies. |
 
@@ -156,10 +161,11 @@ Rule 2 reads the PR title from the event payload. The `pull_request` trigger run
 `opened`, `synchronize`, and `reopened`. A re-run reuses the event payload, so a
 retitled PR keeps the verdict of its last push until the next push.
 
-Rule 1 comes first so that a `refactor` title cannot hide a broken job. Codes 2, 3, and
-4 mean interrupted, internal error, and usage error. The gate fails closed: a run that
-did not complete fails the job. Rule 6 also covers a PR whose touched files under
-`tests/` hold no test function, such as a change to a `conftest.py` file.
+Rule 1 comes first so that a `refactor` title cannot hide a broken job. Pytest exit
+codes 2, 3, and 4 mean interrupted, internal error, and usage error. The gate fails
+closed: a run that did not complete fails the job. Rule 6 also covers a PR whose touched
+files under `tests/`, outside `tests/bdd/`, hold no test function, such as a change to a
+`conftest.py` file.
 
 The job exits with code 1 for `fail` and `error`, and with code 0 for the other
 verdicts.
@@ -193,21 +199,22 @@ The job has the following blind spots:
   `adcp_test` directly runs base code on the head schema.
 - An edit that changes only literal values, local names, or docstrings is not a changed
   test.
+- The comparison reads only the body of a module and of each `Test*` class. It does not
+  see a test defined under an `if` or a `try`.
+  [`changed_functions.py`](../../scripts/ci/changed_functions.py) states this ceiling.
 - A test that the AST lists but pytest never collects reads `not collected`. The verdict
   treats it as unhosted and does not fail it.
 
 ### The Summary job
 
 The job is in `summary.needs`. The validate step of `summary` accepts `skipped` for it,
-because the job does not run on `push`. Every other job must report `success`.
+because the job does not run on `push`. Every other job in `needs` must report `success`.
 
 ### What blocks a merge
 
 Every verdict is advisory until a maintainer requires `CI / Summary` on the `main`
 ruleset. A `fail` or `error` verdict turns the job red on the PR. It blocks the merge
-only after that requirement exists. A ruleset is a repository setting, so no file in
-this repository can add the requirement. The job needs no change when a maintainer adds
-it.
+only after that requirement exists. The job needs no change when a maintainer adds it.
 
 ## BDD Test Shards
 

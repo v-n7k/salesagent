@@ -660,15 +660,20 @@ def then_response_has_formats(ctx, count):
     assert len(wire_field(ctx, "formats")) == count
 ```
 
+### A fix needs a test that reddens on base
+
 **A `fix`, `feat`, or `security` pull request (PR) needs at least one added or changed
 test that fails without its production change.** The rule applies when the PR changes a
 file under `src/`, `templates/`, `static/`, or `alembic/`. The `Tests Redden On Base`
 job checks this rule. It runs the changed tests of the PR on the head, then again with
 those four roots reset to the base. It lists each test with both outcomes in its step
 summary. When the job fails, read that table: a test that is `passed` on both sides did
-not exercise the change. The job cannot run a test in an unhosted suite, such as BDD or
-e2e, or in the creative integration group. Such a test shows as `unhosted` or
-`not collected`, and it counts neither way. See
+not exercise the change. The job does not run an unhosted suite, such as `tests/bdd/`,
+`tests/e2e/`, `tests/admin/`, or `tests/ui/`. A BDD scenario or step module holds no
+`test_` function. The job lists those files under "Touched without a changed test
+function" and grades the PR `skip` when no hosted test changed. A test function in an
+unhosted suite shows as `unhosted`, and one in the creative integration group shows as
+`not collected`. None of these counts either way. See
 [Tests redden on base](../docs/development/ci-pipeline.md#tests-redden-on-base) for the
 verdict rules and the blind spots.
 
