@@ -434,18 +434,79 @@ def _base_expr_is_tenant(node: ast.expr) -> bool:
     return isinstance(node, ast.Attribute) and node.attr == "tenant"
 
 
+def _snippet_labels(
+    find_lineno_violations: Callable[[ast.Module], list[int]],
+    snippets: dict[str, str],
+    *,
+    kind: str,
+    flagged: bool,
+) -> list[str]:
+    """Labels of the snippets whose detector verdict (flags something or not) equals *flagged*."""
+    return [
+        label
+        for label, source in snippets.items()
+        if bool(find_lineno_violations(ast.parse(source, filename=f"<{kind}:{label}>"))) == flagged
+    ]
+
+
 def assert_detector_catches_ast_snippets(
     find_lineno_violations: Callable[[ast.Module], list[int]],
     *,
     snippets: dict[str, str],
 ) -> None:
     """Fail if an inline known-bad snippet is not flagged by the detector."""
-    missed: list[str] = []
-    for label, source in snippets.items():
-        tree = ast.parse(source, filename=f"<known-bad:{label}>")
-        if not find_lineno_violations(tree):
-            missed.append(label)
+    missed = _snippet_labels(find_lineno_violations, snippets, kind="known-bad", flagged=False)
     assert not missed, "Detector missed known-bad snippet(s):\n" + "\n".join(f"  {s}" for s in missed)
+
+
+def assert_detector_ignores_ast_snippets(
+    find_lineno_violations: Callable[[ast.Module], list[int]],
+    *,
+    snippets: dict[str, str],
+) -> None:
+    """Fail if the detector flags an inline known-good snippet.
+
+    The inverse of ``assert_detector_catches_ast_snippets``: a detector that flags a
+    legitimate shape is as wrong as one that misses a violation.
+    """
+    flagged = _snippet_labels(find_lineno_violations, snippets, kind="known-good", flagged=True)
+    assert not flagged, "Detector flagged known-good snippet(s):\n" + "\n".join(f"  {s}" for s in flagged)
+
+
+def assert_check_rejects_mutation(
+    check: Callable[[Path], None],
+    *,
+    paths: Iterable[str],
+    mutate: Callable[[Path], None],
+    source_root: Path | None = None,
+) -> None:
+    """Fail unless *check* passes on a copy of *paths* and rejects the copy once *mutate* has broken it.
+
+    For a guard that reads files (a pin, a config, a workflow) rather than the AST,
+    where an inline snippet cannot show that the guard notices a change. Each of
+    *paths* (a file or directory, relative to *source_root*, default the repo root)
+    is copied to the same relative path in a fresh temporary directory, and *check*
+    and *mutate* receive that directory, so the real tree is never touched. A *check*
+    that fails on the unmutated copy raises its own error. One that passes after
+    *mutate* fails with ``check accepted the mutated copy: <mutate.__name__>``.
+    """
+    root = repo_root() if source_root is None else source_root
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp = Path(tmp_dir)
+        for path in paths:
+            dest = tmp / path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if (root / path).is_dir():
+                shutil.copytree(root / path, dest)
+            else:
+                shutil.copy2(root / path, dest)
+        check(tmp)
+        mutate(tmp)
+        try:
+            check(tmp)
+        except AssertionError:
+            return
+        raise AssertionError(f"check accepted the mutated copy: {mutate.__name__}")
 
 
 def find_tenant_config_violations(tree: ast.Module) -> list[int]:

@@ -10,6 +10,8 @@ import pytest
 
 from tests.unit._architecture_helpers import (
     assert_anchor_consistency,
+    assert_check_rejects_mutation,
+    assert_detector_ignores_ast_snippets,
     assert_violations_match_allowlist,
     iter_call_expressions,
     iter_git_tracked_files,
@@ -272,3 +274,40 @@ def test_scan_src_does_not_raise_when_nothing_is_suppressed(tmp_path):
     dirs = _tree(tmp_path, **{"dirty.py": "MARKER\n"})
 
     assert scan_src(_flag_marker, exempt=frozenset(), skip_prefixes=(), scan_dirs=dirs)
+
+
+# ---------------------------------------------------------------------------
+# The negative snippet helper and the config-mutation probe.
+#
+# The first is the inverse of assert_detector_catches_ast_snippets: a detector
+# that flags a legitimate shape is as wrong as one that misses a violation. The
+# second grades a guard that reads a config file rather than the AST: copy the
+# inputs, confirm the check passes, break the copy, confirm the check now fails.
+# ---------------------------------------------------------------------------
+
+
+def _flag_prints(tree: ast.Module) -> list[int]:
+    return [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "print"]
+
+
+def test_ignores_helper_passes_on_clean_snippets_and_fails_on_a_flagged_one():
+    assert_detector_ignores_ast_snippets(_flag_prints, snippets={"clean": "x = 1\n"})
+    with pytest.raises(AssertionError, match="dirty"):
+        assert_detector_ignores_ast_snippets(_flag_prints, snippets={"dirty": "print(1)\n"})
+
+
+def test_rejects_mutation_helper_demands_a_pass_then_a_failure(tmp_path):
+    (tmp_path / "pin.txt").write_text("1.0\n")
+
+    def check(root: Path) -> None:
+        assert (root / "pin.txt").read_text() == "1.0\n"
+
+    def bump(root: Path) -> None:
+        (root / "pin.txt").write_text("2.0\n")
+
+    def noop(root: Path) -> None:
+        pass
+
+    assert_check_rejects_mutation(check, paths=["pin.txt"], mutate=bump, source_root=tmp_path)
+    with pytest.raises(AssertionError, match="check accepted the mutated copy: noop"):
+        assert_check_rejects_mutation(check, paths=["pin.txt"], mutate=noop, source_root=tmp_path)
