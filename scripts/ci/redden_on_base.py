@@ -18,10 +18,11 @@ id names that module, and it runs nothing, not even the tests of the modules tha
 file as an argument and ``--continue-on-collection-errors``, pytest records the module as a failed
 collector, runs the rest, and exits 1.
 
-The ``verdict`` subcommand grades the pytest reports of the two runs and appends the summary. A run that
-did not complete, because it has no report or its report records a pytest exit code of 2, 3, or 4, makes
-the verdict an ``error``, so the gate fails closed. The exit code is 1 for a ``fail`` or ``error``
-verdict and 0 otherwise.
+The ``verdict`` subcommand grades the pytest reports of the two runs and appends the summary. A run did
+not complete when it has no report or its report records a pytest exit code of 2, 3, or 4. A head run
+that did not complete makes the verdict an ``error`` for every title. A base run that did not complete
+does so for a pull request that the gate grades, so the gate fails closed. The exit code is 1 for a
+``fail`` or ``error`` verdict and 0 otherwise.
 """
 
 from __future__ import annotations
@@ -51,10 +52,20 @@ HOSTED_BUCKETS: dict[str, str] = {"tests/unit/": "unit", "tests/harness/": "unit
 # The suites that run the hosted tests, each named once. The command line takes one report per suite.
 _BUCKETS: tuple[str, ...] = tuple(dict.fromkeys(HOSTED_BUCKETS.values()))
 
-# A BDD scenario is a ``.feature`` file bound by ``scenarios(...)``, and its step modules hold no
-# ``test_`` function, so the lister never sees one; a touched path here is a changed test in a suite
-# this job does not host.
-SCENARIO_SUITES: tuple[str, ...] = ("tests/bdd/",)
+# The test directories that a tox env or a CI job runs and this job does not host (tox.ini, ci.yml).
+# A touched path under one of them is a changed test in a suite this job does not host: a scenario or
+# step module, a known-failures ledger, a conftest or a fixture there. The lister reports no change for
+# most of those files, so the verdict reads ``touched``. A conftest, helper, factory or fixture outside
+# these directories is support, not a test, so a pull request that touches only those still reads ``fail``.
+UNHOSTED_SUITES: tuple[str, ...] = (
+    "tests/admin/",
+    "tests/bdd/",
+    "tests/e2e/",
+    "tests/quality/",
+    "tests/smoke/",
+    "tests/storyboard/",
+    "tests/ui/",
+)
 
 # The outcome strings are those of ``pytest-json-report``, plus ``NOT_COLLECTED``. ``SKIPPED`` stands
 # for every row outcome that is neither a pass nor a failure: skipped, xfailed, and xpassed.
@@ -189,41 +200,51 @@ def verdict(
     changes: Sequence[FunctionChange],
     head: Mapping[str, str],
     base: Mapping[str, str],
-    incomplete: Sequence[str] = (),
+    head_incomplete: Sequence[str] = (),
+    base_incomplete: Sequence[str] = (),
 ) -> Verdict:
     """Return the verdict for a pull request, from the first rule that decides.
 
-    1. A run that did not complete, which ``incomplete`` lists, is an ``error``. This rule comes first
-       because an aborted run is red on an ungated title too, and a ``refactor`` title must not hide a
-       broken job.
-    2. A title whose type is not gated, or a pull request that changed no production root, is ``advisory``.
-    3. A pull request that touched no file under ``tests/`` is a ``fail``.
-    4. A pull request whose changed tests are all deleted, in an unhosted suite, or not collected on the
-       head is a ``skip``. The head run does not collect a test that its marker expression deselects. That
-       covers the creative integration group, which runs in-network and not on this host, and ``skip_ci``
-       tests. A test in a ``Test`` class that pytest refuses to collect, such as a class with an
-       ``__init__`` method, is not collected either. A pull request whose only test changes are BDD
-       scenarios or step modules under ``tests/bdd/`` is a ``skip`` too. Those files hold no ``test_``
-       function, so they appear only in ``touched``.
-    5. A pull request with a hosted changed test that is red on the base and green on the head is a ``pass``.
-    6. Any other pull request is a ``fail``. That includes one whose changes under ``tests/`` hold no test
-       function, such as a change to a conftest.
+    1. A head run that did not complete is an ``error`` for every title, because the job itself is broken.
+       This rule comes first so that a ``refactor`` title cannot hide a broken job.
+    2. A title whose type is not gated is ``advisory``.
+    3. A pull request that changed no production root is ``advisory``.
+    4. A base run that did not complete is an ``error``, because on a gated pull request an absent base
+       result must not read as red on base. This rule comes after rules 2 and 3 because the base run of a
+       pull request that the gate does not grade can abort with no defect in the job. A ``refactor`` that
+       moves a symbol which a conftest imports at module level does that: pytest exits 4 while it loads the
+       conftest, and it writes no report.
+    5. A pull request that touched no file under ``tests/`` is a ``fail``.
+    6. A pull request that has an added or changed test, or a touched path under ``UNHOSTED_SUITES``, and
+       no added or changed test in a hosted suite that the head run collected, is a ``skip``. A deleted test
+       does not count toward this rule, because it cannot fail on the base. The head run does not collect a
+       test that its marker expression deselects. That covers the creative integration group, which runs
+       in-network and not on this host, and ``skip_ci`` tests. A test in a ``Test`` class that pytest refuses
+       to collect, such as a class with an ``__init__`` method, is not collected either. A touched path under
+       ``UNHOSTED_SUITES`` counts as a changed test in a suite this job does not host. Most of those files
+       hold no ``test_`` function, so they appear only in ``touched``.
+    7. A pull request with a hosted changed test that is red on the base and green on the head is a ``pass``.
+    8. Any other pull request is a ``fail``. That includes one that only deletes tests, and one whose changes
+       under ``tests/`` hold no test function, such as a change to a conftest outside ``UNHOSTED_SUITES``.
 
     ``head`` and ``base`` map a node id to its outcome, and a node id that one of them lacks reads ``ERROR``.
-    ``incomplete`` holds the lines that ``incomplete_runs`` returns for the two runs.
+    ``head_incomplete`` and ``base_incomplete`` hold the lines that ``incomplete_runs`` returns for each run.
     """
-    if incomplete:
-        return Verdict("error", "a run did not complete: " + "; ".join(incomplete))
+    if head_incomplete:
+        return _did_not_complete([*head_incomplete, *base_incomplete])
     prefix = title_prefix(title)
     if prefix not in GATED_PREFIXES:
         return Verdict("advisory", f"title type '{prefix or 'none'}' is not gated")
     if not production_changed:
         return Verdict("advisory", "no production root changed")
+    if base_incomplete:
+        return _did_not_complete(base_incomplete)
     if not touched:
         return Verdict("fail", "the PR touches no file under tests/")
-    scenarios = [path for path in touched if path.startswith(SCENARIO_SUITES)]
+    unhosted_touched = [path for path in touched if path.startswith(UNHOSTED_SUITES)]
+    candidates = [change for change in changes if change.kind != DELETED]
     hosted = [change for change in changes if _is_bucketed(change) and head.get(change.node_id, ERROR) != NOT_COLLECTED]
-    if (changes or scenarios) and not hosted:
+    if (candidates or unhosted_touched) and not hosted:
         return Verdict(
             "skip", "every changed test is deleted, in a suite this job does not host, or not collected on the head"
         )
@@ -231,6 +252,10 @@ def verdict(
     if reddened is not None:
         return Verdict("pass", f"{reddened.node_id} is red on base and green on head")
     return Verdict("fail", "no hosted changed test is red on base and green on head")
+
+
+def _did_not_complete(lines: Iterable[str]) -> Verdict:
+    return Verdict("error", "a run did not complete: " + "; ".join(lines))
 
 
 def _is_bucketed(change: FunctionChange) -> bool:
@@ -387,7 +412,6 @@ def _verdict(args: argparse.Namespace) -> int:
     changes = _changes(document)
     head = _side_outcomes(changes, args.head_report)
     base = _side_outcomes(changes, args.base_report)
-    incomplete = incomplete_runs("head", args.head_report, changes) + incomplete_runs("base", args.base_report, changes)
     decision = verdict(
         title=args.title,
         production_changed=document["production_changed"],
@@ -395,7 +419,8 @@ def _verdict(args: argparse.Namespace) -> int:
         changes=changes,
         head=head,
         base=base,
-        incomplete=incomplete,
+        head_incomplete=incomplete_runs("head", args.head_report, changes),
+        base_incomplete=incomplete_runs("base", args.base_report, changes),
     )
     markdown = render_summary(
         title=args.title, verdict=decision, touched=document["touched"], changes=changes, head=head, base=base

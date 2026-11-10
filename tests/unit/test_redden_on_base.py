@@ -104,29 +104,42 @@ CHANGE = FunctionChange("tests/unit/test_a.py", "test_x", CHANGED)
 ID = CHANGE.node_id
 
 
+def _grade(
+    changes: Sequence[FunctionChange],
+    head: Mapping[str, str],
+    base: Mapping[str, str],
+    *,
+    title: str = "fix: x",
+    production_changed: bool = True,
+    touched: Sequence[str] | None = None,
+    head_incomplete: Sequence[str] = (),
+    base_incomplete: Sequence[str] = (),
+) -> Verdict:
+    """Return the verdict for a pull request that touched the files of ``changes``, or the paths in ``touched``."""
+    return verdict(
+        title=title,
+        production_changed=production_changed,
+        touched=sorted({change.path for change in changes}) if touched is None else touched,
+        changes=changes,
+        head=head,
+        base=base,
+        head_incomplete=head_incomplete,
+        base_incomplete=base_incomplete,
+    )
+
+
+def _status(on_base: str | None, on_head: str | None) -> str:
+    """Return the verdict for the one hosted changed test, where ``None`` leaves that side out of the outcomes."""
+    return _grade(
+        [CHANGE],
+        head={} if on_head is None else {ID: on_head},
+        base={} if on_base is None else {ID: on_base},
+    ).status
+
+
 def test_verdict_advisory_for_an_ungated_title_or_no_production_change() -> None:
-    assert (
-        verdict(
-            title="refactor: x",
-            production_changed=True,
-            touched=["tests/unit/test_a.py"],
-            changes=[CHANGE],
-            head={ID: PASSED},
-            base={ID: PASSED},
-        ).status
-        == "advisory"
-    )
-    assert (
-        verdict(
-            title="fix: x",
-            production_changed=False,
-            touched=["tests/unit/test_a.py"],
-            changes=[CHANGE],
-            head={ID: PASSED},
-            base={ID: PASSED},
-        ).status
-        == "advisory"
-    )
+    assert _grade([CHANGE], head={ID: PASSED}, base={ID: PASSED}, title="refactor: x").status == "advisory"
+    assert _grade([CHANGE], head={ID: PASSED}, base={ID: PASSED}, production_changed=False).status == "advisory"
 
 
 def test_verdict_fails_when_no_test_file_was_touched() -> None:
@@ -148,6 +161,13 @@ def test_verdict_skips_when_every_changed_test_is_unhosted_or_deleted() -> None:
     assert (v.status, v.exit_code) == ("skip", 0)
 
 
+def test_verdict_fails_a_fix_pr_that_only_deletes_a_hosted_test() -> None:
+    # A deleted test cannot fail on the base, so nothing in this set can redden there.
+    gone = FunctionChange("tests/unit/test_a.py", "test_old", DELETED)
+    v = _grade([gone], head={}, base={})
+    assert (v, v.exit_code) == (Verdict("fail", "no hosted changed test is red on base and green on head"), 1)
+
+
 def test_verdict_skips_a_fix_pr_whose_only_test_changes_are_bdd_scenarios() -> None:
     # A scenario is a ``.feature`` file bound by ``scenarios(...)``, and its step modules hold no ``test_`` function,
     # so the lister emits no change for them. The files are touched, and they sit in a suite this job does not host.
@@ -167,24 +187,30 @@ def test_verdict_skips_a_fix_pr_whose_only_test_changes_are_bdd_scenarios() -> N
     assert both == Verdict("pass", f"{ID} is red on base and green on head")
 
 
-def _grade(
-    changes: Sequence[FunctionChange],
-    head: Mapping[str, str],
-    base: Mapping[str, str],
-    *,
-    title: str = "fix: x",
-    incomplete: Sequence[str] = (),
-) -> Verdict:
-    """Return the verdict for a pull request that changed production and touched the files of ``changes``."""
-    return verdict(
-        title=title,
-        production_changed=True,
-        touched=sorted({change.path for change in changes}),
-        changes=changes,
-        head=head,
-        base=base,
-        incomplete=incomplete,
-    )
+# The directories under tests/ that a tox env or a CI job runs and this job does not host. The rows below name them
+# one by one: a test over ``UNHOSTED_SUITES`` itself would lose a row with each directory dropped from the constant.
+UNHOSTED_DIRECTORIES = (
+    "tests/admin/",
+    "tests/bdd/",
+    "tests/e2e/",
+    "tests/quality/",
+    "tests/smoke/",
+    "tests/storyboard/",
+    "tests/ui/",
+)
+
+
+@pytest.mark.parametrize(
+    ("path", "status"),
+    [
+        *((f"{suite}conftest.py", "skip") for suite in UNHOSTED_DIRECTORIES),
+        # A conftest outside the unhosted suites is support, not a test, so a PR that touches only it has no test.
+        ("tests/conftest.py", "fail"),
+        ("tests/integration/conftest.py", "fail"),
+    ],
+)
+def test_verdict_grades_a_path_with_no_changed_test_by_the_directory_it_sits_in(path: str, status: str) -> None:
+    assert _grade([], head={}, base={}, touched=[path]).status == status
 
 
 def test_verdict_treats_a_test_the_head_did_not_collect_as_unhosted() -> None:
@@ -202,72 +228,55 @@ def test_verdict_treats_a_test_the_head_did_not_collect_as_unhosted() -> None:
 def test_verdict_errors_when_a_needed_run_did_not_complete() -> None:
     head, base = {ID: PASSED}, {ID: FAILED}
     assert _grade([CHANGE], head, base).status == "pass"  # Only the missing run turns these outcomes into an error.
-    error = _grade([CHANGE], head, base, incomplete=["base unit: no report"])
+    error = _grade([CHANGE], head, base, base_incomplete=["base unit: no report"])
     assert error == Verdict("error", "a run did not complete: base unit: no report")
     assert error.exit_code == 1
-    # The rule comes before the title rule, so a title that the gate does not grade still shows a broken job.
-    assert _grade([CHANGE], head, base, title="refactor: x", incomplete=["base unit: no report"]) == error
-    both = _grade([CHANGE], head, base, incomplete=["head unit: pytest exit 4", "base unit: no report"])
+    assert _grade([CHANGE], head, base, head_incomplete=["head unit: no report"]).exit_code == 1
+    both = _grade(
+        [CHANGE], head, base, head_incomplete=["head unit: pytest exit 4"], base_incomplete=["base unit: no report"]
+    )
     assert both.reason == "a run did not complete: head unit: pytest exit 4; base unit: no report"
 
 
+@pytest.mark.parametrize(
+    ("title", "production_changed"),
+    [("fix: x", True), ("refactor: x", True), ("Update README", True), ("fix: x", False)],
+)
+def test_verdict_errors_on_a_head_run_that_did_not_complete_whatever_the_title_or_the_roots(
+    title: str, production_changed: bool
+) -> None:
+    # A head run that did not complete means the job itself is broken, for example a Postgres service that never
+    # started. A title that the gate does not grade, or an unchanged production tree, must not hide that.
+    aborted = _grade(
+        [CHANGE],
+        head={},
+        base={ID: FAILED},
+        title=title,
+        production_changed=production_changed,
+        head_incomplete=["head unit: pytest exit 4"],
+    )
+    assert aborted == Verdict("error", "a run did not complete: head unit: pytest exit 4")
+
+
+def test_verdict_errors_on_a_base_run_that_did_not_complete_only_for_a_graded_pull_request() -> None:
+    # A base run of a pull request that moved a symbol which tests/integration/conftest.py imports at module level
+    # aborts while pytest loads the conftest, and it writes no report. On a title or a tree the gate does not grade,
+    # that is expected.
+    head, base, aborted = {ID: PASSED}, {}, ["base unit: no report"]
+    ungated = _grade([CHANGE], head, base, title="refactor: x", base_incomplete=aborted)
+    assert ungated == Verdict("advisory", "title type 'refactor' is not gated")
+    no_roots = _grade([CHANGE], head, base, production_changed=False, base_incomplete=aborted)
+    assert no_roots == Verdict("advisory", "no production root changed")
+    # On a graded pull request an absent base result must not read as red on base, so it is an error.
+    graded = _grade([CHANGE], head, base, base_incomplete=aborted)
+    assert (graded, graded.exit_code) == (Verdict("error", "a run did not complete: base unit: no report"), 1)
+
+
 def test_verdict_passes_only_on_red_base_and_green_head() -> None:
-    assert (
-        verdict(
-            title="fix: x",
-            production_changed=True,
-            touched=[CHANGE.path],
-            changes=[CHANGE],
-            head={ID: PASSED},
-            base={ID: FAILED},
-        ).status
-        == "pass"
-    )
-    assert (
-        verdict(
-            title="fix: x",
-            production_changed=True,
-            touched=[CHANGE.path],
-            changes=[CHANGE],
-            head={ID: PASSED},
-            base={ID: ERROR},
-        ).status
-        == "pass"
-    )
-    assert (
-        verdict(
-            title="fix: x",
-            production_changed=True,
-            touched=[CHANGE.path],
-            changes=[CHANGE],
-            head={ID: PASSED},
-            base={ID: PASSED},
-        ).status
-        == "fail"
-    )
-    assert (
-        verdict(
-            title="fix: x",
-            production_changed=True,
-            touched=[CHANGE.path],
-            changes=[CHANGE],
-            head={ID: FAILED},
-            base={ID: FAILED},
-        ).status
-        == "fail"
-    )
-
-
-def _status(on_base: str | None, on_head: str | None) -> str:
-    """Return the verdict for the one hosted changed test, where ``None`` leaves that side out of the outcomes."""
-    return verdict(
-        title="fix: x",
-        production_changed=True,
-        touched=[CHANGE.path],
-        changes=[CHANGE],
-        head={} if on_head is None else {ID: on_head},
-        base={} if on_base is None else {ID: on_base},
-    ).status
+    assert _grade([CHANGE], head={ID: PASSED}, base={ID: FAILED}).status == "pass"
+    assert _grade([CHANGE], head={ID: PASSED}, base={ID: ERROR}).status == "pass"
+    assert _grade([CHANGE], head={ID: PASSED}, base={ID: PASSED}).status == "fail"
+    assert _grade([CHANGE], head={ID: FAILED}, base={ID: FAILED}).status == "fail"
 
 
 def test_verdict_counts_only_failed_or_error_as_red_and_only_passed_as_green() -> None:
@@ -287,11 +296,6 @@ def test_verdict_grades_only_the_gated_title_types() -> None:
         != "advisory"
     ]
     assert graded == ["fix", "feat", "security"]
-
-
-def test_verdict_fails_a_conftest_only_change() -> None:
-    v = verdict(title="fix: x", production_changed=True, touched=["tests/conftest.py"], changes=[], head={}, base={})
-    assert v.status == "fail"
 
 
 def _write_run(path: Path, exitcode: int) -> Path:
@@ -418,9 +422,11 @@ def _changes_json(path: Path, *changes: FunctionChange) -> Path:
     return path
 
 
-def _verdict_argv(*reports: str, changed: str | Path = "changed.json", summary: str | Path = "summary.md") -> list[str]:
-    """Return the arguments of a ``verdict`` call for the title ``fix: x``, followed by the given report options."""
-    return ["verdict", "--changed", str(changed), "--title", "fix: x", "--summary", str(summary), *reports]
+def _verdict_argv(
+    *reports: str, changed: str | Path = "changed.json", summary: str | Path = "summary.md", title: str = "fix: x"
+) -> list[str]:
+    """Return the arguments of a ``verdict`` call for ``title``, followed by the given report options."""
+    return ["verdict", "--changed", str(changed), "--title", title, "--summary", str(summary), *reports]
 
 
 def test_main_changed_then_ids_then_verdict_round_trip(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -486,6 +492,22 @@ def test_main_verdict_errors_when_a_report_records_an_aborted_run(
     reports = ("--head-report", f"unit={head}", "--base-report", f"unit={base}")
     assert main(_verdict_argv(*reports, changed=changed, summary=tmp_path / "summary.md")) == 1
     assert capsys.readouterr().out == "error: a run did not complete: head unit: pytest exit 4\n"
+
+
+def test_main_verdict_grades_the_two_sides_apart_when_the_title_is_not_gated(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    changed = _changed_json(_fix_repo(tmp_path, "unit"), tmp_path / "changed.json")
+    summary = tmp_path / "summary.md"
+    ok = _write_report(tmp_path / "ok.json", FIX_ID, PASSED)
+    # The base run of a refactor can abort while pytest loads a conftest, and then it writes no report. That is no error.
+    base_aborted = ("--head-report", f"unit={ok}", "--base-report", f"unit={tmp_path / 'absent-base.json'}")
+    assert main(_verdict_argv(*base_aborted, changed=changed, summary=summary, title="refactor: x")) == 0
+    assert capsys.readouterr().out == "advisory: title type 'refactor' is not gated\n"
+    # A head run that aborted is the job's own fault, whatever the title is.
+    head_aborted = ("--head-report", f"unit={tmp_path / 'absent-head.json'}", "--base-report", f"unit={ok}")
+    assert main(_verdict_argv(*head_aborted, changed=changed, summary=summary, title="refactor: x")) == 1
+    assert capsys.readouterr().out == "error: a run did not complete: head unit: no report\n"
 
 
 def test_main_verdict_is_advisory_when_no_production_root_changed(
