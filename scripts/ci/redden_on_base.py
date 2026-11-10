@@ -8,9 +8,20 @@ reports of the two runs into that verdict and into the markdown table that the j
 summary.
 
 Run it as ``python -m scripts.ci.redden_on_base``. The ``changed`` subcommand writes the changed set to a
-JSON file, ``ids`` prints the node ids that one suite runs from that file, and ``verdict`` grades the
-pytest reports of the two runs and appends the summary. Its exit code is 1 for a ``fail`` verdict and 0
-otherwise.
+JSON file. The ``ids`` subcommand writes the node ids that one suite runs to a file, one per line, and
+prints the paths of the files that hold them. The job gives pytest those paths as arguments, together
+with ``-p scripts.ci.pytest_only_ids --only-ids IDS``, and the plugin keeps only the listed tests.
+
+The job gives pytest file paths and not node ids because, on the base, a changed test module can fail to
+import a symbol that the pull request added. Pytest then exits 4 with ``found no collectors`` when a node
+id names that module, and it runs nothing, not even the tests of the modules that import fine. With the
+file as an argument and ``--continue-on-collection-errors``, pytest records the module as a failed
+collector, runs the rest, and exits 1.
+
+The ``verdict`` subcommand grades the pytest reports of the two runs and appends the summary. A run that
+did not complete, because it has no report or its report records a pytest exit code of 2, 3, or 4, makes
+the verdict an ``error``, so the gate fails closed. The exit code is 1 for a ``fail`` or ``error``
+verdict and 0 otherwise.
 """
 
 from __future__ import annotations
@@ -51,13 +62,19 @@ NOT_COLLECTED = "not collected"
 # A test is red when it failed or errored, and green when it passed.
 _RED = frozenset({FAILED, ERROR})
 
+# The pytest exit codes of a run that went through its tests: 0 is every test passed, 1 is some test
+# failed, and 5 is no test collected, which is what a run reports when it deselects every changed test.
+# 2 (interrupted), 3 (internal error), and 4 (usage error) mean that the set did not run.
+_COMPLETE_EXIT_CODES: frozenset[int] = frozenset({0, 1, 5})
+
 
 @dataclass(frozen=True)
 class Verdict:
     """The decision of the gate, and the rule that made it.
 
-    ``status`` is ``pass``, ``fail``, ``skip``, or ``advisory``. A ``skip`` marks a pull request whose
-    changed tests this job cannot run, and ``advisory`` marks one that the gate does not grade.
+    ``status`` is ``pass``, ``fail``, ``skip``, ``advisory``, or ``error``. A ``skip`` marks a pull request
+    whose changed tests this job cannot run, and ``advisory`` marks one that the gate does not grade. An
+    ``error`` marks a pull request for which a run did not complete, so that nothing can be graded.
     """
 
     status: str
@@ -65,8 +82,8 @@ class Verdict:
 
     @property
     def exit_code(self) -> int:
-        """Return the exit code of the job, which is 1 for ``fail`` and 0 for every other status."""
-        return 1 if self.status == "fail" else 0
+        """Return the exit code of the job, which is 1 for ``fail`` and ``error`` and 0 for every other status."""
+        return 1 if self.status in ("fail", "error") else 0
 
 
 def title_prefix(title: str) -> str | None:
@@ -85,6 +102,14 @@ def production_changed(repo_root: Path, base: str) -> bool:
     return bool(touched_paths(repo_root, base, PRODUCTION_ROOTS))
 
 
+def test_node_id(nodeid: str) -> str:
+    """Return the node id of the test that a report row or a collected item belongs to.
+
+    The node id drops the parameter set, so that ``test_p[1]`` and ``test_p[2]`` both belong to ``test_p``.
+    """
+    return nodeid.partition("[")[0]
+
+
 def outcomes(report: Mapping[str, Any] | None, node_ids: Iterable[str]) -> dict[str, str]:
     """Return the outcome of each test in ``node_ids`` from a ``pytest-json-report`` document.
 
@@ -92,7 +117,8 @@ def outcomes(report: Mapping[str, Any] | None, node_ids: Iterable[str]) -> dict[
     ``FAILED`` when some row failed or errored, ``PASSED`` when every row passed, and ``SKIPPED`` for
     any other mix. A test with no row reads ``ERROR`` when a collector that failed covers it, which is
     how a module that cannot import on the base shows up, and ``NOT_COLLECTED`` otherwise. A ``None``
-    report means that pytest wrote none, and every test reads ``ERROR``.
+    report means that pytest wrote none, and every test reads ``ERROR``. The verdict is ``error`` in that
+    case, so those rows never decide anything.
     """
     if report is None:
         return dict.fromkeys(node_ids, ERROR)
@@ -104,8 +130,7 @@ def outcomes(report: Mapping[str, Any] | None, node_ids: Iterable[str]) -> dict[
 def _row_outcomes_by_test(rows: Iterable[Mapping[str, Any]]) -> dict[str, set[str]]:
     by_test: dict[str, set[str]] = {}
     for row in rows:
-        # The rows ``test_p[1]`` and ``test_p[2]`` belong to the test whose node id is ``test_p``.
-        by_test.setdefault(row["nodeid"].partition("[")[0], set()).add(row["outcome"])
+        by_test.setdefault(test_node_id(row["nodeid"]), set()).add(row["outcome"])
     return by_test
 
 
@@ -131,6 +156,26 @@ def _covers(collector: str, node_id: str) -> bool:
     return not collector or node_id == collector or node_id.startswith((f"{collector}::", f"{collector}/"))
 
 
+def incomplete_runs(side: str, reports: Mapping[str, Path], changes: Sequence[FunctionChange]) -> list[str]:
+    """Return a line for each run on one side that has no report or that pytest aborted.
+
+    ``side`` is ``head`` or ``base``, and ``reports`` names the report file of each suite on that side. Only
+    a suite with a hosted changed test needs a run. A line names the suite and the problem, as in
+    ``base unit: no report`` or ``base unit: pytest exit 4``, and the lines follow the order of the suites.
+    A report that records no exit code counts as complete.
+    """
+    problems: list[str] = []
+    for bucket in _BUCKETS:
+        if not _hosted_ids(changes, bucket):
+            continue
+        report = _read_report(reports, bucket)
+        if report is None:
+            problems.append(f"{side} {bucket}: no report")
+        elif (exitcode := report.get("exitcode", 0)) not in _COMPLETE_EXIT_CODES:
+            problems.append(f"{side} {bucket}: pytest exit {exitcode}")
+    return problems
+
+
 def verdict(
     *,
     title: str,
@@ -139,18 +184,28 @@ def verdict(
     changes: Sequence[FunctionChange],
     head: Mapping[str, str],
     base: Mapping[str, str],
+    incomplete: Sequence[str] = (),
 ) -> Verdict:
     """Return the verdict for a pull request, from the first rule that decides.
 
-    1. A title whose type is not gated, or a pull request that changed no production root, is ``advisory``.
-    2. A pull request that touched no file under ``tests/`` is a ``fail``.
-    3. A pull request whose changed tests are all deleted or in an unhosted suite is a ``skip``.
-    4. A pull request with a hosted changed test that is red on the base and green on the head is a ``pass``.
-    5. Any other pull request is a ``fail``. That includes one whose changes under ``tests/`` hold no test
+    1. A run that did not complete, which ``incomplete`` lists, is an ``error``. This rule comes first
+       because an aborted run is red on an ungated title too, and a ``refactor`` title must not hide a
+       broken job.
+    2. A title whose type is not gated, or a pull request that changed no production root, is ``advisory``.
+    3. A pull request that touched no file under ``tests/`` is a ``fail``.
+    4. A pull request whose changed tests are all deleted, in an unhosted suite, or not collected on the
+       head is a ``skip``. The head run does not collect a test that its marker expression deselects (the
+       creative integration group runs in-network, not on this host) or one that pytest does not collect
+       at all, such as a ``test_`` function outside a ``Test`` class or one nested in another function.
+    5. A pull request with a hosted changed test that is red on the base and green on the head is a ``pass``.
+    6. Any other pull request is a ``fail``. That includes one whose changes under ``tests/`` hold no test
        function, such as a change to a conftest.
 
     ``head`` and ``base`` map a node id to its outcome, and a node id that one of them lacks reads ``ERROR``.
+    ``incomplete`` holds the lines that ``incomplete_runs`` returns for the two runs.
     """
+    if incomplete:
+        return Verdict("error", "a run did not complete: " + "; ".join(incomplete))
     prefix = title_prefix(title)
     if prefix not in GATED_PREFIXES:
         return Verdict("advisory", f"title type '{prefix or 'none'}' is not gated")
@@ -158,17 +213,22 @@ def verdict(
         return Verdict("advisory", "no production root changed")
     if not touched:
         return Verdict("fail", "the PR touches no file under tests/")
-    hosted = [change for change in changes if _is_hosted(change)]
+    hosted = [change for change in changes if _is_bucketed(change) and head.get(change.node_id, ERROR) != NOT_COLLECTED]
     if changes and not hosted:
-        return Verdict("skip", "every changed test is in a suite this job does not host")
+        return Verdict(
+            "skip", "every changed test is deleted, in a suite this job does not host, or not collected on the head"
+        )
     reddened = next((change for change in hosted if _reddens(change, head, base)), None)
     if reddened is not None:
         return Verdict("pass", f"{reddened.node_id} is red on base and green on head")
     return Verdict("fail", "no hosted changed test is red on base and green on head")
 
 
-def _is_hosted(change: FunctionChange) -> bool:
-    """Return whether this job runs ``change``, which excludes a deleted test and a test in an unhosted suite."""
+def _is_bucketed(change: FunctionChange) -> bool:
+    """Return whether a suite of this job runs ``change``: it is not deleted and its path is in a hosted directory.
+
+    Whether the run collects it is a separate question, which ``verdict`` answers from the outcome on the head.
+    """
     return change.kind != DELETED and bucket_for(change.path) is not None
 
 
@@ -216,7 +276,7 @@ def render_summary(
 
 
 def _table_row(change: FunctionChange, head: Mapping[str, str], base: Mapping[str, str]) -> str:
-    on_base, on_head = _base_and_head(change, head, base) if _is_hosted(change) else ("-", "-")
+    on_base, on_head = _base_and_head(change, head, base) if _is_bucketed(change) else ("-", "-")
     return f"| {change.node_id} | {change.kind} | {bucket_for(change.path) or 'unhosted'} | {on_base} | {on_head} |"
 
 
@@ -246,12 +306,18 @@ def _build_parser() -> argparse.ArgumentParser:
     changed.add_argument("--out", type=Path, required=True, help="the JSON file to write")
     changed.set_defaults(func=_changed)
 
-    ids = commands.add_parser("ids", help="print the node ids that one suite runs, from the JSON that 'changed' wrote")
+    ids = commands.add_parser(
+        "ids",
+        help="write the node ids that one suite runs to a file, and print the paths of the files that hold them",
+    )
     ids.add_argument("changed", type=Path, metavar="FILE", help="the JSON that 'changed' wrote")
-    ids.add_argument("bucket", choices=_BUCKETS, help="the suite whose ids to print")
+    ids.add_argument("bucket", choices=_BUCKETS, help="the suite whose ids to write")
+    ids.add_argument("--out", type=Path, required=True, metavar="IDS", help="the file to write the node ids to")
     ids.set_defaults(func=_ids)
 
-    graded = commands.add_parser("verdict", help="grade the two runs, append the summary, and exit 1 on a fail")
+    graded = commands.add_parser(
+        "verdict", help="grade the two runs, append the summary, and exit 1 on a fail or an error"
+    )
     graded.add_argument("--changed", type=Path, required=True, metavar="FILE", help="the JSON that 'changed' wrote")
     for side in ("head", "base"):
         graded.add_argument(
@@ -301,8 +367,9 @@ def _changed(args: argparse.Namespace) -> int:
 
 
 def _ids(args: argparse.Namespace) -> int:
-    changes = _changes(json.loads(args.changed.read_text()))
-    print(" ".join(_hosted_ids(changes, args.bucket)))
+    hosted = _hosted_changes(_changes(json.loads(args.changed.read_text())), args.bucket)
+    args.out.write_text("".join(f"{change.node_id}\n" for change in hosted))
+    print(" ".join(sorted({change.path for change in hosted})))
     return 0
 
 
@@ -311,6 +378,7 @@ def _verdict(args: argparse.Namespace) -> int:
     changes = _changes(document)
     head = _side_outcomes(changes, args.head_report)
     base = _side_outcomes(changes, args.base_report)
+    incomplete = incomplete_runs("head", args.head_report, changes) + incomplete_runs("base", args.base_report, changes)
     decision = verdict(
         title=args.title,
         production_changed=document["production_changed"],
@@ -318,6 +386,7 @@ def _verdict(args: argparse.Namespace) -> int:
         changes=changes,
         head=head,
         base=base,
+        incomplete=incomplete,
     )
     markdown = render_summary(
         title=args.title, verdict=decision, touched=document["touched"], changes=changes, head=head, base=base
@@ -333,21 +402,34 @@ def _changes(document: Mapping[str, Any]) -> list[FunctionChange]:
     return [FunctionChange(c["path"], c["qualname"], c["kind"]) for c in document["changes"]]
 
 
+def _hosted_changes(changes: Iterable[FunctionChange], bucket: str) -> list[FunctionChange]:
+    """Return the changed tests that the suite ``bucket`` runs, which leaves out the deleted ones."""
+    return [change for change in changes if _is_bucketed(change) and bucket_for(change.path) == bucket]
+
+
 def _hosted_ids(changes: Iterable[FunctionChange], bucket: str) -> list[str]:
-    """Return the node ids of the changed tests that the suite ``bucket`` runs, which leaves out the deleted ones."""
-    return [change.node_id for change in changes if _is_hosted(change) and bucket_for(change.path) == bucket]
+    """Return the node ids of the changed tests that the suite ``bucket`` runs."""
+    return [change.node_id for change in _hosted_changes(changes, bucket)]
+
+
+def _read_report(reports: Mapping[str, Path], bucket: str) -> dict[str, Any] | None:
+    """Return the ``pytest-json-report`` document that ``reports`` names for ``bucket``, or ``None`` when there is none.
+
+    That is the case when ``reports`` names no file for the suite, and when the file does not exist.
+    """
+    path = reports.get(bucket)
+    return json.loads(path.read_text()) if path is not None and path.exists() else None
 
 
 def _side_outcomes(changes: Sequence[FunctionChange], reports: Mapping[str, Path]) -> dict[str, str]:
     """Return the outcome of each hosted changed test on one side, read from the report of its suite.
 
-    A suite that has no named report, or whose report file does not exist, reads ``ERROR`` for each of its tests.
+    A suite that has no named report, or whose report file does not exist, reads ``ERROR`` for each of its
+    tests. Those rows fill the table, and ``incomplete_runs`` is what turns the missing report into an error.
     """
     merged: dict[str, str] = {}
     for bucket in _BUCKETS:
-        path = reports.get(bucket)
-        report = json.loads(path.read_text()) if path is not None and path.exists() else None
-        merged |= outcomes(report, _hosted_ids(changes, bucket))
+        merged |= outcomes(_read_report(reports, bucket), _hosted_ids(changes, bucket))
     return merged
 
 

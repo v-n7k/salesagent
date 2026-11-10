@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,7 @@ from scripts.ci.redden_on_base import (
     SKIPPED,
     Verdict,
     bucket_for,
+    incomplete_runs,
     main,
     outcomes,
     render_summary,
@@ -145,6 +148,50 @@ def test_verdict_skips_when_every_changed_test_is_unhosted_or_deleted() -> None:
     assert (v.status, v.exit_code) == ("skip", 0)
 
 
+def _grade(
+    changes: Sequence[FunctionChange],
+    head: Mapping[str, str],
+    base: Mapping[str, str],
+    *,
+    title: str = "fix: x",
+    incomplete: Sequence[str] = (),
+) -> Verdict:
+    """Return the verdict for a pull request that changed production and touched the files of ``changes``."""
+    return verdict(
+        title=title,
+        production_changed=True,
+        touched=sorted({change.path for change in changes}),
+        changes=changes,
+        head=head,
+        base=base,
+        incomplete=incomplete,
+    )
+
+
+def test_verdict_treats_a_test_the_head_did_not_collect_as_unhosted() -> None:
+    # The job runs the integration suite with a marker expression that deselects the creative group.
+    creative = FunctionChange("tests/integration/test_creative.py", "test_c", CHANGED)
+    uncollected = {creative.node_id: NOT_COLLECTED}
+    skipped = _grade([creative], head=uncollected, base=uncollected)
+    reason = "every changed test is deleted, in a suite this job does not host, or not collected on the head"
+    assert skipped == Verdict("skip", reason)
+    # A changed test that the head run did collect still decides.
+    head, base = {**uncollected, ID: PASSED}, {**uncollected, ID: FAILED}
+    assert _grade([creative, CHANGE], head=head, base=base) == Verdict("pass", f"{ID} is red on base and green on head")
+
+
+def test_verdict_errors_when_a_needed_run_did_not_complete() -> None:
+    head, base = {ID: PASSED}, {ID: FAILED}
+    assert _grade([CHANGE], head, base).status == "pass"  # Only the missing run turns these outcomes into an error.
+    error = _grade([CHANGE], head, base, incomplete=["base unit: no report"])
+    assert error == Verdict("error", "a run did not complete: base unit: no report")
+    assert error.exit_code == 1
+    # The rule comes before the title rule, so a title that the gate does not grade still shows a broken job.
+    assert _grade([CHANGE], head, base, title="refactor: x", incomplete=["base unit: no report"]) == error
+    both = _grade([CHANGE], head, base, incomplete=["head unit: pytest exit 4", "base unit: no report"])
+    assert both.reason == "a run did not complete: head unit: pytest exit 4; base unit: no report"
+
+
 def test_verdict_passes_only_on_red_base_and_green_head() -> None:
     assert (
         verdict(
@@ -207,7 +254,8 @@ def _status(on_base: str | None, on_head: str | None) -> str:
 def test_verdict_counts_only_failed_or_error_as_red_and_only_passed_as_green() -> None:
     assert [_status(on_base, PASSED) for on_base in (SKIPPED, NOT_COLLECTED, PASSED)] == ["fail"] * 3
     # A head run that wrote no report reads ERROR for every test, and that is never green.
-    assert [_status(FAILED, on_head) for on_head in (SKIPPED, NOT_COLLECTED, ERROR, None)] == ["fail"] * 4
+    assert [_status(FAILED, on_head) for on_head in (SKIPPED, ERROR, None)] == ["fail"] * 3
+    assert _status(FAILED, NOT_COLLECTED) == "skip"  # The head run did not collect it, so nothing grades it.
     assert _status(None, PASSED) == "pass"  # A test that the base run did not report reads ERROR there.
 
 
@@ -225,6 +273,43 @@ def test_verdict_grades_only_the_gated_title_types() -> None:
 def test_verdict_fails_a_conftest_only_change() -> None:
     v = verdict(title="fix: x", production_changed=True, touched=["tests/conftest.py"], changes=[], head={}, base={})
     assert v.status == "fail"
+
+
+def _write_run(path: Path, exitcode: int) -> Path:
+    """Write a pytest-json-report document of a run that ended with ``exitcode`` and ran no test, and return ``path``."""
+    path.write_text(json.dumps({"exitcode": exitcode, "tests": [], "collectors": []}))
+    return path
+
+
+def test_incomplete_runs_names_an_absent_report_and_an_aborted_run_and_ignores_an_idle_bucket(tmp_path: Path) -> None:
+    unit = FunctionChange("tests/unit/test_a.py", "test_x", CHANGED)
+    integration = FunctionChange("tests/integration/test_a.py", "test_y", CHANGED)
+    aborted = _write_run(tmp_path / "integration.json", 4)
+    reports = {"unit": tmp_path / "absent.json", "integration": aborted}
+    assert incomplete_runs("base", reports, [unit, integration]) == [
+        "base unit: no report",
+        "base integration: pytest exit 4",
+    ]
+    # A suite with no hosted changed test needs no run, whether its report is aborted or not named at all.
+    unit_report = _write_run(tmp_path / "unit.json", 1)
+    assert incomplete_runs("base", {"unit": unit_report, "integration": aborted}, [unit]) == []
+    assert incomplete_runs("base", {"unit": unit_report}, [unit]) == []
+    # A deleted test does not make its suite busy.
+    deleted = FunctionChange("tests/integration/test_a.py", "test_old", DELETED)
+    assert incomplete_runs("head", {"unit": unit_report}, [unit, deleted]) == []
+
+
+@pytest.mark.parametrize(
+    ("exitcode", "complete"), [(0, True), (1, True), (5, True), (2, False), (3, False), (4, False)]
+)
+def test_incomplete_runs_accepts_only_the_exit_codes_of_a_run_that_went_through_its_tests(
+    tmp_path: Path, exitcode: int, complete: bool
+) -> None:
+    unit = FunctionChange("tests/unit/test_a.py", "test_x", CHANGED)
+    report = _write_run(tmp_path / "unit.json", exitcode)
+    assert incomplete_runs("head", {"unit": report}, [unit]) == (
+        [] if complete else [f"head unit: pytest exit {exitcode}"]
+    )
 
 
 def test_render_summary_lists_every_change_and_the_untested_touches() -> None:
@@ -255,6 +340,20 @@ def test_render_summary_orders_base_before_head_and_dashes_the_tests_that_do_not
     assert "| tests/bdd/test_uc.py::test_s | added | unhosted | - | - |" in text
     assert "| tests/unit/test_a.py::test_old | deleted | unit | - | - |" in text
     assert "Touched without" not in text  # Every touched path holds a change.
+
+
+def test_render_summary_says_not_collected_for_a_test_of_a_hosted_suite_that_no_run_collected() -> None:
+    creative = FunctionChange("tests/integration/test_creative.py", "test_c", CHANGED)
+    uncollected = {creative.node_id: NOT_COLLECTED}
+    text = render_summary(
+        title="fix: x",
+        verdict=Verdict("skip", "r"),
+        touched=[creative.path],
+        changes=[creative],
+        head=uncollected,
+        base=uncollected,
+    )
+    assert f"| {creative.node_id} | changed | integration | not collected | not collected |" in text
 
 
 def test_render_summary_prints_the_title_between_the_heading_and_the_verdict() -> None:
@@ -294,6 +393,12 @@ def _write_report(path: Path, node_id: str, outcome: str) -> Path:
     return path
 
 
+def _changes_json(path: Path, *changes: FunctionChange) -> Path:
+    """Write the part of the ``changed`` document that ``ids`` reads, with ``changes`` in the given order."""
+    path.write_text(json.dumps({"changes": [asdict(change) for change in changes]}))
+    return path
+
+
 def _verdict_argv(*reports: str, changed: str | Path = "changed.json", summary: str | Path = "summary.md") -> list[str]:
     """Return the arguments of a ``verdict`` call for the title ``fix: x``, followed by the given report options."""
     return ["verdict", "--changed", str(changed), "--title", "fix: x", "--summary", str(summary), *reports]
@@ -307,8 +412,9 @@ def test_main_changed_then_ids_then_verdict_round_trip(tmp_path: Path, capsys: p
     assert doc["production_changed"] is True
     assert [c["node_id"] for c in doc["changes"]] == [FIX_ID]
     assert (doc["base"], doc["touched"]) == ("HEAD^1", ["tests/unit/test_a.py"])
-    assert main(["ids", str(changed), "unit"]) == 0
-    assert capsys.readouterr().out.strip() == FIX_ID
+    ids = tmp_path / "ids.txt"
+    assert main(["ids", str(changed), "unit", "--out", str(ids)]) == 0
+    assert (ids.read_text(), capsys.readouterr().out) == (f"{FIX_ID}\n", "tests/unit/test_a.py\n")
     head = _write_report(tmp_path / "head.json", FIX_ID, PASSED)
     base = _write_report(tmp_path / "base.json", FIX_ID, FAILED)
     summary = tmp_path / "summary.md"
@@ -341,13 +447,26 @@ def test_main_verdict_reads_each_suite_from_its_own_report_on_each_side(
     assert f"| {INTEGRATION_FIX_ID} | changed | integration | failed | passed |" in text
 
 
-def test_main_verdict_treats_a_missing_bucket_report_as_errors(tmp_path: Path) -> None:
-    changed = _changed_json(_fix_repo(tmp_path, "integration"), tmp_path / "changed.json")
+def test_main_verdict_errors_when_the_base_report_is_absent(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    changed = _changed_json(_fix_repo(tmp_path, "unit"), tmp_path / "changed.json")
     summary = tmp_path / "summary.md"
-    # The one changed test is an integration test, and the only report named is a unit head report whose file is absent.
-    absent = f"unit={tmp_path / 'absent-head.json'}"
-    assert main(_verdict_argv("--head-report", absent, changed=changed, summary=summary)) == 1
-    assert "| error | error |" in summary.read_text()
+    head = _write_report(tmp_path / "head.json", FIX_ID, PASSED)
+    # A base run that died before it wrote its report must not read as a test that is red on the base.
+    reports = ("--head-report", f"unit={head}", "--base-report", f"unit={tmp_path / 'absent-base.json'}")
+    assert main(_verdict_argv(*reports, changed=changed, summary=summary)) == 1
+    assert capsys.readouterr().out == "error: a run did not complete: base unit: no report\n"
+    assert f"| {FIX_ID} | changed | unit | error | passed |" in summary.read_text()
+
+
+def test_main_verdict_errors_when_a_report_records_an_aborted_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    changed = _changed_json(_fix_repo(tmp_path, "unit"), tmp_path / "changed.json")
+    head = _write_run(tmp_path / "head.json", 4)
+    base = _write_report(tmp_path / "base.json", FIX_ID, FAILED)
+    reports = ("--head-report", f"unit={head}", "--base-report", f"unit={base}")
+    assert main(_verdict_argv(*reports, changed=changed, summary=tmp_path / "summary.md")) == 1
+    assert capsys.readouterr().out == "error: a run did not complete: head unit: pytest exit 4\n"
 
 
 def test_main_verdict_is_advisory_when_no_production_root_changed(
@@ -355,7 +474,9 @@ def test_main_verdict_is_advisory_when_no_production_root_changed(
 ) -> None:
     changed = _changed_json(_fix_repo(tmp_path, "unit", production=False), tmp_path / "changed.json")
     assert json.loads(changed.read_text())["production_changed"] is False
-    assert main(_verdict_argv(changed=changed, summary=tmp_path / "summary.md")) == 0
+    report = _write_report(tmp_path / "report.json", FIX_ID, PASSED)  # The runs must complete, whatever the verdict is.
+    reports = ("--head-report", f"unit={report}", "--base-report", f"unit={report}")
+    assert main(_verdict_argv(*reports, changed=changed, summary=tmp_path / "summary.md")) == 0
     assert capsys.readouterr().out == "advisory: no production root changed\n"
 
 
@@ -367,6 +488,7 @@ def test_main_verdict_is_advisory_when_no_production_root_changed(
         (_verdict_argv("--head-report", "unit="), "expected BUCKET=PATH"),
         (_verdict_argv("--head-report", "unit=a.json", "--head-report", "unit=b.json"), "'unit' is named twice"),
         (["ids", "changed.json", "bdd"], "invalid choice: 'bdd'"),
+        (["ids", "changed.json", "unit"], "the following arguments are required: --out"),
     ],
 )
 def test_main_refuses_a_bucket_argument_that_is_malformed_or_repeated(
@@ -378,6 +500,25 @@ def test_main_refuses_a_bucket_argument_that_is_malformed_or_repeated(
     assert reason in capsys.readouterr().err
 
 
+def test_ids_writes_the_bucket_ids_and_prints_their_files(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # The document is not in path order, so the ids keep its order and the printed files do not.
+    in_b = FunctionChange("tests/unit/test_b.py", "test_three", ADDED)
+    in_a = FunctionChange("tests/unit/test_a.py", "test_one", CHANGED)
+    in_a_class = FunctionChange("tests/unit/test_a.py", "TestK.test_two", ADDED)
+    integration = FunctionChange("tests/integration/test_c.py", "test_four", ADDED)
+    changed = _changes_json(tmp_path / "changed.json", in_b, in_a, integration, in_a_class)
+    ids = tmp_path / "ids.txt"
+    assert main(["ids", str(changed), "unit", "--out", str(ids)]) == 0
+    assert ids.read_text() == f"{in_b.node_id}\n{in_a.node_id}\n{in_a_class.node_id}\n"
+    assert capsys.readouterr().out == "tests/unit/test_a.py tests/unit/test_b.py\n"
+    assert main(["ids", str(changed), "integration", "--out", str(ids)]) == 0
+    assert (ids.read_text(), capsys.readouterr().out) == (f"{integration.node_id}\n", "tests/integration/test_c.py\n")
+    # A suite with no test writes an empty file over the earlier one, and prints an empty line.
+    no_integration = _changes_json(tmp_path / "no-integration.json", in_b, in_a)
+    assert main(["ids", str(no_integration), "integration", "--out", str(ids)]) == 0
+    assert (ids.read_text(), capsys.readouterr().out) == ("", "\n")
+
+
 def test_main_ids_skips_deleted_tests_and_prints_an_empty_line_when_a_suite_has_none(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -386,10 +527,12 @@ def test_main_ids_skips_deleted_tests_and_prints_an_empty_line_when_a_suite_has_
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "head")
     changed = _changed_json(repo, tmp_path / "changed.json")
-    assert main(["ids", str(changed), "unit"]) == 0
-    assert capsys.readouterr().out == "tests/unit/test_a.py::test_new tests/unit/test_a.py::test_other\n"
-    assert main(["ids", str(changed), "integration"]) == 0
-    assert capsys.readouterr().out == "\n"
+    ids = tmp_path / "ids.txt"
+    assert main(["ids", str(changed), "unit", "--out", str(ids)]) == 0
+    assert ids.read_text() == "tests/unit/test_a.py::test_new\ntests/unit/test_a.py::test_other\n"
+    assert capsys.readouterr().out == "tests/unit/test_a.py\n"
+    assert main(["ids", str(changed), "integration", "--out", str(ids)]) == 0
+    assert (ids.read_text(), capsys.readouterr().out) == ("", "\n")
 
 
 def test_main_changed_reads_the_current_directory_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -417,5 +560,6 @@ def test_main_run_as_a_module_exits_with_the_code_of_the_verdict(tmp_path: Path)
         *_verdict_argv(changed=changed, summary=tmp_path / "s.md"),
     ]
     run = subprocess.run(command, cwd=repo_root(), capture_output=True, text=True)
-    # With no report, the test reads ERROR on the head, which is never green, so the verdict is a fail.
-    assert (run.returncode, run.stdout) == (1, "fail: no hosted changed test is red on base and green on head\n")
+    # With no report, neither run completed, so the verdict is an error, and an error exits 1.
+    reason = "a run did not complete: head unit: no report; base unit: no report"
+    assert (run.returncode, run.stdout) == (1, f"error: {reason}\n")
