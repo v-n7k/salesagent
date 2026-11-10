@@ -84,3 +84,27 @@ def test_fingerprint_ignores_a_docstring_that_only_one_function_has() -> None:
 def test_normalize_function_keeps_every_singleton_constant() -> None:
     f = fn("def f():\n    return (None, True, False, ...)\n")
     assert dump_statements(normalize_function(f)) == dump_statements(f.body)
+
+
+def test_function_fingerprint_leaves_the_tree_untouched() -> None:
+    f = fn('def f(a):\n    """doc"""\n    b = a\n    return b\n')
+    before = ast.dump(f)
+    function_fingerprint(f)
+    assert ast.dump(f) == before
+
+
+def test_fingerprint_ignores_the_spelling_of_declared_names() -> None:
+    handler = fn("def t():\n    try:\n        pass\n    except KeyError as e:\n        h(e)\n")
+    renamed_handler = fn("def t():\n    try:\n        pass\n    except KeyError as exc:\n        h(exc)\n")
+    assert function_fingerprint(handler) == function_fingerprint(renamed_handler)
+    alias = fn("def t():\n    import os as a\n    return a.sep\n")
+    renamed_alias = fn("def t():\n    import os as b\n    return b.sep\n")
+    assert function_fingerprint(alias) == function_fingerprint(renamed_alias)
+    helper = fn("def t():\n    def helper():\n        pass\n    helper()\n")
+    renamed_helper = fn("def t():\n    def _helper():\n        pass\n    _helper()\n")
+    assert function_fingerprint(helper) == function_fingerprint(renamed_helper)
+    scopes = fn("def t():\n    class Fake:\n        pass\n    async def run():\n        pass\n    return Fake, run\n")
+    renamed_scopes = fn(
+        "def t():\n    class _Fake:\n        pass\n    async def _run():\n        pass\n    return _Fake, _run\n"
+    )
+    assert function_fingerprint(scopes) == function_fingerprint(renamed_scopes)
