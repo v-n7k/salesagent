@@ -683,12 +683,23 @@ jobs:
       - uses: ./.github/actions/_postgres
         with:
           database-url: ${{ env.DATABASE_URL }}
-      # The Coverage gate combines unit + BDD only; add an artifact upload
-      # before re-enabling coverage here, or the data is silently dropped.
+      # Uploaded below and combined by the Coverage job.
       - uses: ./.github/actions/_pytest
+        env:
+          COVERAGE_FILE: .coverage.admin
         with:
           paths: tests/admin/
+          coverage_xml: coverage-admin.xml
           extra_args: -m "not slow"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: admin-coverage
+          path: |
+            .coverage.admin
+            coverage-admin.xml
+          include-hidden-files: true
+          if-no-files-found: error
 
   bdd-tests-shard:
     name: BDD Tests (Shard ${{ matrix.shard }}/${{ strategy.job-total }})

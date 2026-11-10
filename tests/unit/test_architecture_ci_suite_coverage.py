@@ -143,6 +143,22 @@ class TestCISuiteCoverage:
         assert uploads[0]["with"].get("if-no-files-found") == "error"
 
     @pytest.mark.arch_guard
+    def test_admin_job_uploads_coverage(self):
+        job = load_ci_workflow()["jobs"]["admin-ui-tests"]
+        pytest_steps = [s for s in job["steps"] if str(s.get("uses", "")).endswith("/_pytest")]
+        assert len(pytest_steps) == 1
+        assert pytest_steps[0]["env"]["COVERAGE_FILE"] == ".coverage.admin"
+        assert pytest_steps[0]["with"]["coverage_xml"] == "coverage-admin.xml"
+        uploads = [
+            s
+            for s in job["steps"]
+            if "actions/upload-artifact" in str(s.get("uses", "")) and s.get("with", {}).get("name") == "admin-coverage"
+        ]
+        assert len(uploads) == 1
+        assert ".coverage.admin" in uploads[0]["with"]["path"]
+        assert uploads[0]["with"].get("if-no-files-found") == "error"
+
+    @pytest.mark.arch_guard
     def test_quality_gate_does_not_run_unit_tests(self):
         """Quality Gate runs static checks only; unit tests run once in unit-tests."""
         quality_job = load_ci_workflow()["jobs"]["quality-gate"]
