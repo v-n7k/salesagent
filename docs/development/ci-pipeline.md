@@ -49,8 +49,8 @@ single BDD job). The table lists every name the frozen guard pins.
 | `CI / BDD Tests (Shard 3/4)` | BDD shard, balanced by measured duration |
 | `CI / BDD Tests (Shard 4/4)` | BDD shard, balanced by measured duration |
 | `CI / BDD Tests` | aggregate status proxy (shard pass/fail) |
-| `CI / BDD In-Network (e2e_rest)` | BDD scenarios over the `e2e_rest` transport against the Docker stack; grades `tests/bdd/e2e_rest_known_failures.txt` |
-| `CI / Storyboard Conformance` | the AdCP storyboard runner, once per protocol |
+| `CI / BDD In-Network (e2e_rest)` | BDD scenarios over the in-network transports (`e2e_rest`, `e2e_mcp`, `e2e_a2a`, `e2e_admin`) against the Docker stack; grades `tests/bdd/e2e_rest_known_failures.txt` |
+| `CI / Storyboard Conformance` | the AdCP storyboard runner, once per protocol; report only, not in Summary's `needs` |
 | `CI / Migration Roundtrip` | alembic upgrade |
 | `CI / Coverage` | `--fail-under` from `.coverage-baseline` using unit + four BDD shard + four host integration group + admin artifacts; diff-cover report of the changed lines |
 | `CI / Summary` | aggregation gate |
