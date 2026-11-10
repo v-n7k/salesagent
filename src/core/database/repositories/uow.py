@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 
 from src.core.database.database_session import get_db_session
 from src.core.database.repositories.account import AccountRepository
+from src.core.database.repositories.agent import CreativeAgentRepository, SignalsAgentRepository
 from src.core.database.repositories.authorized_property import AuthorizedPropertyRepository
 from src.core.database.repositories.creative import CreativeAssignmentRepository, CreativeRepository
 from src.core.database.repositories.currency_limit import CurrencyLimitRepository
@@ -45,6 +46,7 @@ from src.core.database.repositories.product import ProductRepository
 from src.core.database.repositories.push_notification_config import PushNotificationConfigRepository
 from src.core.database.repositories.signing_key import SigningKeyRepository
 from src.core.database.repositories.tenant_config import TenantConfigRepository
+from src.core.database.repositories.user import UserRepository
 from src.core.database.repositories.workflow import WorkflowRepository
 
 logger = logging.getLogger(__name__)
@@ -435,6 +437,36 @@ class SigningKeyUoW(BaseUoW):
     signing_keys: SigningKeyRepository | None
 
     _REPOSITORIES: ClassVar[Mapping[str, type]] = {"signing_keys": SigningKeyRepository}
+
+
+class TenantAccessUoW(BaseUoW):
+    """Unit of Work for the admin's tenant-access decision: is the caller an active member?
+
+    One tenant-scoped ``UserRepository``; opened and closed inside ``tenant_access_decision``
+    so the guard holds no session while the view runs.
+    """
+
+    users: UserRepository | None
+
+    _REPOSITORIES: ClassVar[Mapping[str, type]] = {"users": UserRepository}
+
+
+class AgentUoW(BaseUoW):
+    """Unit of Work for the admin's creative-agent and signals-agent pages.
+
+    ``tenant_config`` is here because every admin page renders ``tenant``; the two agent
+    repositories because the pair's routes read and write both kinds through one service.
+    """
+
+    tenant_config: TenantConfigRepository | None
+    creative_agents: CreativeAgentRepository | None
+    signals_agents: SignalsAgentRepository | None
+
+    _REPOSITORIES: ClassVar[Mapping[str, type]] = {
+        "tenant_config": TenantConfigRepository,
+        "creative_agents": CreativeAgentRepository,
+        "signals_agents": SignalsAgentRepository,
+    }
 
 
 class CapabilitiesUoW(BaseUoW):

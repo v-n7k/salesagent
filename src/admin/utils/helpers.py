@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
 from functools import wraps
-from typing import TYPE_CHECKING, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar
 
 from flask import abort, g, jsonify, redirect, session, url_for
 from sqlalchemy import select
@@ -295,7 +297,7 @@ def _session_email(user_info: object) -> str:
     return user_info.get("email", "") if isinstance(user_info, dict) else str(user_info)
 
 
-def _setup_session_reaches(tenant_id: str) -> bool:
+def _setup_session_reaches(session_data: Mapping[str, Any], tenant_id: str) -> bool:
     """Whether the caller's setup-mode session grants access to *tenant_id*.
 
     Decided from the session alone — NO database read. Reading the tenant's auth_setup_mode
@@ -313,13 +315,51 @@ def _setup_session_reaches(tenant_id: str) -> bool:
     Never true in production: no route in a deployment mints such a session, so the branch
     is unreachable there, and this says so rather than leaving it to be inferred.
     """
-    if "test_user" not in session or get_settings().runtime.is_production:
+    if "test_user" not in session_data or get_settings().runtime.is_production:
         return False
-    return session.get("test_tenant_id") == tenant_id or session.get("test_user_role") == "super_admin"
+    return session_data.get("test_tenant_id") == tenant_id or session_data.get("test_user_role") == "super_admin"
+
+
+@dataclass(frozen=True)
+class TenantAccess:
+    """What the tenant-access decision found: a refusal to answer, or access (with a setup user)."""
+
+    refusal: Literal["login_required", "denied"] | None
+    setup_user: Any = None
+
+
+def tenant_access_decision(session_data: Mapping[str, Any], tenant_id: str) -> TenantAccess:
+    """Decide whether the session *session_data* carries may reach *tenant_id*.
+
+    ONE function, so the Flask decorator and the FastAPI dependency (``src.admin.web.guards``)
+    cannot drift: in this order, a setup-mode session, then no user (login required), then a
+    super admin, then an active member of the tenant, else denied. Reads the mapping it is
+    given, never Flask's ``session``; raises nothing of its own (an unexpected failure
+    propagates to the caller, which answers it the way its framework does).
+    """
+    if _setup_session_reaches(session_data, tenant_id):
+        return TenantAccess(None, session_data["test_user"])
+    if "user" not in session_data:
+        return TenantAccess("login_required")
+    email = _session_email(session_data["user"])
+    if is_super_admin(email):
+        return TenantAccess(None)
+    from src.core.database.repositories.uow import TenantAccessUoW
+
+    with TenantAccessUoW(tenant_id) as uow:
+        assert uow.users is not None
+        member = uow.users.is_active_member(email)
+    return TenantAccess(None) if member else TenantAccess("denied")
 
 
 def require_tenant_access(api_mode=False):
-    """Decorator to require tenant access for routes."""
+    """Decorator to require tenant access for routes.
+
+    The decision is :func:`tenant_access_decision`; this wrapper answers it the Flask way.
+    The view runs after the decision, outside the decision's database session and outside
+    the ``try`` that turns an unexpected failure into a 500, so a view's own ``abort`` keeps
+    its status.
+    """
 
     def decorator(f):
         @wraps(f)
@@ -333,65 +373,26 @@ def require_tenant_access(api_mode=False):
                 f"Auth check - tenant: {tenant_id}, method: {request.method}, has_session: {has_session}, has_cookies: {has_cookies}, session_keys: {list(session.keys())}"
             )
 
-            # A SETUP-MODE SESSION, decided from the session alone — NO DATABASE READ.
-            #
-            # Reading the tenant's auth_setup_mode to decide whether a ``test_user`` session
-            # counts would be a DB read inside the auth decorator, on every request, and
-            # ``get_db_session()`` is scoped: opening one here nests inside whatever session
-            # the caller already holds, and the inner exit REMOVES the scoped session and
-            # detaches the outer one, discarding rows the caller flushed but had not
-            # committed. ``enable_oidc`` carries the same rule.
-            #
-            # The scope check does not need the database. The session states which tenant it
-            # is for, and a session is signed by this server, so what it states is as
-            # trustworthy as the ``user`` the path below reads. The grant is TENANT-SCOPED:
-            # a caller who is not a super admin reaches exactly the tenant named in its own
-            # session, which is what the approval-refusal tests grade (a super admin crosses
-            # tenants by design, so a refusal test authenticated as one proves nothing).
-            #
-            # Never in production: no route in a deployment mints such a session, so this
-            # branch is unreachable there by construction; the guard states that rather than
-            # leaving it to be inferred.
-            if _setup_session_reaches(tenant_id):
-                g.user = session["test_user"]
-                return f(tenant_id, *args, **kwargs)
-
-            if "user" not in session:
-                if api_mode:
-                    return jsonify({"error": "Authentication required"}), 401
-                # Redirect to tenant-specific login (preserves tenant context)
-                return redirect(url_for("auth.tenant_login", tenant_id=tenant_id, next=request.url))
-
-            user_info = session["user"]
-
-            email = _session_email(user_info)
-
-            # Check super admin status (is_super_admin handles env + db + session caching internally)
-            if is_super_admin(email):
-                return f(tenant_id, *args, **kwargs)
-
-            # Check if user has access to this specific tenant
             try:
-                with get_db_session() as db_session:
-                    stmt = select(User).filter_by(email=email.lower(), tenant_id=tenant_id, is_active=True)
-                    user = db_session.scalars(stmt).first()
-
-                    if not user:
-                        if api_mode:
-                            return jsonify({"error": "Access denied"}), 403
-                        abort(403)
-
-                    return f(tenant_id, *args, **kwargs)
-
+                access = tenant_access_decision(session, tenant_id)
             except Exception as e:
-                # Don't catch abort exceptions (they should propagate)
-                if hasattr(e, "code") and e.code in [403, 404]:
-                    raise
-
                 logger.error(f"Error checking tenant access: {e}")
                 if api_mode:
                     return jsonify({"error": "Internal server error"}), 500
                 abort(500)
+
+            if access.refusal == "login_required":
+                if api_mode:
+                    return jsonify({"error": "Authentication required"}), 401
+                # Redirect to tenant-specific login (preserves tenant context)
+                return redirect(url_for("auth.tenant_login", tenant_id=tenant_id, next=request.url))
+            if access.refusal == "denied":
+                if api_mode:
+                    return jsonify({"error": "Access denied"}), 403
+                abort(403)
+            if access.setup_user is not None:
+                g.user = access.setup_user
+            return f(tenant_id, *args, **kwargs)
 
         return decorated_function
 

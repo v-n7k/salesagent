@@ -1,9 +1,9 @@
 """Ingest-time egress policy, graded through the real admin endpoints.
 
 Admin write handlers accept URLs that are STORED now and fetched later, so the
-refusal has to happen at ingest. These cases drive the actual Flask routes —
-``POST /tenant/<id>/signals-agents/add`` and the tenant-management JSON API —
-against a real database, because the obligation is not "``validate_url`` says
+refusal has to happen at ingest. These cases drive the actual admin routes (the
+agent routers on the ASGI sub-application, the tenant-management JSON API on
+Flask) against a real database, because the obligation is not "``validate_url`` says
 no" (``tests/integration/test_outbound_http.py`` grades that already) but "the
 handler asks, and acts on the answer". Deleting the call in either handler has
 to turn these red; that is the whole point of going through the route rather
@@ -50,6 +50,7 @@ from tests.integration._egress_ingest_helpers import (
     ADMITTED_URL,
     PRINCIPAL_ID,
     TENANT_ID,
+    asgi_flashes,
     flashes,
     post_register_hmac_webhook,
 )
@@ -159,7 +160,7 @@ def create_agent_through_the_add_form(client, env, monkeypatch) -> SignalsAgent:
 
 @pytest.mark.parametrize("url", [METADATA_URL, INSECURE_PUBLIC_URL])
 def test_signals_agent_add_refuses_and_stores_nothing(
-    url, authenticated_admin_client, seeded_tenant, monkeypatch, caplog
+    url, authenticated_asgi_admin_client, seeded_tenant, monkeypatch, caplog
 ):
     """A refused agent URL redirects back to the form, flashes, and creates no row.
 
@@ -171,15 +172,19 @@ def test_signals_agent_add_refuses_and_stores_nothing(
     set_flags(monkeypatch)
     caplog.set_level(logging.WARNING)
 
-    response = post_signals_agent(authenticated_admin_client, url)
+    response = post_signals_agent(authenticated_asgi_admin_client, url)
 
     assert response.status_code == 302
     assert "/signals-agents/add" in response.headers["Location"]
-    assert flashes(authenticated_admin_client) == [("error", "Agent URL is not allowed by outbound egress policy.")]
+    assert asgi_flashes(authenticated_asgi_admin_client, response) == [
+        ("error", "Agent URL is not allowed by outbound egress policy.")
+    ]
     assert signals_agents_for(seeded_tenant) == []
 
 
-def test_signals_agent_add_accepts_a_url_egress_policy_admits(authenticated_admin_client, seeded_tenant, monkeypatch):
+def test_signals_agent_add_accepts_a_url_egress_policy_admits(
+    authenticated_asgi_admin_client, seeded_tenant, monkeypatch
+):
     """A URL the policy admits is stored — the check refuses, it does not reject everything.
 
     Without this the refusal cases above would also pass against a handler that
@@ -189,7 +194,7 @@ def test_signals_agent_add_accepts_a_url_egress_policy_admits(authenticated_admi
     """
     set_flags(monkeypatch, private=True)
 
-    response = post_signals_agent(authenticated_admin_client, ADMITTED_URL)
+    response = post_signals_agent(authenticated_asgi_admin_client, ADMITTED_URL)
 
     assert response.status_code == 302
     assert "/signals-agents/add" not in response.headers["Location"]
@@ -199,7 +204,7 @@ def test_signals_agent_add_accepts_a_url_egress_policy_admits(authenticated_admi
 
 @pytest.mark.parametrize("url", [METADATA_URL, INSECURE_PUBLIC_URL])
 def test_signals_agent_edit_refuses_and_leaves_the_stored_url_alone(
-    url, authenticated_admin_client, seeded_tenant, monkeypatch
+    url, authenticated_asgi_admin_client, seeded_tenant, monkeypatch
 ):
     """Editing an admitted URL into a refused one is rejected and does not persist.
 
@@ -210,10 +215,10 @@ def test_signals_agent_edit_refuses_and_leaves_the_stored_url_alone(
     the column back is the only assertion that can tell those two apart; the
     302 alone cannot.
     """
-    agent = create_agent_through_the_add_form(authenticated_admin_client, seeded_tenant, monkeypatch)
+    agent = create_agent_through_the_add_form(authenticated_asgi_admin_client, seeded_tenant, monkeypatch)
     set_flags(monkeypatch)
 
-    response = authenticated_admin_client.post(
+    response = authenticated_asgi_admin_client.post(
         f"/tenant/{TENANT_ID}/signals-agents/{agent.id}/edit",
         data={"agent_url": url, "name": "Ingest Policy Agent", "enabled": "on", "timeout": "30"},
         follow_redirects=False,
@@ -225,7 +230,7 @@ def test_signals_agent_edit_refuses_and_leaves_the_stored_url_alone(
 
 
 def test_signals_agent_test_connection_refuses_a_stored_url_without_connecting(
-    authenticated_admin_client, seeded_tenant, monkeypatch
+    authenticated_asgi_admin_client, seeded_tenant, monkeypatch
 ):
     """A stored URL is graded again on the way out, in the endpoint's own JSON envelope.
 
@@ -235,23 +240,23 @@ def test_signals_agent_test_connection_refuses_a_stored_url_without_connecting(
     once they are closed — which is exactly why the check is repeated at send
     time rather than trusted from ingest.
     """
-    agent = create_agent_through_the_add_form(authenticated_admin_client, seeded_tenant, monkeypatch)
+    agent = create_agent_through_the_add_form(authenticated_asgi_admin_client, seeded_tenant, monkeypatch)
     set_flags(monkeypatch)
 
-    response = authenticated_admin_client.post(
+    response = authenticated_asgi_admin_client.post(
         f"/tenant/{TENANT_ID}/signals-agents/{agent.id}/test",
         follow_redirects=False,
     )
 
     assert response.status_code == 400
-    assert response.get_json() == {
+    assert response.json() == {
         "success": False,
         "error": "Agent URL is not allowed by outbound egress policy.",
     }
 
 
 def test_signals_agent_add_refusal_reason_reaches_the_logs(
-    authenticated_admin_client, seeded_tenant, monkeypatch, caplog
+    authenticated_asgi_admin_client, seeded_tenant, monkeypatch, caplog
 ):
     """The reason withheld from the operator's screen is present in the operator's logs.
 
@@ -264,7 +269,7 @@ def test_signals_agent_add_refusal_reason_reaches_the_logs(
     set_flags(monkeypatch)
     caplog.set_level(logging.WARNING)
 
-    post_signals_agent(authenticated_admin_client, METADATA_URL)
+    post_signals_agent(authenticated_asgi_admin_client, METADATA_URL)
 
     # The refusal-cause log line moved with EgressPolicy.resolve_for_dial into
     # src/core/security/egress/policy.py (salesagent-tbrk.1) -- same seam,
@@ -815,23 +820,29 @@ def create_creative_agent_through_the_add_form(client, env, monkeypatch) -> Crea
 
 
 @pytest.mark.parametrize("url", [METADATA_URL, INSECURE_PUBLIC_URL])
-def test_creative_agent_add_refuses_and_stores_nothing(url, authenticated_admin_client, seeded_tenant, monkeypatch):
+def test_creative_agent_add_refuses_and_stores_nothing(
+    url, authenticated_asgi_admin_client, seeded_tenant, monkeypatch
+):
     """creative_agents.py:105 — the add form."""
     set_flags(monkeypatch)
 
-    response = post_creative_agent_add(authenticated_admin_client, url)
+    response = post_creative_agent_add(authenticated_asgi_admin_client, url)
 
     assert response.status_code == 302
     assert "/creative-agents/add" in response.headers["Location"]
-    assert flashes(authenticated_admin_client) == [("error", "Agent URL is not allowed by outbound egress policy.")]
+    assert asgi_flashes(authenticated_asgi_admin_client, response) == [
+        ("error", "Agent URL is not allowed by outbound egress policy.")
+    ]
     assert creative_agents_for(seeded_tenant) == []
 
 
-def test_creative_agent_add_accepts_a_url_egress_policy_admits(authenticated_admin_client, seeded_tenant, monkeypatch):
+def test_creative_agent_add_accepts_a_url_egress_policy_admits(
+    authenticated_asgi_admin_client, seeded_tenant, monkeypatch
+):
     """A URL the policy admits is stored — the add form's positive control."""
     set_flags(monkeypatch, private=True)
 
-    response = post_creative_agent_add(authenticated_admin_client, ADMITTED_URL)
+    response = post_creative_agent_add(authenticated_asgi_admin_client, ADMITTED_URL)
 
     assert response.status_code == 302
     assert "/creative-agents/add" not in response.headers["Location"]
@@ -841,7 +852,7 @@ def test_creative_agent_add_accepts_a_url_egress_policy_admits(authenticated_adm
 
 @pytest.mark.parametrize("url", [METADATA_URL, INSECURE_PUBLIC_URL])
 def test_creative_agent_edit_refuses_and_leaves_the_stored_url_alone(
-    url, authenticated_admin_client, seeded_tenant, monkeypatch
+    url, authenticated_asgi_admin_client, seeded_tenant, monkeypatch
 ):
     """creative_agents.py:189 — the edit form.
 
@@ -850,10 +861,10 @@ def test_creative_agent_edit_refuses_and_leaves_the_stored_url_alone(
     that is exactly what could regress silently without a test reading the
     column back.
     """
-    agent = create_creative_agent_through_the_add_form(authenticated_admin_client, seeded_tenant, monkeypatch)
+    agent = create_creative_agent_through_the_add_form(authenticated_asgi_admin_client, seeded_tenant, monkeypatch)
     set_flags(monkeypatch)
 
-    response = authenticated_admin_client.post(
+    response = authenticated_asgi_admin_client.post(
         f"/tenant/{TENANT_ID}/creative-agents/{agent.id}/edit",
         data={"agent_url": url, "name": "Ingest Policy Creative Agent", "priority": "10", "enabled": "on"},
         follow_redirects=False,

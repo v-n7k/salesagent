@@ -27,6 +27,8 @@ from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+from tests.helpers.admin_session import admin_composition_client
+
 
 @dataclass
 class Link:
@@ -100,11 +102,16 @@ class LinkValidator:
     def __init__(self, client: Any, base_url: str = "http://localhost"):
         """Initialize validator with a Flask test client.
 
+        Pages are fetched through *client*; the links on them are followed through the admin
+        composition production serves (:func:`admin_composition_client`), because a link on
+        a Flask-rendered page may point at a route that has migrated to a FastAPI router.
+
         Args:
             client: Flask test client (from authenticated_admin_session fixture)
             base_url: Base URL for resolving relative links
         """
         self.client = client
+        self.follow = admin_composition_client(client)
         self.base_url = base_url
 
     def should_validate_link(self, url: str) -> bool:
@@ -187,12 +194,12 @@ class LinkValidator:
 
         try:
             # Don't follow redirects automatically - check where they go first
-            response = self.client.head(url, follow_redirects=False)
+            response = self.follow.head(url, follow_redirects=False)
 
             # Some routes don't support HEAD, fallback to GET
             if response.status_code == 405:
                 response.close()  # Close HEAD response before making GET
-                response = self.client.get(url, follow_redirects=False)
+                response = self.follow.get(url, follow_redirects=False)
 
             try:
                 # Handle redirects specially
