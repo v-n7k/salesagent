@@ -221,7 +221,7 @@ class TestCISuiteCoverage:
     def test_coverage_floor_runs_last(self):
         """The floor is the last step, so the diff-cover report and its artifact exist on a run under the floor."""
         job = load_ci_workflow()["jobs"]["coverage"]
-        assert job["steps"][-1]["name"] == "Coverage floor", "nothing enforces .coverage-baseline without this step"
+        assert job["steps"][-1].get("name") == "Coverage floor", "nothing enforces .coverage-baseline without this step"
         assert job["steps"][-1]["run"].strip() == "./scripts/ci/coverage_report.sh --data-file .coverage.combined"
 
     @pytest.mark.arch_guard
