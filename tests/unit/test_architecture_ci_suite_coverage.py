@@ -208,10 +208,14 @@ class TestCISuiteCoverage:
         assert "--fail-under" not in run_steps, "stage 1 is report only; the threshold is stage 2"
         assert 'diff-cover.md >> "$GITHUB_STEP_SUMMARY"' in run_steps
         upload = next(
-            step["with"]
-            for step in job["steps"]
-            if "actions/upload-artifact" in str(step.get("uses", "")) and step["with"].get("name") == "diff-cover"
+            (
+                step["with"]
+                for step in job["steps"]
+                if "actions/upload-artifact" in str(step.get("uses", "")) and step["with"].get("name") == "diff-cover"
+            ),
+            None,
         )
+        assert upload is not None, "the report and its XML must be uploaded as the diff-cover artifact"
         assert "diff-cover.md" in upload["path"] and "coverage-combined.xml" in upload["path"], (
             "the artifact carries the report and the XML it was computed from"
         )
