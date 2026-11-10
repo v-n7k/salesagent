@@ -55,10 +55,11 @@ advisory. See [Tests redden on base](#tests-redden-on-base).
 
 ## Tests redden on base
 
-The `tests-redden-on-base` job (`CI / Tests Redden On Base`) runs twice the tests that a
-pull request (PR) adds or changes. It checks that a `fix`, `feat`, or `security` PR
-brings a test that fails without its production change. The job runs on `pull_request`
-only, because a push has no PR base to compare with. Its verdicts are advisory: see
+The `tests-redden-on-base` job (`CI / Tests Redden On Base`) runs each test that a pull
+request (PR) adds or changes two times, once on the head and once on the base tree. It
+checks that a `fix`, `feat`, or `security` PR brings a test that fails without its
+production change. The job runs on `pull_request` only, because a push has no PR base
+to compare with. Its verdicts are advisory: see
 [What blocks a merge](#what-blocks-a-merge).
 
 ### What it runs
@@ -88,8 +89,9 @@ old name reads as a deleted test.
 from `HEAD^1`. A file that the PR added under a root is absent on the base. The `-f`
 flag lets `git rm` remove a tracked file that a head run modified, and the checkout
 rebuilds the roots from git. `HEAD^1`, the first parent of that merge commit, is the tip
-of the base branch, so the job fetches two commits. Everything else stays at head:
-tests, `conftest.py` files, `scripts/`, and configs.
+of the base branch. The job checks out with a depth of two, which carries the merge
+commit and both parents. Everything else stays at head: tests, `conftest.py` files,
+`scripts/`, and configs.
 
 **Duration.** Replaying three merged PRs on a laptop, migrations included, took 34, 44,
 and 162 seconds. The job's `timeout-minutes` is 10.
@@ -121,16 +123,22 @@ A suite is hosted when this job runs its tests. The job hosts the following suit
 |-----------|--------|-----|
 | `tests/unit/` and `tests/harness/` | Yes | One run |
 | `tests/integration/` | Yes, except the creative group and `skip_ci` tests | One run on the job's Postgres service, with `-m "not creative and not skip_ci"` |
-| `tests/e2e/`, `tests/admin/`, `tests/ui/`, and any other directory | No | A `test_` function is listed as `unhosted`, with `-` in both outcome cells |
-| `tests/bdd/` | No | A scenario or step module holds no `test_` function, so the touched file appears only under "Touched without a changed test function" |
+| `tests/admin/`, `tests/bdd/`, `tests/e2e/`, `tests/quality/`, `tests/smoke/`, `tests/storyboard/`, and `tests/ui/` | No | A `test_` function is listed as `unhosted`, with `-` in both outcome cells. Any other touched file appears under "Touched without a changed test function" |
+| Any other directory under `tests/` | No | A `test_` function is listed as `unhosted`, with `-` in both outcome cells. Any other touched file is support, not a test |
 
-A BDD scenario is a `.feature` file that a `scenarios(...)` call binds. The job lists no
-change for it, so the verdict counts a touched path under `tests/bdd/` as a changed test
-in an unhosted suite.
+The directories in the third row are the unhosted directories: a tox env or a CI job
+runs each of them, and this job does not. A BDD scenario is a `.feature` file that a
+`scenarios(...)` call binds. The job lists no change for most of the files in the
+unhosted directories, such as a scenario, a step module, a known-failures ledger, or a
+`conftest.py` file, because they are not `test_*.py` modules. The verdict counts a
+touched path in an unhosted directory as a changed test in an unhosted suite. A module
+that binds scenarios with `@scenario` on `test_` functions, such as
+`tests/bdd/test_uc001_discover_available_inventory.py`, lists `unhosted` rows instead,
+and the verdict is `skip` either way.
 
-The creative integration group needs the
-[reference creative agent](#reference-creative-agent), so CI runs it in-network, inside
-the Docker stack, in the `Integration (creative)` shard. This job does not host that
+The creative group, which a filename marker selects, runs in-network, inside the Docker
+stack, in the `Integration (creative)` shard, next to the
+[reference creative agent](#reference-creative-agent). This job does not host that
 group.
 
 A changed test that the head run did not collect shows its suite and `not collected` in
@@ -150,22 +158,37 @@ of the following rules that fits:
 
 | Order | Verdict | When |
 |-------|---------|------|
-| 1 | `error` | A suite with a hosted added or changed test has no report, or its report records an exit code other than 0, 1, or 5. |
-| 2 | `advisory` | The Conventional Commits type of the PR title is not `fix`, `feat`, or `security`, or no production root changed. The gate does not grade the PR. |
-| 3 | `fail` | The PR touches no file under `tests/`. |
-| 4 | `skip` | Every changed test is deleted, unhosted, or not collected on the head. A touched path under `tests/bdd/` counts as an unhosted changed test. |
-| 5 | `pass` | Some hosted changed test is red (`failed` or `error`) on the base and `passed` on the head. |
-| 6 | `fail` | None of the earlier rules applies. |
+| 1 | `error` | A suite with a hosted added or changed test has no readable report on the head, or its head report records an exit code other than 0, 1, or 5. This holds for every title. |
+| 2 | `advisory` | The Conventional Commits type of the PR title is not `fix`, `feat`, or `security`. The gate does not grade the PR. |
+| 3 | `advisory` | No production root changed. |
+| 4 | `error` | A suite with a hosted added or changed test has no readable report on the base, or its base report records an exit code other than 0, 1, or 5. |
+| 5 | `fail` | The PR touches no file under `tests/`. |
+| 6 | `skip` | The PR has an added or changed test, or a touched path in an unhosted directory, and none of its added or changed tests is hosted and collected on the head. |
+| 7 | `pass` | Some hosted changed test is red (`failed` or `error`) on the base and `passed` on the head. |
+| 8 | `fail` | None of the earlier rules applies. |
 
 Rule 2 reads the PR title from the event payload. The `pull_request` trigger runs on
 `opened`, `synchronize`, and `reopened`. A re-run reuses the event payload, so a
 retitled PR keeps the verdict of its last push until the next push.
 
-Rule 1 comes first so that a `refactor` title cannot hide a broken job. Pytest exit
-codes 2, 3, and 4 mean interrupted, internal error, and usage error. The gate fails
-closed: a run that did not complete fails the job. Rule 6 also covers a PR whose touched
-files under `tests/`, outside `tests/bdd/`, hold no test function, such as a change to a
-`conftest.py` file.
+Rules 1 and 4 check the two runs. Pytest exit codes 2, 3, and 4 mean interrupted,
+internal error, and usage error. A report file that exists but does not parse as JSON,
+as an empty or a truncated file does, counts as absent. The reason then says
+`unreadable report`, and the table still renders.
+
+Rule 1 comes first so that a `refactor` title cannot hide a broken job. Rule 4 comes
+after the title rule and the production rule, because the base run of a PR that the
+gate does not grade can abort with no defect in the job: see
+[Blind spots](#blind-spots). On a PR that the gate grades, an absent base result must
+not read as red on base. The gate fails closed: a run that did not complete is an
+`error`, and an `error` fails the job.
+
+Rule 6 counts a touched path in an unhosted directory as a changed test there, whether
+the PR adds, changes, or deletes it. A deleted test does not count toward rule 6,
+because a deleted test cannot fail on the base. A PR that only deletes tests reads
+`fail` under rule 8, unless a path that it touches is in an unhosted directory. Rule 8
+also covers a PR whose touched files under `tests/`, outside those directories, hold no
+test function, such as a change to a `conftest.py` file.
 
 The job exits with code 1 for `fail` and `error`, and with code 0 for the other
 verdicts.
@@ -183,7 +206,8 @@ The base runs of a `fix` PR fail by design. The four pytest steps run with
 `continue-on-error: true`, so a failing pytest step does not fail the job. The run page
 still shows a red "Process completed with exit code 1" annotation for each failing
 pytest step. The verdict step decides the job result, and the step summary table is the
-result to read.
+result to read. On a `fail` or an `error`, the verdict step also prints a GitHub `::error`
+annotation with the reason, so the run page shows the reason beside the exit code.
 
 ### Blind spots
 
@@ -192,6 +216,15 @@ The job has the following blind spots:
 - A test that is red on the base for the wrong reason counts as red. Two causes are an
   import error from a renamed helper and a module that imports a symbol that the PR
   added. Both read `error` on the base.
+- A base run can abort before it runs a test, and then it writes no report. The usual
+  cause is a conftest that imports a symbol which the PR moved or renamed.
+  `tests/integration/conftest.py` imports `create_app` from `src.admin.app` at module
+  level, for one, so pytest exits with code 4 while it loads that conftest on the base.
+  On a PR that the gate grades, the verdict is `error` with the reason
+  `base integration: no report`, or `base integration: unreadable report`. Open the
+  "Base run (integration, host groups)" step to read the import error. The
+  "Base run (unit and harness)" step is the one to open for `base unit`. The same abort
+  on a PR whose title the gate does not grade reads `advisory`.
 - A migration that the PR adds reaches the base run only through the `adcp_test`
   database, which the `_postgres` step migrates with the head's `alembic`. The
   `integration_db` fixture builds a fresh database with `create_all` from the models of
