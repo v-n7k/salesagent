@@ -167,7 +167,7 @@ Pytest guards key their allowlists on `(file_path, function_name)` tuples, not l
 
 ### Ratchet counters
 
-A counter tracks the debt that no shrink-only list can express, against a committed baseline that may only go down: type-ignores, mypy untyped defs, ruff complexity, code duplication (`.duplication-baseline`), admin raw sessions (`.admin-raw-session-baseline`), and beads ids in FIXMEs (baseline zero). The fast counters run in `make quality`; the two too slow for it (mypy `--check-untyped-defs`, pylint duplication) run in the `quality` tox env.
+A counter tracks the debt that no shrink-only list can express, against a committed baseline that may only go down: type-ignores, mypy untyped defs, ruff complexity, code duplication (`.duplication-baseline`), clone-bearing functions (`.clone-baseline`), admin raw sessions (`.admin-raw-session-baseline`), and beads ids in FIXMEs (baseline zero). The fast counters run in `make quality`; the two too slow for it (mypy `--check-untyped-defs`, pylint duplication) run in the `quality` tox env.
 
 Read [Structural guards](structural-guards.md) for the design rationale, and run `ls tests/unit/test_architecture_*.py` for the full pytest inventory.
 
@@ -572,7 +572,7 @@ for req_ids, attr in (
 
 The same reasoning applies one level up. When a fact otherwise appears in two places, derive the second statement from the first, or refuse the disagreement at load. `ToolSpec.requires_credential()` derives the credential policy from the implementation's identity annotation instead of repeating it as an `auth=` literal, and `ToolSpec.__post_init__` refuses a row whose annotation and DTO disagree about the account.
 
-**Enforced by:** `check_code_duplication.py` in `make quality` (pylint R0801 against the shrink-only `.duplication-baseline`)
+**Enforced by:** `check_code_duplication.py` in `make quality` (pylint R0801 against the shrink-only `.duplication-baseline`) and `check_clone_count.py` in `make quality-ci` and the unit suite (clone-bearing functions against `.clone-baseline`)
 
 ## Quick reference: where to look
 

@@ -536,8 +536,8 @@ entity-marker `architecture`).
 Each of these guards includes a **known-bad self-test** (inline snippet or tmp
 fixture) so a narrowed detector fails CI instead of passing green silently.
 
-CI-only hook enforcement runs in `make quality-ci`: duplication, GAM auth
-support, response attribute access, roundtrip tests. See
+CI-only hook enforcement runs in `make quality-ci`: duplication, clone count,
+GAM auth support, response attribute access, roundtrip tests. See
 `.pre-commit-coverage-map.yml`.
 
 ## Add a guard
@@ -771,3 +771,46 @@ here.
 commit time for simple BDD patterns (`ctx.get("env")`, `hasattr(env, ...)`,
 error fabrication). Python AST guards manage the allowlists for existing
 violations and handle complex cross-file analysis.
+
+**Duplication ratchets.** `check_code_duplication.py` still counts the duplicate
+blocks that pylint R0801 reports (`.duplication-baseline`).
+`check_clone_count.py` adds a count of clone-bearing functions. A function is
+clone-bearing when a run of five consecutive statements in it, normalized and
+containing at least one call, also occurs in another function anywhere under
+`src/`, `tests/`, `scripts/`, `.pre-commit-hooks/` or `.claude/scripts/`, the
+same file included. The run may come from any statement list in the function,
+compound-statement bodies included. A nested `def` or `class` counts as one
+statement of the enclosing function and yields no windows there; each nested
+function is indexed on its own. Normalization relabels the names the function
+binds, replaces constants with their type (`None`, `True` and `False` stay) and
+ignores docstrings and positions, but keeps free names, attribute names and
+keyword names, so two functions that call different methods do not match.
+`scripts/ci/ast_normalize.py` defines the normalization and
+`scripts/ci/clone_index.py` the windows.
+
+The unit is the function, so extracting a helper removes every member of a group
+from the count at once and a third copy adds one. The R0801 count lacks that
+property: it counts one message per group of similar blocks, so a third copy adds
+nothing. `.clone-baseline` is keyed per root, so one root cannot trade against
+another; lower it with
+`uv run python .pre-commit-hooks/check_clone_count.py --update-baseline`.
+`check_clone_count.py` runs in `make quality-ci` and, on an increase, prints each
+newly clone-bearing function with one partner as `path:line` pairs. The unit suite
+runs the same count as the fast ratchet `clone-count-no-regression`
+(`tests/unit/test_architecture_ratchet_enforcement.py`), which requires the
+committed number to equal the live count exactly. Directories named `vendor`,
+`node_modules`, `.venv`, `.tox` and `__pycache__` are skipped. One count takes
+more than ten seconds, against under a second in total for the other four fast
+ratchets. The count has four blind spots:
+
+- **Copies shorter than five statements.** A two-line enum unwrap re-inlined for
+  the third time (PR [#1835](https://github.com/prebid/salesagent/pull/1835#discussion_r3769077442))
+  is below the window and stays a reviewer's job.
+- **Class bodies.** Three-line private test-harness env subclasses are not
+  functions, so the count does not see them; covering that family takes a guard
+  that names it, which this ratchet does not provide.
+- **A copy with one statement inserted inside the window.** The comparison is
+  exact over the five statements, so the insertion breaks every window that spans
+  it; the copy is caught only if five statements in a row on at least one side of
+  the insertion still match the original.
+- **Divergence.** Editing one copy so it stops matching lowers the count.

@@ -32,7 +32,7 @@ This guide surfaces the repository-specific rules for the Prebid Sales Agent cod
 - If you are asked to refactor duplicated code, that is a **bug fix**, not an "improvement"
 - **NEVER** cite "avoid over-engineering" or "keep it simple" to justify leaving duplicated logic in place
 - Duplicated code is a defect. It means the next person who fixes a bug in one copy misses the other copy, and it has caused real bugs in this codebase
-- **Enforced by:** `check_code_duplication.py` in `make quality` (pylint R0801, ratcheting baseline in `.duplication-baseline`)
+- **Enforced by:** `check_code_duplication.py` in `make quality` (pylint R0801, ratcheting baseline in `.duplication-baseline`) and `check_clone_count.py` in `make quality-ci` and the unit suite (clone-bearing functions, meaning functions that share five consecutive normalized statements, a call among them, with another function; ratcheting baseline in `.clone-baseline`)
 
 **What DRY is NOT:**
 - It is not an excuse to create deep abstraction hierarchies for one-time code
@@ -74,6 +74,7 @@ AST-scanning tests enforce architecture invariants on every `make quality` run. 
 | BDD no duplicate steps | No 3+ step functions with identical bodies | `test_architecture_bdd_no_duplicate_steps.py` |
 | BDD no silent env | No `ctx.get("env")` or `hasattr(env, ...)` in step functions | `test_architecture_bdd_no_silent_env.py` |
 | Code duplication (DRY) | Duplicate block count in src/ and tests/ cannot increase | `check_code_duplication.py` (make quality) |
+| Code clones (DRY) | Clone-bearing function count (five normalized statements with a call among them, shared with another function, the same file included) cannot increase in `src/`, `tests/`, `scripts/`, `.pre-commit-hooks/` or `.claude/scripts/` | `check_clone_count.py` (`make quality-ci`) + `test_architecture_ratchet_enforcement.py` |
 | Workflow tenant isolation | WorkflowRepository queries join DBContext for tenant scoping | `test_architecture_workflow_tenant_isolation.py` |
 | No split mock assertions | Tests use `assert_called_once_with()`, not `assert_called_once()` + `call_args` | `test_architecture_weak_mock_assertions.py` |
 | Single migration head | Alembic migration graph has exactly one head | `test_architecture_single_migration_head.py` |

@@ -115,8 +115,9 @@ Where duplication concentrates, and what to do instead:
 
 Intentional repetition is fine: test parametrization,
 protocol-required boilerplate, and framework conventions repeat by
-design. The mechanical backstop is `check_code_duplication.py` in
-`make quality` — the `.duplication-baseline` count may not rise.
+design. The mechanical backstops are `check_code_duplication.py` and
+`check_clone_count.py` in `make quality`; neither the
+`.duplication-baseline` count nor the `.clone-baseline` counts may rise.
 
 ## Follow the codebase's own conventions
 
@@ -274,8 +275,8 @@ claims a thoroughness that never executes.
 
 ## Keep every allowlist shrinking
 
-Guard allowlists, `.duplication-baseline`, and the xfail and
-known-failure registries track pre-existing debt. Debt can only be paid
+Guard allowlists, `.duplication-baseline`, `.clone-baseline`, and the xfail
+and known-failure registries track pre-existing debt. Debt can only be paid
 down; growing a ratchet converts a visible defect into an invisible,
 permanent one. The invariant is binary — a ratchet either grew or it did
 not:
@@ -329,7 +330,7 @@ Run through this list to check that the work is correct:
    `src/core/security/outbound_http.py` (`send` / `asend`) — the
    egress bans in `ruff-egress.toml` run in `make quality-ci`.
 3. `git diff main...HEAD -- 'tests/unit/test_architecture_*.py'
-   .duplication-baseline tests/bdd/conftest.py
+   .duplication-baseline .clone-baseline tests/bdd/conftest.py
    tests/bdd/e2e_rest_known_failures.txt` shows no added allowlist,
    baseline, or xfail entries — and shows removals for every violation
    you fixed.

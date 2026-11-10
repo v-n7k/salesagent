@@ -299,14 +299,14 @@ Requires pre-commit ≥3.2.0. Run `pre-commit install` once per clone (installs 
 
 Running `make quality` or `make quality-ci` may update the tracked ratchet
 baselines (`.duplication-baseline`, `.type-ignore-baseline`,
-`.ruff-complexity-baseline`, `.mypy-untyped-defs-baseline`) when counts
-decrease. Commit those updates intentionally; CI runs are ephemeral and do
-not persist baseline writes.
+`.ruff-complexity-baseline`, `.mypy-untyped-defs-baseline`,
+`.clone-baseline`) when counts decrease. Commit those updates intentionally;
+CI runs are ephemeral and do not persist baseline writes.
 
 Checks invoked directly by `make quality-ci` (not via `pre-commit run --all-files` in the Quality Gate):
 
-- **CI-only** (no commit/pre-push stage): `check_code_duplication`, `check-gam-auth-support`,
-  `check_response_attribute_access`.
+- **CI-only** (no commit/pre-push stage): `check_code_duplication`, `check_clone_count`,
+  `check-gam-auth-support`, `check_response_attribute_access`.
 - **Dual-stage** (`pre-push + ci-step` in the coverage map): `check-route-conflicts`,
   `type-ignore-no-regression`, `check-docs-links`, `no-hardcoded-urls`.
 
