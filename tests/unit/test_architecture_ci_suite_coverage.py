@@ -235,6 +235,19 @@ class TestCISuiteCoverage:
             "--head-report unit=head-unit.json" in verdict_step["run"]
             and "--base-report integration=base-integration.json" in verdict_step["run"]
         )
+        # Refuses continue-on-error off the pytest steps (advisory gate), a step on another suite, a wrong report file.
+        assert not job.get("continue-on-error")
+        assert [s for s in steps if s.get("continue-on-error")] == pytest_steps
+        assert all("--json-report --json-report-file=" in s["with"]["extra_args"] for s in pytest_steps)
+        for s in pytest_steps:
+            bucket = "integration" if "integration_files" in s["if"] else "unit"
+            assert s["if"] == f"steps.changed.outputs.{bucket}_files != ''"
+            assert s["with"]["paths"] == f"${{{{ steps.changed.outputs.{bucket}_files }}}}"
+            assert f"--only-ids {bucket}-ids.txt " in s["with"]["extra_args"]
+            assert f"-{bucket}.json" in s["with"]["extra_args"]
+        for side in ("head", "base"):
+            for bucket in ("unit", "integration"):
+                assert f"--{side}-report {bucket}={side}-{bucket}.json" in verdict_step["run"]
         summary = workflow["jobs"]["summary"]
         assert "tests-redden-on-base" in summary["needs"]
         validate = " ".join(str(s.get("run", "")) for s in summary["steps"])
@@ -264,8 +277,8 @@ class TestCISuiteCoverage:
         assert [p for p in map(phase, steps) if p] == ["changed", "head", "head", "reset", "base", "base", "verdict"]
         roots = " ".join(PRODUCTION_ROOTS)
         reset = [line.strip() for line in next(s["run"] for s in steps if phase(s) == "reset").splitlines()]
-        assert reset[-2:] == [f"git rm -r -q --ignore-unmatch -- {roots}", f'git checkout "$BASE" -- {roots}'], (
-            "remove the roots first, so that a file the pull request added under one is gone on the base"
+        assert reset[-2:] == [f"git rm -f -r -q --ignore-unmatch -- {roots}", f'git checkout "$BASE" -- {roots}'], (
+            "remove the roots by force first, so that a file the pull request added under one is gone on the base"
         )
 
     @pytest.mark.arch_guard

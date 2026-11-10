@@ -934,13 +934,14 @@ jobs:
           disable_randomly: "true"
           extra_args: -p scripts.ci.pytest_only_ids --only-ids integration-ids.txt --timeout=60 -m "not creative and not skip_ci" --continue-on-collection-errors --json-report --json-report-file=head-integration.json
       # git rm comes first, so that a file the pull request added under a production root is gone
-      # on the base and is not left in place.
+      # on the base and is not left in place. It is forced because a head run may have modified a
+      # tracked file under a root, and the checkout below rebuilds the roots from git anyway.
       - name: Reset the production roots to the base
         env:
           BASE: ${{ steps.changed.outputs.base }}
         run: |
           set -euo pipefail
-          git rm -r -q --ignore-unmatch -- src templates static alembic
+          git rm -f -r -q --ignore-unmatch -- src templates static alembic
           git checkout "$BASE" -- src templates static alembic
       - name: Base run (unit and harness)
         if: steps.changed.outputs.unit_files != ''
