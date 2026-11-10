@@ -86,6 +86,20 @@ class TestCoverageConfig:
         """[tool.coverage.report] should exist with show_missing."""
         assert "[tool.coverage.report]" in pyproject_content, "Missing [tool.coverage.report] in pyproject.toml"
 
+    def test_no_root_coveragerc_shadows_pyproject(self):
+        """A root .coveragerc wins over [tool.coverage.*] and silently turns branch coverage off."""
+        assert not (PROJECT_ROOT / ".coveragerc").exists(), (
+            ".coveragerc shadows pyproject.toml's [tool.coverage.run]; delete it, pyproject is the one config"
+        )
+
+    def test_coverage_omits_in_tree_test_modules(self, pyproject_content):
+        """src/admin/tests/ is collected by no CI job; measured, it reads as 0%."""
+        assert 'omit = ["src/admin/tests/*"]' in pyproject_content
+
+    def test_diff_cover_is_a_locked_dev_dependency(self, pyproject_content):
+        assert '"diff-cover>=11.0.1"' in pyproject_content
+        assert 'name = "diff-cover"' in (PROJECT_ROOT / "uv.lock").read_text()
+
 
 class TestPerEnvCoverageIsolation:
     """Each tox env must use a unique COVERAGE_FILE to prevent SQLite race conditions."""

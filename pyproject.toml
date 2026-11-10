@@ -146,6 +146,7 @@ dev = [
     # 21.14.7, 21.14.9 and 21.14.13 as fixes, so the floor is the highest of them (earlier
     # PYSEC-2026-4011..4014). Dev-only, but audited, because `uv export` includes the dev group.
     "virtualenv>=21.14.13",
+    "diff-cover>=11.0.1",
 ]
 
 # Local iteration against an SDK worktree checked out beside this one overlays an
@@ -259,6 +260,7 @@ max-statements = 50
 source = ["src"]
 branch = true
 relative_files = true
+omit = ["src/admin/tests/*"]
 
 [tool.coverage.paths]
 source = [
