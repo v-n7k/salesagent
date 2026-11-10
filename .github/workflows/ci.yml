@@ -281,10 +281,23 @@ jobs:
       # group's own step below for where that hatch now lives.
       - uses: ./.github/actions/_pytest
         if: matrix.group != 'creative'
+        env:
+          # One data file per group so the artifacts cannot collide with unit's .coverage.
+          COVERAGE_FILE: .coverage.integration-${{ matrix.group }}
         with:
           paths: tests/integration/
           disable_randomly: "true"
+          coverage_xml: coverage-integration-${{ matrix.group }}.xml
           extra_args: --timeout=60 -m "(${{ matrix.marker }}) and not skip_ci"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ always() && matrix.group != 'creative' }}
+        with:
+          name: integration-${{ matrix.group }}-coverage
+          path: |
+            .coverage.integration-${{ matrix.group }}
+            coverage-integration-${{ matrix.group }}.xml
+          include-hidden-files: true
+          if-no-files-found: error
       # `creative` is the one group that needs the reference agent, so it runs
       # IN-NETWORK — the same hammer bdd-in-network already swings. The agent is
       # reached by SERVICE NAME on the stack's own network

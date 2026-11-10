@@ -113,6 +113,36 @@ class TestCISuiteCoverage:
         assert "and not delivery" in markers["infra"]
 
     @pytest.mark.arch_guard
+    def test_host_integration_groups_upload_coverage(self):
+        """Every host integration group writes its own data file and uploads it; creative uploads nothing."""
+        from scripts.ci.shard_split import INTEGRATION_HOST_GROUPS
+
+        job = load_ci_workflow()["jobs"]["integration-tests"]
+        groups = {row["group"] for row in job["strategy"]["matrix"]["include"]}
+        assert groups - {"creative"} == set(INTEGRATION_HOST_GROUPS), (
+            "the matrix's host groups and shard_split.INTEGRATION_HOST_GROUPS must be the same list; "
+            "the coverage gate loops over the constant"
+        )
+        host_pytest = [
+            step
+            for step in job["steps"]
+            if str(step.get("uses", "")).endswith("/_pytest") and step.get("if") == "matrix.group != 'creative'"
+        ]
+        assert len(host_pytest) == 1
+        assert host_pytest[0]["with"]["coverage_xml"] == "coverage-integration-${{ matrix.group }}.xml"
+        assert host_pytest[0]["env"]["COVERAGE_FILE"] == ".coverage.integration-${{ matrix.group }}"
+        uploads = [
+            step
+            for step in job["steps"]
+            if "actions/upload-artifact" in str(step.get("uses", ""))
+            and step.get("with", {}).get("name") == "integration-${{ matrix.group }}-coverage"
+        ]
+        assert len(uploads) == 1, "one upload step per host group, keyed by group"
+        assert "matrix.group != 'creative'" in str(uploads[0].get("if", ""))
+        assert ".coverage.integration-${{ matrix.group }}" in uploads[0]["with"]["path"]
+        assert uploads[0]["with"].get("if-no-files-found") == "error"
+
+    @pytest.mark.arch_guard
     def test_quality_gate_does_not_run_unit_tests(self):
         """Quality Gate runs static checks only; unit tests run once in unit-tests."""
         quality_job = load_ci_workflow()["jobs"]["quality-gate"]
