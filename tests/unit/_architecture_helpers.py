@@ -142,6 +142,72 @@ def collect_error_aliases(tree: ast.AST) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Harness-env class index — which classes under tests/ derive from an env root
+# ---------------------------------------------------------------------------
+
+# Roots of the harness env hierarchy (declared in tests/harness/_base.py).
+ENV_ROOTS = frozenset({"BaseTestEnv", "IntegrationEnv", "BareIntegrationEnv"})
+
+
+def iter_test_module_trees() -> list[tuple[str, ast.Module]]:
+    """``(repo_relative_path, tree)`` for every parseable ``.py`` under tests/."""
+    modules: list[tuple[str, ast.Module]] = []
+    for py_file in sorted((REPO_ROOT / "tests").rglob("*.py")):
+        if "__pycache__" in py_file.parts:
+            continue
+        tree = safe_parse(py_file)
+        if tree is None:  # pragma: no cover - a syntax error fails elsewhere
+            continue
+        modules.append((str(py_file.relative_to(repo_root())), tree))
+    return modules
+
+
+def _base_names(cls: ast.ClassDef) -> set[str]:
+    """Base-class NAMES of *cls* — ``Foo`` and ``mod.Foo`` both yield ``Foo``."""
+    names: set[str] = set()
+    for base in cls.bases:
+        if isinstance(base, ast.Name):
+            names.add(base.id)
+        elif isinstance(base, ast.Attribute):
+            names.add(base.attr)
+    return names
+
+
+def class_base_index(modules: list[tuple[str, ast.Module]]) -> dict[str, set[str]]:
+    """``class name -> union of its base-class names`` across the whole tests tree.
+
+    Nested classes (defined inside a function body — the exact shape both
+    out-of-harness env definitions take) are included: ``ast.walk`` descends
+    into function bodies, so a ``class _TestEnv(BaseTestEnv)`` written inside a
+    test function is indexed like a module-level one.
+    """
+    index: dict[str, set[str]] = {}
+    for _path, tree in modules:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                index.setdefault(node.name, set()).update(_base_names(node))
+    return index
+
+
+def derives_from_env(name: str, index: dict[str, set[str]]) -> bool:
+    """True when *name* is one of ``ENV_ROOTS`` or transitively derives from one."""
+    if name in ENV_ROOTS:
+        return True
+    seen: set[str] = set()
+    frontier = [name]
+    while frontier:
+        current = frontier.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        for base in index.get(current, set()):
+            if base in ENV_ROOTS:
+                return True
+            frontier.append(base)
+    return False
+
+
+# ---------------------------------------------------------------------------
 # AST parsing — mtime-keyed cache
 # ---------------------------------------------------------------------------
 

@@ -43,16 +43,17 @@ from __future__ import annotations
 
 import ast
 
-from tests.unit._architecture_helpers import assert_violations_match_allowlist, repo_root
-
-_TESTS_DIR = repo_root() / "tests"
+from tests.unit._architecture_helpers import (
+    assert_violations_match_allowlist,
+    class_base_index,
+    derives_from_env,
+    iter_test_module_trees,
+    repo_root,
+)
 
 # The module that owns the ONE definition of each dispatch method. Overrides
 # are counted everywhere else.
 _BASE_MODULE = "tests/harness/_base.py"
-
-# Roots of the harness env hierarchy (declared in _BASE_MODULE).
-_ENV_ROOTS = frozenset({"BaseTestEnv", "IntegrationEnv", "BareIntegrationEnv"})
 
 # The old quartet's transport entry points. After the single-dispatch change these exist ONLY on
 # BaseTestEnv, as ``return self.deliver_*(**kwargs).payload``.
@@ -140,70 +141,11 @@ _KNOWN_DELIVER_OVERRIDES: set[tuple[str, str, str]] = {
 # --------------------------------------------------------------------------
 
 
-def _iter_test_modules() -> list[tuple[str, ast.Module]]:
-    """``(repo_relative_path, tree)`` for every parseable ``.py`` under tests/."""
-    modules: list[tuple[str, ast.Module]] = []
-    for py_file in sorted(_TESTS_DIR.rglob("*.py")):
-        if "__pycache__" in py_file.parts:
-            continue
-        try:
-            tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
-        except SyntaxError:  # pragma: no cover - a syntax error fails elsewhere
-            continue
-        modules.append((str(py_file.relative_to(repo_root())), tree))
-    return modules
-
-
-def _base_names(cls: ast.ClassDef) -> set[str]:
-    """Base-class NAMES of *cls* — ``Foo`` and ``mod.Foo`` both yield ``Foo``."""
-    names: set[str] = set()
-    for base in cls.bases:
-        if isinstance(base, ast.Name):
-            names.add(base.id)
-        elif isinstance(base, ast.Attribute):
-            names.add(base.attr)
-    return names
-
-
-def _class_index(modules: list[tuple[str, ast.Module]]) -> dict[str, set[str]]:
-    """``class name -> union of its base-class names`` across the whole tests tree.
-
-    Nested classes (defined inside a function body — the exact shape both
-    out-of-harness env definitions take) are included: ``ast.walk`` descends
-    into function bodies, so a ``class _TestEnv(BaseTestEnv)`` written inside a
-    test function is indexed like a module-level one.
-    """
-    index: dict[str, set[str]] = {}
-    for _path, tree in modules:
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                index.setdefault(node.name, set()).update(_base_names(node))
-    return index
-
-
-def _is_env_class(name: str, index: dict[str, set[str]]) -> bool:
-    """True when *name* transitively derives from a harness env root."""
-    if name in _ENV_ROOTS:
-        return True
-    seen: set[str] = set()
-    frontier = [name]
-    while frontier:
-        current = frontier.pop()
-        if current in seen:
-            continue
-        seen.add(current)
-        for base in index.get(current, set()):
-            if base in _ENV_ROOTS:
-                return True
-            frontier.append(base)
-    return False
-
-
 def env_class_names() -> set[str]:
     """Every harness-env class name defined anywhere under ``tests/``."""
-    modules = _iter_test_modules()
-    index = _class_index(modules)
-    return {name for name in index if _is_env_class(name, index)}
+    modules = iter_test_module_trees()
+    index = class_base_index(modules)
+    return {name for name in index if derives_from_env(name, index)}
 
 
 def _defining_module_paths(class_name: str) -> set[str]:
@@ -211,10 +153,10 @@ def _defining_module_paths(class_name: str) -> set[str]:
 
     ``ast.walk`` descends into function bodies, so a class nested inside a test
     function counts as defined by its module — the same membership rule
-    ``_class_index`` uses.
+    ``class_base_index`` uses.
     """
     paths: set[str] = set()
-    for path, tree in _iter_test_modules():
+    for path, tree in iter_test_module_trees():
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef) and node.name == class_name:
                 paths.add(path)
@@ -227,14 +169,14 @@ def _scan_method_defs(method_names: frozenset[str]) -> set[tuple[str, str, str]]
     ``_BASE_MODULE`` is excluded: it holds the ONE canonical definition, which
     is the thing every other site must delegate to rather than re-implement.
     """
-    modules = _iter_test_modules()
-    index = _class_index(modules)
+    modules = iter_test_module_trees()
+    index = class_base_index(modules)
     found: set[tuple[str, str, str]] = set()
     for path, tree in modules:
         if path == _BASE_MODULE:
             continue
         for node in ast.walk(tree):
-            if not isinstance(node, ast.ClassDef) or not _is_env_class(node.name, index):
+            if not isinstance(node, ast.ClassDef) or not derives_from_env(node.name, index):
                 continue
             for stmt in node.body:
                 if isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef) and stmt.name in method_names:
@@ -250,7 +192,7 @@ def _scan_wire_stash_references() -> set[tuple[str, int]]:
     orphaned reader is how the attribute grows a second writer back.
     """
     found: set[tuple[str, int]] = set()
-    for path, tree in _iter_test_modules():
+    for path, tree in iter_test_module_trees():
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and node.attr == _WIRE_STASH_ATTR:
                 found.add((path, node.lineno))
@@ -392,9 +334,9 @@ def test_meta_membership_resolves_transitively_through_a_mixin():
         "SubEnv": {"DeliveryPollEnv"},
         "Unrelated": {"object"},
     }
-    assert _is_env_class("DeliveryPollEnv", index) is True
-    assert _is_env_class("SubEnv", index) is True
-    assert _is_env_class("Unrelated", index) is False
+    assert derives_from_env("DeliveryPollEnv", index) is True
+    assert derives_from_env("SubEnv", index) is True
+    assert derives_from_env("Unrelated", index) is False
 
 
 def test_meta_membership_is_not_a_directory_glob():
@@ -430,6 +372,6 @@ def test_meta_membership_is_not_a_directory_glob():
 
 def test_meta_scanner_flags_an_override_on_an_env_and_ignores_a_non_env():
     """Positive + negative: the method scan keys on env membership, not name."""
-    index = _class_index([("x.py", ast.parse(_SNIPPET_ENV_SUBCLASS)), ("y.py", ast.parse(_SNIPPET_NON_ENV))])
-    assert _is_env_class("ProductEnv", index) is True
-    assert _is_env_class("NotAnEnv", index) is False
+    index = class_base_index([("x.py", ast.parse(_SNIPPET_ENV_SUBCLASS)), ("y.py", ast.parse(_SNIPPET_NON_ENV))])
+    assert derives_from_env("ProductEnv", index) is True
+    assert derives_from_env("NotAnEnv", index) is False
