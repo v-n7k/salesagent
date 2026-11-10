@@ -93,9 +93,11 @@ class Normalizer(ast.NodeTransformer):
     """Rename the bound names of a function and replace its literal values with their type names.
 
     A ``Name`` or ``arg`` whose id is in ``bound`` becomes ``_v{index}``, where ``index`` is its
-    position in ``bound``. Every other ``Name`` stays, and so do attribute names and keyword
-    argument names. A ``str``, ``bytes``, ``int``, ``float``, or ``complex`` constant becomes a
-    ``Name`` that holds its type name in upper case. ``None``, ``True``, ``False``, and ``...`` stay.
+    position in ``bound``. A bound name gets the same rename where it is declared. The declaration
+    sites are an ``except ... as`` name, an ``import ... as`` alias, and the name of a ``def`` or
+    ``class``. Every other ``Name`` stays, and so do attribute names and keyword argument names.
+    A ``str``, ``bytes``, ``int``, ``float``, or ``complex`` constant becomes a ``Name`` that holds
+    its type name in upper case. ``None``, ``True``, ``False``, and ``...`` stay.
     The transformer edits the tree in place, so pass it a copy.
     """
 
@@ -114,6 +116,24 @@ class Normalizer(ast.NodeTransformer):
         node.arg = self._rename(node.arg)
         self.generic_visit(node)
         return node
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> ast.ExceptHandler:
+        if node.name:
+            node.name = self._rename(node.name)
+        self.generic_visit(node)
+        return node
+
+    def visit_alias(self, node: ast.alias) -> ast.alias:
+        if node.asname:
+            node.asname = self._rename(node.asname)
+        return node
+
+    def _rename_declared(self, node: _FunctionNode | ast.ClassDef) -> ast.AST:
+        node.name = self._rename(node.name)
+        self.generic_visit(node)
+        return node
+
+    visit_FunctionDef = visit_AsyncFunctionDef = visit_ClassDef = _rename_declared
 
     def visit_Constant(self, node: ast.Constant) -> ast.AST:
         value = node.value
