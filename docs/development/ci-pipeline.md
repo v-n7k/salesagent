@@ -18,14 +18,15 @@ git rebase upstream/main
 git diff upstream/main --stat   # target: ~20-30 files, no alembic/versions/ changes
 ```
 
-## Required checks (20 rendered names after PR #1379)
+## Required checks
 
 Run `./scripts/capture-rendered-names.sh` after any job rename. The frozen guard
 [`tests/unit/test_architecture_required_ci_checks_frozen.py`](../../tests/unit/test_architecture_required_ci_checks_frozen.py)
 must stay in sync.
 
-PR #1372 (PR3) establishes **18** checks. PR #1379 adds **2 BDD shard** checks
-plus the aggregate `CI / BDD Tests` status proxy (replacing PR3's single BDD job).
+PR #1372 (PR3) established **18** checks. PR #1379 added the BDD shard checks (two
+then, four now) plus the aggregate `CI / BDD Tests` status proxy (replacing PR3's
+single BDD job). The table lists every name the frozen guard pins.
 
 | Rendered check name | Job |
 |---------------------|-----|
@@ -48,6 +49,8 @@ plus the aggregate `CI / BDD Tests` status proxy (replacing PR3's single BDD job
 | `CI / BDD Tests (Shard 3/4)` | BDD shard, balanced by measured duration |
 | `CI / BDD Tests (Shard 4/4)` | BDD shard, balanced by measured duration |
 | `CI / BDD Tests` | aggregate status proxy (shard pass/fail) |
+| `CI / BDD In-Network (e2e_rest)` | BDD scenarios over the `e2e_rest` transport against the Docker stack; grades `tests/bdd/e2e_rest_known_failures.txt` |
+| `CI / Storyboard Conformance` | the AdCP storyboard runner, once per protocol |
 | `CI / Migration Roundtrip` | alembic upgrade |
 | `CI / Coverage` | `--fail-under` from `.coverage-baseline` using unit + four BDD shard + four host integration group + admin artifacts; diff-cover report of the changed lines |
 | `CI / Summary` | aggregation gate |
