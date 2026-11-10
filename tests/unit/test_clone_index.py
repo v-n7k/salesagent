@@ -22,6 +22,7 @@ from scripts.ci.clone_index import (
     function_windows,
     index_tree,
     new_clone_pairs,
+    relabel_window,
     statement_lists,
 )
 from tests.unit._clone_index_helpers import SEED_A, SEED_B, SEED_B_OTHER_CALL, write_sources
@@ -45,6 +46,28 @@ def test_pins() -> None:
 
 def test_renamed_locals_and_different_literals_are_one_window(tmp_path: Path) -> None:
     index = _write_and_index(tmp_path, {"src/a.py": SEED_A, "tests/b.py": SEED_B})
+    assert clone_bearing_functions(index) == {
+        FunctionRef("src/a.py", "seed_tenant", 1),
+        FunctionRef("tests/b.py", "seed_other", 1),
+    }
+
+
+def test_relabel_window_numbers_labels_by_first_appearance() -> None:
+    dump = (
+        "Assign([Name('_v3', Store())], Call(Name('api_v1', Load()), [Name('_v1', Load())], []))\nReturn(Name('_v3'))"
+    )
+    assert relabel_window(dump) == (
+        "Assign([Name('_w0', Store())], Call(Name('api_v1', Load()), [Name('_w1', Load())], []))\nReturn(Name('_w0'))"
+    )
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [("(db, label)", "(db, label, unused)"), ("label):\n", "label):\n    scratch = helper()\n")],
+    ids=["extra_parameter", "earlier_binding"],
+)
+def test_a_copy_is_found_whatever_precedes_it_in_its_function(tmp_path: Path, old: str, new: str) -> None:
+    index = _write_and_index(tmp_path, {"src/a.py": SEED_A, "tests/b.py": SEED_B.replace(old, new)})
     assert clone_bearing_functions(index) == {
         FunctionRef("src/a.py", "seed_tenant", 1),
         FunctionRef("tests/b.py", "seed_other", 1),

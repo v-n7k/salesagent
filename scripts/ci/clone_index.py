@@ -4,16 +4,21 @@ A window is a run of ``WINDOW`` consecutive statements in one statement list of 
 body, or the body of an ``if``, ``for``, ``while``, ``with``, ``try``, ``except``, ``else``,
 ``finally`` or ``match`` case inside it, at any depth. A nested ``def`` or ``class`` is one
 statement of the enclosing function; its body is not scanned as part of that function, and a
-nested function is indexed as a function of its own. With
-``REQUIRE_CALL``, a window counts only if it contains a call, which leaves out runs of plain
-assignments and assertions.
+nested function is indexed as a function of its own. With ``REQUIRE_CALL``, a window counts only
+if it contains a call, which leaves out runs of plain assignments and assertions.
 
-Windows are compared after ``scripts/ci/ast_normalize.py`` normalizes the function: local names
-are renamed by position and literal values are replaced by their type, so a copy that uses other
-names and values has the same hash. A function is clone-bearing when one of its windows also
-occurs in another function, in the same file or in any other file under the scanned roots. The
-same window twice inside one function does not count. The clone ratchet
-(``.pre-commit-hooks/check_clone_count.py``) counts clone-bearing functions per root.
+Windows are compared after ``scripts/ci/ast_normalize.py`` normalizes the function: bound names
+become ``_v{n}`` labels and literal values are replaced by their type, so a copy that uses other
+names and values has the same shape. The labels are numbered across the whole function, so the
+label of a name inside a window depends on the parameter list and on every binding before the
+window. The window is the unit that is hashed, so ``relabel_window`` numbers the names again,
+positionally in order of first appearance inside the window (``_w0``, ``_w1``, ...). Two copies of
+one run of statements then hash the same wherever each sits in its function.
+
+A function is clone-bearing when one of its windows also occurs in another function, in the same
+file or in any other file under the scanned roots. The same window twice inside one function does
+not count. The clone ratchet (``.pre-commit-hooks/check_clone_count.py``) counts clone-bearing
+functions per root.
 
 Only ``index_tree`` reads files. Everything else is a function of its arguments.
 """
@@ -22,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +41,8 @@ ROOTS: tuple[str, ...] = ("src", "tests", "scripts", ".pre-commit-hooks", ".clau
 SKIP_PARTS: frozenset[str] = frozenset({"__pycache__", "node_modules", ".venv", ".tox", "vendor"})
 
 _NESTED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+# A bound-name label in a dump: the normalizer writes `_v{n}`, and `ast.dump` quotes an identifier.
+_BOUND_LABEL = re.compile(r"(?<=')_v\d+(?=')")
 
 
 @dataclass(frozen=True, order=True)
@@ -89,12 +97,19 @@ def _has_call(stmts: list[ast.stmt]) -> bool:
     return any(isinstance(node, ast.Call) for stmt in stmts for node in ast.walk(stmt))
 
 
+def relabel_window(dump: str) -> str:
+    """Return ``dump`` with each ``_v{n}`` label renumbered ``_w0``, ``_w1``, ... by first appearance."""
+    labels: dict[str, str] = {}
+    return _BOUND_LABEL.sub(lambda match: labels.setdefault(match.group(), f"_w{len(labels)}"), dump)
+
+
 def function_windows(
     fn: ast.FunctionDef | ast.AsyncFunctionDef, *, window: int = WINDOW, require_call: bool = REQUIRE_CALL
 ) -> dict[str, tuple[int, int]]:
     """Map the hash of each distinct window of ``fn`` to the first and last line of its first occurrence.
 
-    The hash is the SHA-1 hex digest of ``dump_statements`` over the normalized statements.
+    The hash is the SHA-1 hex digest of ``relabel_window`` applied to ``dump_statements`` of the
+    window's normalized statements.
     """
     windows: dict[str, tuple[int, int]] = {}
     for stmts in statement_lists(normalize_function(fn)):
@@ -102,13 +117,13 @@ def function_windows(
             run = stmts[offset : offset + window]
             if require_call and not _has_call(run):
                 continue
-            digest = hashlib.sha1(dump_statements(run).encode()).hexdigest()
+            digest = hashlib.sha1(relabel_window(dump_statements(run)).encode()).hexdigest()
             windows.setdefault(digest, (run[0].lineno, run[-1].end_lineno or run[-1].lineno))
     return windows
 
 
 # Deliberate simplification: there is no per-file cache, so every call parses and normalizes the
-# whole tree, about 16 to 18 s for the five roots (some 1,700 files). The upgrade path is a cache
+# whole tree, about 13 to 18 s for the five roots (some 1,700 files). The upgrade path is a cache
 # keyed by path and mtime, like `tests/unit/_architecture_helpers.parse_module`.
 def index_tree(
     root: Path, roots: Sequence[str] = ROOTS, *, window: int = WINDOW, require_call: bool = REQUIRE_CALL
