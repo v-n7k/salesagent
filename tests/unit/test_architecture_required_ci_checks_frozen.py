@@ -53,6 +53,7 @@ REQUIRED_RENDERED_CHECKS = {
     "CI / Storyboard Conformance",
     "CI / Migration Roundtrip",
     "CI / Coverage",
+    "CI / Tests Redden On Base",
     "CI / Summary",
 }
 

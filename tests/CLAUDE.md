@@ -660,6 +660,27 @@ def then_response_has_formats(ctx, count):
     assert len(wire_field(ctx, "formats")) == count
 ```
 
+### A fix needs a test that reddens on base
+
+**A `fix`, `feat`, or `security` pull request (PR) needs at least one added or changed
+test that fails without its production change.** The rule applies when the PR changes a
+file under `src/`, `templates/`, `static/`, or `alembic/`. The `Tests Redden On Base`
+job checks this rule. It runs the changed tests of the PR on the head, then again with
+those four roots reset to the base. It lists each test with both outcomes in its step
+summary. When the job fails, read that table: a test that is `passed` on both sides did
+not exercise the change. A PR that only deletes hosted tests fails too, because a deleted
+test cannot fail on the base. The job does not run the suites in `tests/admin/`, `tests/bdd/`,
+`tests/e2e/`, `tests/quality/`, `tests/smoke/`, `tests/storyboard/`, and `tests/ui/`. Most
+files there hold no `test_` function, such as a feature file, a step module, a
+known-failures ledger, or a conftest. The job lists those files under "Touched without a
+changed test function" and grades the PR `skip` when no hosted test changed. A `test_`
+function in an unhosted suite shows as `unhosted`, and one in the creative integration
+group shows as `not collected`. None of these counts either way. A PR that changes only a
+conftest, helper, or factory outside those directories still fails, because that is
+support code and not a test. See
+[Tests redden on base](../docs/development/ci-pipeline.md#tests-redden-on-base) for the
+verdict rules and the blind spots.
+
 ## Error verification policy
 
 ### Principle: Assert on the wire envelope, not reconstructed exceptions
