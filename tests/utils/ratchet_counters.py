@@ -74,8 +74,10 @@ class RatchetCounter:
         return {SINGLE_KEY: int(raw)}
 
 
-#: File scans and one ruff invocation — measured at well under a second in
-#: total, so the unit suite absorbs them without a detectable change.
+#: File scans and one ruff invocation. The type-ignore, fixme-citation,
+#: admin-raw-session and ruff-complexity counters measure under a second in
+#: total, so the unit suite absorbs them without a detectable change. The
+#: clone-count counter is the exception (see its entry).
 FAST_RATCHETS = (
     RatchetCounter(
         "type-ignore-no-regression",
@@ -100,6 +102,17 @@ FAST_RATCHETS = (
         "check_ruff_complexity_count",
         ".ruff-complexity-baseline",
         lambda hook, root: hook.count_rule_violations(root, root / hook.SRC_DIR),
+    ),
+    # The one fast ratchet above a second: one count measured 14 to 20 s over 1,711
+    # files, against under a second in total for the four above. It is here anyway
+    # because the clone count moves on more PRs than any other, so it is graded
+    # exactly, in every unit-suite run, rather than in the slower `quality` env
+    # (review-feedback guards design, § 13.2).
+    RatchetCounter(
+        "clone-count-no-regression",
+        "check_clone_count",
+        ".clone-baseline",
+        lambda hook, root: hook.count_clone_bearing(root),
     ),
 )
 

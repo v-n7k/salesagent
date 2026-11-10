@@ -84,3 +84,6 @@ fixme-citation-no-regression:
 admin-raw-session-no-regression:
   enforced_by: guard
   location: tests/unit/test_architecture_ratchet_enforcement.py
+clone-count-no-regression:
+  enforced_by: guard
+  location: tests/unit/test_architecture_ratchet_enforcement.py

@@ -87,10 +87,10 @@ def test_the_ratchet_registry_is_not_empty() -> None:
     empty is what makes that safe, and it is the pattern to copy.
     """
     assert_derived_population(
-        FAST_RATCHETS, name="FAST_RATCHETS", derived_from="tests/utils/ratchet_counters.py", minimum=4
+        FAST_RATCHETS, name="FAST_RATCHETS", derived_from="tests/utils/ratchet_counters.py", minimum=5
     )
     assert_derived_population(
-        ALL_RATCHETS, name="ALL_RATCHETS", derived_from="FAST_RATCHETS + SLOW_RATCHETS", minimum=6
+        ALL_RATCHETS, name="ALL_RATCHETS", derived_from="FAST_RATCHETS + SLOW_RATCHETS", minimum=7
     )
 
 

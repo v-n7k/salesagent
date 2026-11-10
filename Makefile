@@ -57,6 +57,7 @@ quality-ci:
 	uv run python .pre-commit-hooks/check_mypy_untyped_defs_count.py
 	uv run python .pre-commit-hooks/check_fixme_citation_count.py
 	uv run python .pre-commit-hooks/check_admin_raw_session_count.py
+	uv run python .pre-commit-hooks/check_clone_count.py
 	uv run python .pre-commit-hooks/check_docs_links.py
 	uv run python .pre-commit-hooks/check_hardcoded_urls.py $$(find templates static -type f \( -name '*.html' -o -name '*.js' \) 2>/dev/null)
 
