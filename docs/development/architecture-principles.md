@@ -282,7 +282,7 @@ unit and harness suites. The following mechanisms do the checking:
 | `mypy src/` | The `ToolImpl` protocol on `ToolSpec.impl`, the generic detail type on every exception, the typed carriers at the adapter seam |
 | Load-time refusals in the code itself | `ToolSpec.__post_init__` (identity annotation versus DTO), `_register_tool` (envelope bases, SDK grounding), `__init_subclass__` on `AdCPSalesAgentError` (code in `CODE_TABLE`), the import-time totality check on the pydantic keyword map |
 | `tests/unit/test_architecture_*.py` | The remaining structural invariants, each with a shrink-only allowlist and a stale-entry test |
-| Ratchet counters in `.pre-commit-hooks/` | Debt that may only shrink: type-ignores, mypy untyped defs, ruff complexity, code duplication, admin raw sessions, beads ids in FIXMEs (baseline zero) |
+| Ratchet counters in `.pre-commit-hooks/` | Debt that may only shrink: type-ignores, mypy untyped defs, ruff complexity, code duplication, admin raw sessions, `# pragma: no cover` comments under `src/`, beads ids in FIXMEs (baseline zero) |
 
 New violations fail the build. Allowlists only shrink, and every allowlisted
 violation cites a GitHub issue — never a local beads id.

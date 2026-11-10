@@ -43,8 +43,10 @@ plus the aggregate `CI / BDD Tests` status proxy (replacing PR3's single BDD job
 | `CI / Integration (other)` | integration shard |
 | `CI / E2E Tests` | full stack |
 | `CI / Admin UI Tests` | admin suite |
-| `CI / BDD Tests (Shard 1/2)` | BDD greedy scenario shard |
-| `CI / BDD Tests (Shard 2/2)` | BDD greedy scenario shard |
+| `CI / BDD Tests (Shard 1/4)` | BDD shard, balanced by measured duration |
+| `CI / BDD Tests (Shard 2/4)` | BDD shard, balanced by measured duration |
+| `CI / BDD Tests (Shard 3/4)` | BDD shard, balanced by measured duration |
+| `CI / BDD Tests (Shard 4/4)` | BDD shard, balanced by measured duration |
 | `CI / BDD Tests` | aggregate status proxy (shard pass/fail) |
 | `CI / Migration Roundtrip` | alembic upgrade |
 | `CI / Coverage` | `--fail-under` from `.coverage-baseline` using unit + four BDD shard + four host integration group + admin artifacts; diff-cover report of the changed lines |
@@ -52,26 +54,12 @@ plus the aggregate `CI / BDD Tests` status proxy (replacing PR3's single BDD job
 
 ## BDD Test Shards
 
-BDD tests (`tests/bdd/test_*.py`, 13 files) run in **2 parallel shards** via
-greedy min-load assignment by Gherkin scenario count (`scripts/ci/shard_split.py`).
-Each shard uploads coverage; the **Coverage** job combines the unit artifact,
-the four BDD shards, the four host integration groups and the admin suite (ten
-data files in all). It writes a diff-cover report of the changed lines against
-the PR base (`HEAD^1`) into its step summary and the `diff-cover` artifact, then
-enforces `.coverage-baseline`, so the report exists even on a run under the
-floor. No threshold applies to the report. The aggregate `BDD Tests` job is
-status-only. Shard jobs route pytest through the shared `_pytest` composite.
-
-Branch coverage is on, and `pyproject.toml` is the one coverage config. A
-`.tox/.coverage.*` file written before branch coverage was on holds line data
-only, so `tox -e coverage` stops on it with
-`Can't combine statement coverage data with branch data`; remove such files
-once with `rm .tox/.coverage*`.
-
-| Shard | Files | Scenarios (approx.) |
-|-------|------:|--------------------:|
-| 1/2 | 5 | 479 |
-| 2/2 | 8 | 441 |
+BDD tests (`tests/bdd/test_*.py`) run in **4 parallel shards** via greedy
+min-load assignment by measured file duration (`scripts/ci/shard_split.py`;
+seconds per file in `scripts/ci/bdd_shard_timings.json`, refreshed by
+`scripts/ci/refresh_shard_timings.py`). Each shard uploads its coverage data
+(see Coverage below). The aggregate `BDD Tests` job is status-only. Shard jobs
+route pytest through the shared `_pytest` composite.
 
 Reproduce a CI shard locally:
 
@@ -79,11 +67,12 @@ Reproduce a CI shard locally:
 uv run pytest $(uv run python scripts/ci/shard_paths.py bdd 1)
 ```
 
-`make test-bdd` (full `tests/bdd/`) runs the same scenarios as both shards combined.
+`make test-bdd` (full `tests/bdd/`) runs the same scenarios as all four shards combined.
 
-**Load metric note:** greedy assignment balances Gherkin `Scenario` line counts (~920 total). Collected pytest items are much higher (~9×) because each scenario expands by `Examples:` rows and transport parametrization. Wall-clock is dominated by slow DB-heavy scenarios, not test volume — the reason 2 shards was chosen over 3–4.
-
-Structural guard: `tests/unit/test_architecture_ci_bdd_shard_manifest.py`.
+Structural guards: `test_bdd_shards_run_the_bdd_suite` and
+`test_bdd_shards_have_postgres_service` in
+`tests/unit/test_architecture_ci_suite_coverage.py`; the four check names are
+pinned in `tests/unit/test_architecture_required_ci_checks_frozen.py`.
 
 ## Integration Test Shards
 
@@ -110,6 +99,22 @@ a line only it exercises reads as uncovered in the diff-cover report.
 
 **Admin UI** and **BDD** jobs also require the Postgres service container plus
 `_postgres` (wait + migrate) — admin blueprint tests use the `integration_db` fixture.
+
+## Coverage
+
+The **Coverage** job combines the unit artifact, the four BDD shards, the four
+host integration groups and the admin suite (ten data files in all). It writes a
+diff-cover report of the changed lines against `HEAD^1` (the base of the merge
+commit on a `pull_request` run; the previous commit on a `push` or
+`workflow_dispatch` run) into its step summary and the `diff-cover` artifact,
+then enforces `.coverage-baseline`, so the report exists even on a run under the
+floor. No threshold applies to the report.
+
+Branch coverage is on, and `pyproject.toml` is the one coverage config. A
+`.tox/.coverage.*` file written before branch coverage was on holds line data
+only, so `tox -e coverage` stops on it with one of coverage's two `Can't combine`
+errors (which one depends on which file merges first); remove such files once
+with `rm .tox/.coverage*`.
 
 ## E2E Tests
 
