@@ -857,6 +857,115 @@ jobs:
           uv run coverage combine --data-file=.coverage.combined .coverage "${bdd_data_files[@]}"
           ./scripts/ci/coverage_report.sh --data-file .coverage.combined
 
+  # Runs the tests that a pull request added or changed twice: on the head, then on the head with
+  # src, templates, static and alembic reset to the base. A fix, feat or security pull request that
+  # changed one of those roots must bring a test that is red on the base and green on the head.
+  # scripts/ci/redden_on_base.py picks the tests, grades the two runs, and writes the table to the
+  # step summary. The four pytest steps continue on error because a red run is the evidence. The
+  # verdict step fails the job on a fail, and also when a run did not complete.
+  tests-redden-on-base:
+    name: Tests Redden On Base
+    runs-on: ubuntu-latest
+    # A push has no pull request base to compare with; the Summary job accepts the skip.
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    env:
+      # The -p plugin imports before any conftest puts the repository root on sys.path.
+      PYTHONPATH: .
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: adcp_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: adcp_test
+        options: >-
+          --health-cmd "pg_isready -U adcp_user"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+        ports:
+          - 5432:5432
+    steps:
+      - uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          # The checkout is the merge commit of the pull request. Depth 2 brings in its first
+          # parent, the tip of the base branch, which the steps below read as HEAD^1.
+          fetch-depth: 2
+      - uses: ./.github/actions/_setup-env
+      - uses: ./.github/actions/_postgres
+        with:
+          database-url: ${{ env.DATABASE_URL }}
+      - name: Find the changed tests
+        id: changed
+        run: |
+          set -euo pipefail
+          base="$(git rev-parse HEAD^1)"
+          uv run python -m scripts.ci.redden_on_base changed --base "${base}" --out changed-tests.json
+          unit_files="$(uv run python -m scripts.ci.redden_on_base ids changed-tests.json unit --out unit-ids.txt)"
+          integration_files="$(uv run python -m scripts.ci.redden_on_base ids changed-tests.json integration --out integration-ids.txt)"
+          {
+            echo "base=${base}"
+            echo "unit_files=${unit_files}"
+            echo "integration_files=${integration_files}"
+          } >> "$GITHUB_OUTPUT"
+      # pytest gets the files that hold the changed tests, and the plugin keeps only the listed
+      # test ids. Node ids as arguments would end the run with exit 4 when a changed module cannot
+      # import on the base, and the tests of the modules that do import would not run.
+      - name: Head run (unit and harness)
+        if: steps.changed.outputs.unit_files != ''
+        continue-on-error: true
+        uses: ./.github/actions/_pytest
+        with:
+          paths: ${{ steps.changed.outputs.unit_files }}
+          extra_args: -p scripts.ci.pytest_only_ids --only-ids unit-ids.txt --continue-on-collection-errors --json-report --json-report-file=head-unit.json
+      - name: Head run (integration, host groups)
+        if: steps.changed.outputs.integration_files != ''
+        continue-on-error: true
+        uses: ./.github/actions/_pytest
+        with:
+          paths: ${{ steps.changed.outputs.integration_files }}
+          disable_randomly: "true"
+          extra_args: -p scripts.ci.pytest_only_ids --only-ids integration-ids.txt --timeout=60 -m "not creative and not skip_ci" --continue-on-collection-errors --json-report --json-report-file=head-integration.json
+      # git rm comes first, so that a file the pull request added under a production root is gone
+      # on the base and is not left in place.
+      - name: Reset the production roots to the base
+        env:
+          BASE: ${{ steps.changed.outputs.base }}
+        run: |
+          set -euo pipefail
+          git rm -r -q --ignore-unmatch -- src templates static alembic
+          git checkout "$BASE" -- src templates static alembic
+      - name: Base run (unit and harness)
+        if: steps.changed.outputs.unit_files != ''
+        continue-on-error: true
+        uses: ./.github/actions/_pytest
+        with:
+          paths: ${{ steps.changed.outputs.unit_files }}
+          extra_args: -p scripts.ci.pytest_only_ids --only-ids unit-ids.txt --continue-on-collection-errors --json-report --json-report-file=base-unit.json
+      - name: Base run (integration, host groups)
+        if: steps.changed.outputs.integration_files != ''
+        continue-on-error: true
+        uses: ./.github/actions/_pytest
+        with:
+          paths: ${{ steps.changed.outputs.integration_files }}
+          disable_randomly: "true"
+          extra_args: -p scripts.ci.pytest_only_ids --only-ids integration-ids.txt --timeout=60 -m "not creative and not skip_ci" --continue-on-collection-errors --json-report --json-report-file=base-integration.json
+      - name: Verdict
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          uv run python -m scripts.ci.redden_on_base verdict --changed changed-tests.json \
+            --head-report unit=head-unit.json --head-report integration=head-integration.json \
+            --base-report unit=base-unit.json --base-report integration=base-integration.json \
+            --title="$PR_TITLE" --summary "$GITHUB_STEP_SUMMARY"
+
   summary:
     name: Summary
     runs-on: ubuntu-latest
@@ -880,6 +989,7 @@ jobs:
         bdd-in-network,
         migration-roundtrip,
         coverage,
+        tests-redden-on-base,
       ]
     steps:
       - uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
@@ -901,7 +1011,10 @@ jobs:
              [ "${{ needs.bdd-tests.result }}" != "success" ] || \
              [ "${{ needs.bdd-in-network.result }}" != "success" ] || \
              [ "${{ needs.migration-roundtrip.result }}" != "success" ] || \
-             [ "${{ needs.coverage.result }}" != "success" ]; then
+             [ "${{ needs.coverage.result }}" != "success" ] || \
+             # tests-redden-on-base runs on pull_request only; on push there is no PR base, so skipped is not a failure.
+             { [ "${{ needs.tests-redden-on-base.result }}" != "success" ] && \
+               [ "${{ needs.tests-redden-on-base.result }}" != "skipped" ]; }; then
             echo "One or more required checks failed."
             exit 1
           fi

@@ -15,6 +15,7 @@ CI job, or a broken suite can silently land on main again.
 
 import pytest
 
+from scripts.ci.redden_on_base import PRODUCTION_ROOTS
 from scripts.ci.workflow_helpers import load_ci_workflow
 
 # Suite jobs that must appear in summary.needs — a suite that runs but is absent
@@ -195,6 +196,77 @@ class TestCISuiteCoverage:
                 f"summary's result-check step does not inspect '{token}'. "
                 f"A failing {required} job would not fail CI even though it is listed in needs[]."
             )
+
+    @pytest.mark.arch_guard
+    def test_redden_on_base_job_shape(self):
+        """Changed tests run on head, then on head with the production roots reset to HEAD^1, then a verdict."""
+        workflow = load_ci_workflow()
+        job = workflow["jobs"]["tests-redden-on-base"]
+        assert job["if"] == "github.event_name == 'pull_request'"
+        assert job["timeout-minutes"] == 10
+        assert job["permissions"] == {"contents": "read"}
+        assert job["env"]["PYTHONPATH"] == "."
+        steps = job["steps"]
+        checkout = next(s for s in steps if "actions/checkout" in str(s.get("uses", "")))
+        assert checkout["with"]["fetch-depth"] == 2
+        assert any(str(s.get("uses", "")).endswith("/_postgres") for s in steps)
+        pytest_steps = [s for s in steps if str(s.get("uses", "")).endswith("/_pytest")]
+        assert len(pytest_steps) == 4 and all(s.get("continue-on-error") is True for s in pytest_steps)
+        assert all(
+            "--continue-on-collection-errors" in s["with"]["extra_args"]
+            and "--json-report-file=" in s["with"]["extra_args"]
+            for s in pytest_steps
+        )
+        assert all("-p scripts.ci.pytest_only_ids --only-ids " in s["with"]["extra_args"] for s in pytest_steps)
+        integration = [s for s in pytest_steps if "integration_files" in str(s.get("if", ""))]
+        assert len(integration) == 2 and all(
+            '-m "not creative and not skip_ci"' in s["with"]["extra_args"] for s in integration
+        )
+        run_text = " ".join(str(s.get("run", "")) for s in steps)
+        assert "python -m scripts.ci.redden_on_base changed" in run_text
+        assert 'git checkout "$BASE" -- src templates static alembic' in run_text
+        assert "python -m scripts.ci.redden_on_base verdict" in run_text
+        assert "pull_request.title" not in run_text, "the title reaches the shell through env, never inline"
+        verdict_step = next(s for s in steps if "redden_on_base verdict" in str(s.get("run", "")))
+        assert verdict_step["env"]["PR_TITLE"] == "${{ github.event.pull_request.title }}"
+        assert '--summary "$GITHUB_STEP_SUMMARY"' in verdict_step["run"]
+        assert '--title="$PR_TITLE"' in verdict_step["run"]
+        assert (
+            "--head-report unit=head-unit.json" in verdict_step["run"]
+            and "--base-report integration=base-integration.json" in verdict_step["run"]
+        )
+        summary = workflow["jobs"]["summary"]
+        assert "tests-redden-on-base" in summary["needs"]
+        validate = " ".join(str(s.get("run", "")) for s in summary["steps"])
+        assert 'needs.tests-redden-on-base.result }}" != "skipped"' in validate, (
+            "summary accepts skipped for the one job that runs on pull_request only"
+        )
+
+    @pytest.mark.arch_guard
+    def test_redden_on_base_resets_the_roots_between_the_two_runs(self):
+        """The reset sits between the head runs and the base runs, on the roots the verdict treats as production."""
+        steps = load_ci_workflow()["jobs"]["tests-redden-on-base"]["steps"]
+
+        def phase(step: dict) -> str | None:
+            extra_args, run = str(step.get("with", {}).get("extra_args", "")), str(step.get("run", ""))
+            if "redden_on_base changed" in run:
+                return "changed"
+            if "--json-report-file=head-" in extra_args:
+                return "head"
+            if 'git checkout "$BASE"' in run:
+                return "reset"
+            if "--json-report-file=base-" in extra_args:
+                return "base"
+            if "redden_on_base verdict" in run:
+                return "verdict"
+            return None
+
+        assert [p for p in map(phase, steps) if p] == ["changed", "head", "head", "reset", "base", "base", "verdict"]
+        roots = " ".join(PRODUCTION_ROOTS)
+        reset = [line.strip() for line in next(s["run"] for s in steps if phase(s) == "reset").splitlines()]
+        assert reset[-2:] == [f"git rm -r -q --ignore-unmatch -- {roots}", f'git checkout "$BASE" -- {roots}'], (
+            "remove the roots first, so that a file the pull request added under one is gone on the base"
+        )
 
     @pytest.mark.arch_guard
     def test_type_check_uses_make_target(self):
