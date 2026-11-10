@@ -205,7 +205,7 @@ class TestCISuiteCoverage:
         assert "coverage xml --data-file=.coverage.combined -o coverage-combined.xml" in run_steps
         assert "uv run diff-cover coverage-combined.xml --compare-branch=HEAD^1 --diff-range-notation=.." in run_steps
         assert "--format markdown:diff-cover.md" in run_steps
-        assert "--fail-under" not in run_steps, "stage 1 is report only (spec § 7.2); the threshold is stage 2"
+        assert "--fail-under" not in run_steps, "stage 1 is report only; the threshold is stage 2"
         assert 'diff-cover.md >> "$GITHUB_STEP_SUMMARY"' in run_steps
         upload = next(
             step["with"]

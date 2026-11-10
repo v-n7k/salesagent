@@ -54,9 +54,9 @@ SHARD_COUNTS: dict[str, int] = {
 
 # The integration groups that run on the runner with the _postgres action and so
 # can write a coverage data file. `creative` runs the whole suite inside the Docker
-# stack (ci.yml, its own step) and its data stays in the tox volume (spec § 7.2 of
-# the review-feedback design). The coverage gate loops over this tuple; the matrix
-# guard pins the matrix to it.
+# stack (ci.yml, its own step) and its data stays in the tox volume. The coverage
+# gate loops over this tuple; the matrix guard pins the matrix to it. Pinned by
+# test_host_integration_groups_upload_coverage.
 INTEGRATION_HOST_GROUPS: tuple[str, ...] = ("product", "media-buy", "infra", "other")
 
 # Measured seconds per test file, from a recorded run. Absolute values are

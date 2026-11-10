@@ -24,8 +24,8 @@ BASELINE_FILE = ".no-cover-baseline"
 SRC_DIR = "src"
 KEY = "no_cover"
 KEYS = (KEY,)
-# The pragma spellings this repository's report honours: coverage.config.DEFAULT_EXCLUDE, and pyproject adds no other.
-# Ceiling: text match, so a string or docstring with the comment counts too. Upgrade path: tokenize COMMENT tokens.
+# Coverage's own pragma pattern (coverage.config.DEFAULT_EXCLUDE[0]); pyproject adds no other pragma spelling.
+# Text match, as coverage's exclusion is: a string holding the comment counts here and is excluded there alike.
 NO_COVER = re.compile(r"#\s*(?:pragma|PRAGMA)[:\s]?\s*(?:no|NO)\s*(?:cover|COVER)")
 
 
