@@ -8,6 +8,7 @@ pass/fail results and per-suite reports whether sequential or parallel.
 """
 
 import configparser
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,14 @@ class TestCoverageConfig:
     def test_diff_cover_is_a_locked_dev_dependency(self, pyproject_content):
         assert '"diff-cover>=11.0.1"' in pyproject_content
         assert 'name = "diff-cover"' in (PROJECT_ROOT / "uv.lock").read_text()
+
+    def test_coverage_report_precision_is_one_decimal(self, pyproject_content):
+        """The floor in .coverage-baseline carries one decimal.
+
+        Coverage rounds the total to `precision` digits before comparing it with --fail-under, so at
+        precision 0 a total of 68.4 is compared as 68 and fails against a floor of 68.4.
+        """
+        assert tomllib.loads(pyproject_content)["tool"]["coverage"]["report"]["precision"] == 1
 
 
 class TestPerEnvCoverageIsolation:
