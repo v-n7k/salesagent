@@ -51,6 +51,11 @@ HOSTED_BUCKETS: dict[str, str] = {"tests/unit/": "unit", "tests/harness/": "unit
 # The suites that run the hosted tests, each named once. The command line takes one report per suite.
 _BUCKETS: tuple[str, ...] = tuple(dict.fromkeys(HOSTED_BUCKETS.values()))
 
+# A BDD scenario is a ``.feature`` file bound by ``scenarios(...)``, and its step modules hold no
+# ``test_`` function, so the lister never sees one; a touched path here is a changed test in a suite
+# this job does not host.
+SCENARIO_SUITES: tuple[str, ...] = ("tests/bdd/",)
+
 # The outcome strings are those of ``pytest-json-report``, plus ``NOT_COLLECTED``. ``SKIPPED`` stands
 # for every row outcome that is neither a pass nor a failure: skipped, xfailed, and xpassed.
 PASSED = "passed"
@@ -197,7 +202,9 @@ def verdict(
        head is a ``skip``. The head run does not collect a test that its marker expression deselects. That
        covers the creative integration group, which runs in-network and not on this host, and ``skip_ci``
        tests. A test in a ``Test`` class that pytest refuses to collect, such as a class with an
-       ``__init__`` method, is not collected either.
+       ``__init__`` method, is not collected either. A pull request whose only test changes are BDD
+       scenarios or step modules under ``tests/bdd/`` is a ``skip`` too. Those files hold no ``test_``
+       function, so they appear only in ``touched``.
     5. A pull request with a hosted changed test that is red on the base and green on the head is a ``pass``.
     6. Any other pull request is a ``fail``. That includes one whose changes under ``tests/`` hold no test
        function, such as a change to a conftest.
@@ -214,8 +221,9 @@ def verdict(
         return Verdict("advisory", "no production root changed")
     if not touched:
         return Verdict("fail", "the PR touches no file under tests/")
+    scenarios = [path for path in touched if path.startswith(SCENARIO_SUITES)]
     hosted = [change for change in changes if _is_bucketed(change) and head.get(change.node_id, ERROR) != NOT_COLLECTED]
-    if changes and not hosted:
+    if (changes or scenarios) and not hosted:
         return Verdict(
             "skip", "every changed test is deleted, in a suite this job does not host, or not collected on the head"
         )

@@ -148,6 +148,25 @@ def test_verdict_skips_when_every_changed_test_is_unhosted_or_deleted() -> None:
     assert (v.status, v.exit_code) == ("skip", 0)
 
 
+def test_verdict_skips_a_fix_pr_whose_only_test_changes_are_bdd_scenarios() -> None:
+    # A scenario is a ``.feature`` file bound by ``scenarios(...)``, and its step modules hold no ``test_`` function,
+    # so the lister emits no change for them. The files are touched, and they sit in a suite this job does not host.
+    touched = ["tests/bdd/features/x.feature", "tests/bdd/steps/test_x.py"]
+    v = verdict(title="fix: x", production_changed=True, touched=touched, changes=[], head={}, base={})
+    reason = "every changed test is deleted, in a suite this job does not host, or not collected on the head"
+    assert (v, v.exit_code) == (Verdict("skip", reason), 0)
+    # A hosted changed test next to the scenarios still decides.
+    both = verdict(
+        title="fix: x",
+        production_changed=True,
+        touched=[*touched, CHANGE.path],
+        changes=[CHANGE],
+        head={ID: PASSED},
+        base={ID: FAILED},
+    )
+    assert both == Verdict("pass", f"{ID} is red on base and green on head")
+
+
 def _grade(
     changes: Sequence[FunctionChange],
     head: Mapping[str, str],
