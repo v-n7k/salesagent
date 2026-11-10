@@ -26,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _BANNED = {"ValueError", "Exception"}
 
-# (file, lineno-message-prefix) pairs permitted to violate — shrink-only.
+# (file, exception) pairs permitted to violate — shrink-only.
 ALLOWLIST: set[tuple[str, str]] = set()
 
 

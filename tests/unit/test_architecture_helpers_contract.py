@@ -12,6 +12,7 @@ from tests.unit._architecture_helpers import (
     GUARD_MODULE_PREFIXES,
     assert_anchor_consistency,
     assert_check_rejects_mutation,
+    assert_detector_catches_ast_snippets,
     assert_detector_ignores_ast_snippets,
     assert_violations_match_allowlist,
     iter_architecture_guard_trees,
@@ -21,6 +22,7 @@ from tests.unit._architecture_helpers import (
     postgres_tag_pattern_map,
     rel,
     scan_src,
+    trailing_name,
     uv_version_pattern_map,
 )
 
@@ -70,6 +72,13 @@ def test_iter_call_expressions_subtree_scope() -> None:
     assert len(calls) == 1
     assert isinstance(calls[0].func, ast.Name)
     assert calls[0].func.id == "inner_call"
+
+
+@pytest.mark.arch_guard
+def test_trailing_name_reads_a_name_or_an_attribute_and_nothing_else() -> None:
+    assert trailing_name(ast.parse("Foo", mode="eval").body) == "Foo"
+    assert trailing_name(ast.parse("mod.Foo", mode="eval").body) == "Foo"
+    assert trailing_name(ast.parse("handlers[0]", mode="eval").body) is None
 
 
 @pytest.mark.arch_guard
@@ -279,12 +288,13 @@ def test_scan_src_does_not_raise_when_nothing_is_suppressed(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# The negative snippet helper and the config-mutation probe.
+# The two snippet helpers and the config-mutation probe.
 #
-# The first is the inverse of assert_detector_catches_ast_snippets: a detector
-# that flags a legitimate shape is as wrong as one that misses a violation. The
-# second grades a guard that reads a config file rather than the AST: copy the
-# inputs, confirm the check passes, break the copy, confirm the check now fails.
+# The negative helper is the inverse of assert_detector_catches_ast_snippets: a
+# detector that flags a legitimate shape is as wrong as one that misses a
+# violation. The probe grades a guard that reads a config file rather than the
+# AST: copy the inputs, confirm the check passes, break the copy, confirm the
+# check now fails.
 # ---------------------------------------------------------------------------
 
 
@@ -296,6 +306,18 @@ def test_ignores_helper_passes_on_clean_snippets_and_fails_on_a_flagged_one():
     assert_detector_ignores_ast_snippets(_flag_prints, snippets={"clean": "x = 1\n"})
     with pytest.raises(AssertionError, match="dirty"):
         assert_detector_ignores_ast_snippets(_flag_prints, snippets={"dirty": "print(1)\n"})
+
+
+def test_catches_helper_passes_on_a_flagged_snippet_and_fails_on_a_missed_one():
+    assert_detector_catches_ast_snippets(_flag_prints, snippets={"dirty": "print(1)\n"})
+    with pytest.raises(AssertionError, match="clean"):
+        assert_detector_catches_ast_snippets(_flag_prints, snippets={"clean": "x = 1\n"})
+
+
+@pytest.mark.parametrize("helper", [assert_detector_catches_ast_snippets, assert_detector_ignores_ast_snippets])
+def test_snippet_helpers_refuse_an_empty_snippet_dict(helper):
+    with pytest.raises(AssertionError, match="grades nothing"):
+        helper(_flag_prints, snippets={})
 
 
 def test_rejects_mutation_helper_demands_a_pass_then_a_failure(tmp_path):
@@ -323,6 +345,7 @@ def test_rejects_mutation_helper_demands_a_pass_then_a_failure(tmp_path):
 
 def test_guard_inventory_covers_the_three_prefixes():
     paths = {rel.name for _tree, rel in iter_architecture_guard_trees()}
+    assert any(p.startswith("test_architecture_") for p in paths)
     assert any(p.startswith("test_guards_") for p in paths)
     assert any(p.startswith("test_ast_grep_") for p in paths)
     assert all(p.startswith(GUARD_MODULE_PREFIXES) for p in paths)

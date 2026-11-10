@@ -47,6 +47,7 @@ from tests.unit._architecture_helpers import (
     assert_violations_match_allowlist,
     class_base_index,
     derives_from_env,
+    env_class_defs,
     iter_test_module_trees,
     repo_root,
 )
@@ -175,9 +176,7 @@ def _scan_method_defs(method_names: frozenset[str]) -> set[tuple[str, str, str]]
     for path, tree in modules:
         if path == _BASE_MODULE:
             continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ClassDef) or not derives_from_env(node.name, index):
-                continue
+        for node in env_class_defs(tree, index):
             for stmt in node.body:
                 if isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef) and stmt.name in method_names:
                     found.add((path, node.name, stmt.name))

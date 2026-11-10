@@ -1,10 +1,13 @@
 """Guard: the app and its test clients are built by the harness and nowhere else.
 
 A test takes its app and its client from the harness: the ``admin_client`` fixture,
-``env.get_rest_client()``, or ``tests/helpers/admin_session.admin_test_app()``. A test module
-that calls ``create_app(...)``, ``Flask(...)``, ``TestClient(...)`` or ``app.test_client()``
-builds a second app. The harness does not configure that app, so a patch that the harness
-applies misses it.
+``env.get_rest_client()``, or ``tests/helpers/admin_session.admin_test_app()``. The two
+``admin_client`` fixture bodies, in ``tests/admin/conftest.py`` and ``tests/integration/conftest.py``,
+still build their app and client themselves, so they are rows (#2536) until that app is built
+under ``tests/harness/`` by a planned ``AdminEnv``; the exemption is not widened to cover them. A
+test module that calls ``create_app(...)``, ``Flask(...)``, ``FastAPI(...)``, ``TestClient(...)``
+or ``app.test_client()`` builds a second app. The harness does not configure that app, so a patch
+that the harness applies misses it.
 
 The scan reads the AST of every module under ``tests/`` except ``tests/harness/`` and
 ``tests/helpers/``, where the harness and its shared helpers build the apps. It flags a call to a
@@ -38,7 +41,7 @@ from tests.unit._architecture_helpers import (
 )
 
 #: Callees that build the app or a client for it, matched by name whether bare or an attribute.
-APP_CONSTRUCTORS: frozenset[str] = frozenset({"create_app", "Flask", "TestClient"})
+APP_CONSTRUCTORS: frozenset[str] = frozenset({"create_app", "Flask", "FastAPI", "TestClient"})
 
 #: The method that hands out a Flask test client, matched as an attribute only.
 CLIENT_METHOD = "test_client"
@@ -103,6 +106,22 @@ KNOWN_APP_CONSTRUCTIONS: frozenset[tuple[str, str]] = frozenset(
             "test_real_a2a_get_adcp_capabilities_over_http_returns_integer_replay_ttl",
         ),  # FIXME(#2536)
         ("tests/integration/test_admin_ingest_url_policy.py", "management_api_client"),  # FIXME(#2536)
+        (
+            "tests/integration/test_app_lifespan_shutdown.py",
+            "test_constructing_the_webhook_service_registers_no_shutdown_callback",
+        ),  # FIXME(#2536)
+        (
+            "tests/integration/test_app_lifespan_shutdown.py",
+            "test_lifespan_awaits_every_registered_shutdown_callback",
+        ),  # FIXME(#2536)
+        (
+            "tests/integration/test_app_lifespan_shutdown.py",
+            "test_lifespan_safe_when_no_callbacks_registered",
+        ),  # FIXME(#2536)
+        (
+            "tests/integration/test_app_lifespan_shutdown.py",
+            "test_lifespan_swallows_a_failing_shutdown_callback",
+        ),  # FIXME(#2536)
         ("tests/integration/test_audit_decorator.py", "test_decorator_extracts_custom_details"),  # FIXME(#2536)
         ("tests/integration/test_audit_decorator.py", "test_decorator_filters_password_fields"),  # FIXME(#2536)
         ("tests/integration/test_audit_decorator.py", "test_decorator_filters_sensitive_json_fields"),  # FIXME(#2536)
@@ -254,9 +273,10 @@ def find_app_constructions(tree: ast.Module) -> list[int]:
 def scan() -> set[tuple[str, str]]:
     """``(path, enclosing function)`` for each app or client construction outside the harness.
 
-    A call in a nested function keys under the innermost function. A call at module level, or in a
-    class body outside any method, keys under ``"<module>"``, which is what
-    ``walk_with_enclosing_function`` gives.
+    A call in a nested function keys under the innermost function. A call at module level, or in
+    the body of a module-level class outside any method, keys under ``"<module>"``, which is what
+    ``walk_with_enclosing_function`` gives. A call in the body of a class defined inside a function
+    keys under that function.
     """
     return {
         (path, function)
@@ -274,6 +294,7 @@ def test_flags_each_construction_form():
             "create_app at module level": "app = create_app()\n",
             "qualified create_app": "app = admin.create_app(settings=s)\n",
             "Flask": "app = Flask(__name__)\n",
+            "FastAPI": "app = FastAPI(lifespan=app_lifespan)\n",
             "TestClient": "client = TestClient(app)\n",
             "test_client method": "with app.test_client() as c:\n    pass\n",
         },

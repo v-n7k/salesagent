@@ -36,7 +36,7 @@ from tests.unit._architecture_helpers import (
     assert_detector_ignores_ast_snippets,
     assert_violations_match_allowlist,
     class_base_index,
-    derives_from_env,
+    env_class_defs,
     iter_test_module_trees,
 )
 
@@ -68,14 +68,9 @@ KNOWN_PRIVATE_ENV_SUBCLASSES: frozenset[tuple[str, str]] = frozenset(
 )
 
 
-def _env_subclass_nodes(tree: ast.Module, index: dict[str, set[str]]) -> list[ast.ClassDef]:
-    """Every class in *tree*, at any depth, whose name derives from an env root."""
-    return [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and derives_from_env(node.name, index)]
-
-
 def find_private_env_subclasses(tree: ast.Module, index: dict[str, set[str]]) -> list[int]:
     """Line numbers of the classes in *tree* that derive from a harness env root."""
-    return sorted(node.lineno for node in _env_subclass_nodes(tree, index))
+    return sorted(node.lineno for node in env_class_defs(tree, index))
 
 
 def scan() -> set[tuple[str, str]]:
@@ -90,13 +85,14 @@ def scan() -> set[tuple[str, str]]:
         (path, node.name)
         for path, tree in modules
         if not path.startswith(_HARNESS_DIR)
-        for node in _env_subclass_nodes(tree, index)
+        for node in env_class_defs(tree, index)
     }
 
 
-#: Stand-ins for the classes a snippet derives from but cannot define: ``IntegrationEnv`` derives
-#: from ``BaseTestEnv``, and ``_LiveDBEnv`` (tests/e2e/utils.py) is a shim with no env base.
-_INDEX = {"IntegrationEnv": {"BaseTestEnv"}, "_LiveDBEnv": set()}
+#: Stand-in for the harness class a snippet derives from but cannot define: ``TaskManagementEnv``
+#: (tests/harness/task_management.py) derives from the root ``IntegrationEnv``, so a snippet class
+#: built on it reaches a root only through a second hop.
+_INDEX = {"TaskManagementEnv": {"IntegrationEnv"}}
 
 
 def _detect(tree: ast.Module) -> list[int]:
@@ -110,7 +106,8 @@ def test_flags_a_subclass_at_module_level_and_inside_a_function():
         snippets={
             "module level": "class _RepoEnv(IntegrationEnv):\n    EXTERNAL_PATCHES = {}\n",
             "inside a test": "def test_x():\n    class _E(IntegrationEnv):\n        pass\n",
-            "through a local mixin": "class _M:\n    pass\nclass _E(_M, BareIntegrationEnv):\n    pass\n",
+            "mixin beside a root": "class _M:\n    pass\nclass _E(_M, BareIntegrationEnv):\n    pass\n",
+            "through a harness env": "class _GetTaskEnv(TaskManagementEnv):\n    pass\n",
         },
     )
 

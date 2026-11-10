@@ -2,9 +2,9 @@
 
 A guard that has never been seen to fail is not known to grade anything
 (tests/unit/CLAUDE.md, "A guard must be seen to fail"). The shared helpers in
-``tests/unit/_architecture_helpers.py`` each show one kind of guard failing on a
-known defect, and this guard requires every guard module to call at least one of
-them (``SELF_TEST_HELPERS``):
+``tests/unit/_architecture_helpers.py`` let a guard module run its own check on known
+input: a known defect, known-good source, or a probe staged for an ast-grep rule. This
+guard requires every guard module to call at least one of them (``SELF_TEST_HELPERS``):
 
 - ``assert_detector_catches_ast_snippets``: an AST detector flags known-bad source.
 - ``assert_detector_ignores_ast_snippets``: the detector passes known-good source.
@@ -224,7 +224,10 @@ def find_guards_without_self_test(tree: ast.Module) -> list[int]:
 
     Ceiling: a call anywhere in the module counts, including one in a function that no
     test calls. If that proves too lenient, require the call to sit inside a ``test_*``
-    function.
+    function. A call also counts whatever detector it passes: one that flags every snippet
+    (``assert_detector_catches_ast_snippets(lambda tree: [1], snippets=...)``) passes the
+    helper without grading the guard's own scan, and neither this guard nor the helper can
+    tell. The helpers refuse only an empty ``snippets`` dict.
     """
     return [] if called_function_names(tree) & SELF_TEST_HELPERS else [1]
 
@@ -245,6 +248,7 @@ def test_meta_guard_flags_a_module_with_no_helper_call():
         snippets={
             "assert only": "def test_x():\n    assert scan() == set()\n",
             "hand-rolled self-test": "def test_self():\n    assert find(ast.parse('bad()'))\n",
+            "import only": "from tests.unit._architecture_helpers import write_ast_grep_probe\n",
         },
     )
 

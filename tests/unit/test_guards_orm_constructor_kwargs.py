@@ -27,7 +27,7 @@ from tests.unit._architecture_helpers import assert_violations_match_allowlist
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODELS_MODULE = "src.core.database.models"
 
-# (file, class, kwarg) triples permitted to violate — shrink-only.
+# (file, class) pairs permitted to violate — shrink-only.
 ALLOWLIST: set[tuple[str, str]] = set()
 
 

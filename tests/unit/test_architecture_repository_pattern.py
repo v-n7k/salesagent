@@ -79,6 +79,9 @@ IMPL_SESSION_ALLOWLIST: set[tuple[str, str]] = set()
 # ---------------------------------------------------------------------------
 
 
+# The names _discover_integration_test_files, INTEGRATION_TEST_FILES and
+# INTEGRATION_SESSION_ADD_ALLOWLIST predate the widening of this scan to every tracked .py
+# under tests/; they cover the whole tests/ tree, not only tests/integration/.
 def _discover_integration_test_files() -> list[str]:
     """Every git-tracked ``.py`` file under ``tests/``, from one glob.
 
@@ -103,7 +106,7 @@ def _discover_integration_test_files() -> list[str]:
 INTEGRATION_TEST_FILES = _discover_integration_test_files()
 
 # Pre-existing violations: (file_path, function_or_fixture_name)
-# FIXME(#2133): integration tests should use polyfactory fixtures
+# FIXME(#2133): integration tests should use factory-boy factories
 INTEGRATION_SESSION_ADD_ALLOWLIST = {
     # tests/utils/** — the SAME pre-existing violations, at the address they moved to.
     # Two rows were removed from this allowlist as "removed by the consolidation"; the
@@ -672,7 +675,7 @@ class TestImplNoDirectDbSession:
 class TestIntegrationTestsNoInlineSessionAdd:
     """Test modules under tests/ must use factories/fixtures, not inline session.add().
 
-    Test data setup belongs in polyfactory-based fixtures defined in conftest.py,
+    Test data setup belongs in factory-boy factories and the conftest.py fixtures built on them,
     not scattered across test bodies as raw ORM model construction.
     """
 
@@ -685,7 +688,7 @@ class TestIntegrationTestsNoInlineSessionAdd:
             INTEGRATION_SESSION_ADD_ALLOWLIST,
             header="New session.add() / add_all() calls in test modules under tests/ (use factories instead):",
             fix_hint=(
-                "Fix: Use a polyfactory fixture instead of inline model construction. "
+                "Fix: Use a factory-boy factory instead of inline model construction. "
                 "See CLAUDE.md Pattern #8 for the factory pattern."
             ),
         )

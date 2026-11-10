@@ -28,6 +28,7 @@ import tempfile
 import uuid
 import warnings
 from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Set as AbstractSet
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -176,10 +177,9 @@ def _base_names(cls: ast.ClassDef) -> set[str]:
 def class_base_index(modules: list[tuple[str, ast.Module]]) -> dict[str, set[str]]:
     """``class name -> union of its base-class names`` across the whole tests tree.
 
-    Nested classes (defined inside a function body — the exact shape both
-    out-of-harness env definitions take) are included: ``ast.walk`` descends
-    into function bodies, so a ``class _TestEnv(BaseTestEnv)`` written inside a
-    test function is indexed like a module-level one.
+    Classes nested in a function body are included: ``ast.walk`` descends into
+    function bodies, so a ``class _TestEnv(BaseTestEnv)`` written inside a test
+    function is indexed like a module-level one.
     """
     index: dict[str, set[str]] = {}
     for _path, tree in modules:
@@ -205,6 +205,11 @@ def derives_from_env(name: str, index: dict[str, set[str]]) -> bool:
                 return True
             frontier.append(base)
     return False
+
+
+def env_class_defs(tree: ast.Module, index: dict[str, set[str]]) -> list[ast.ClassDef]:
+    """Every class in *tree*, at any depth, whose name derives from an env root through *index*."""
+    return [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and derives_from_env(node.name, index)]
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +511,7 @@ def _snippet_labels(
     flagged: bool,
 ) -> list[str]:
     """Labels of the snippets whose detector verdict (flags something or not) equals *flagged*."""
+    assert snippets, "a snippet helper with no snippets grades nothing"
     return [
         label
         for label, source in snippets.items()
@@ -552,12 +558,18 @@ def assert_check_rejects_mutation(
     is copied to the same relative path in a fresh temporary directory, and *check*
     and *mutate* receive that directory, so the real tree is never touched. A *check*
     that fails on the unmutated copy raises its own error. One that passes after
-    *mutate* fails with ``check accepted the mutated copy: <mutate.__name__>``.
+    *mutate* fails with ``check accepted the mutated copy: <mutate.__name__>``. Only an
+    ``AssertionError`` from the second *check* counts as a rejection; any other exception
+    it raises propagates.
     """
     root = repo_root() if source_root is None else source_root
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp = Path(tmp_dir)
         for path in paths:
+            assert not Path(path).is_absolute(), (
+                f"{path} is absolute; each path is copied under a temporary directory, so it must be "
+                "relative to source_root"
+            )
             dest = tmp / path
             dest.parent.mkdir(parents=True, exist_ok=True)
             if (root / path).is_dir():
@@ -1531,12 +1543,15 @@ def iter_pre_commit_hooks(
 
 
 def assert_violations_match_allowlist(
-    found: set[tuple],
-    allowlist: set[tuple],
+    found: AbstractSet[Any],
+    allowlist: AbstractSet[Any],
     *,
     fix_hint: str = "",
 ) -> None:
     """Assert that the actual-found set equals the allowlist.
+
+    Either argument is a ``set`` or a ``frozenset`` of rows, and a row is any value that
+    ``sorted`` can order (a tuple, a string), because the failure message lists rows in order.
 
     Raises with two distinct error modes:
     - "new violations" — entries in `found` not in `allowlist`
