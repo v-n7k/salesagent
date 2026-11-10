@@ -21,6 +21,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.unit._architecture_helpers import call_callee_name, iter_call_expressions
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCAN_ROOT = REPO_ROOT / "src"
 SANCTIONED = SCAN_ROOT / "core" / "validation_helpers.py"
@@ -45,24 +47,14 @@ VALIDATION_ERROR_NAMES = _validation_error_class_names()
 
 
 def _contains_format_validation_error_call(node: ast.AST) -> bool:
-    for sub in ast.walk(node):
-        if isinstance(sub, ast.Call):
-            fn = sub.func
-            name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
-            if name == "format_validation_error":
-                return True
-    return False
+    return any(iter_call_expressions(node, name="format_validation_error"))
 
 
 def find_handrolled_boundaries(tree: ast.AST) -> list[str]:
     """Unparsed source for AdCPValidationError(-subclass)(...) wrapping format_validation_error(...)."""
     offenders: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        fn = node.func
-        name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
-        if name not in VALIDATION_ERROR_NAMES:
+    for node in iter_call_expressions(tree):
+        if call_callee_name(node) not in VALIDATION_ERROR_NAMES:
             continue
         args_and_kwargs: list[ast.AST] = [*node.args, *[kw.value for kw in node.keywords]]
         if any(_contains_format_validation_error_call(a) for a in args_and_kwargs):

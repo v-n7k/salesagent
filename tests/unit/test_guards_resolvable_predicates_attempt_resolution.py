@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import ast
 
-from tests.unit._architecture_helpers import REPO_ROOT
+from tests.unit._architecture_helpers import REPO_ROOT, called_function_names
 
 _SIGNING_DIR = REPO_ROOT / "src" / "core" / "signing"
 _REAL_RESOLVERS = {"resolve_signing_material", "_resolve_signing_provider"}
@@ -28,13 +28,7 @@ ALLOWLIST: set[str] = set()
 
 
 def _calls_a_real_resolver(node: ast.FunctionDef) -> bool:
-    for child in ast.walk(node):
-        if isinstance(child, ast.Call):
-            func = child.func
-            name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
-            if name in _REAL_RESOLVERS:
-                return True
-    return False
+    return bool(called_function_names(node) & _REAL_RESOLVERS)
 
 
 def _scan() -> set[str]:

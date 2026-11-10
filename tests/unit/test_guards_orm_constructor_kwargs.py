@@ -22,6 +22,7 @@ from pathlib import Path
 from sqlalchemy.orm import class_mapper
 
 from src.core.database.models import Base
+from tests.unit._architecture_helpers import assert_violations_match_allowlist
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODELS_MODULE = "src.core.database.models"
@@ -86,10 +87,16 @@ class TestOrmConstructorKwargsGuard:
         )
 
     def test_allowlist_entries_still_violate(self):
-        """Stale-entry check: every allowlisted (file, class) still has a violation."""
+        """The allowlist equals the violating (file, class) pairs: a stale entry or an unlisted one fails."""
         actual = {(v[0], v[1]) for v in _scan_src()}
-        stale = ALLOWLIST - actual
-        assert not stale, f"Allowlist entries no longer violating — remove them: {sorted(stale)}"
+        assert_violations_match_allowlist(
+            actual,
+            ALLOWLIST,
+            fix_hint=(
+                "Construct the ORM class with kwargs its mapper has. "
+                "Remove an entry once its (file, class) pair no longer violates."
+            ),
+        )
 
 
 class TestGuardMetaTests:

@@ -20,6 +20,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.unit._architecture_helpers import assert_violations_match_allowlist
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TESTS_DIR = REPO_ROOT / "tests"
 
@@ -100,8 +102,14 @@ class TestNoAdhocTestClientBypassGuard:
 
     def test_allowlist_entries_still_violate(self):
         actual = set(_scan())
-        stale = ALLOWLIST - actual
-        assert not stale, f"Allowlist entries no longer violating — remove them: {sorted(stale)}"
+        assert_violations_match_allowlist(
+            actual,
+            ALLOWLIST,
+            fix_hint=(
+                "Use env.inject_untyped_exception(...) + env.call_via(Transport.REST, ...) instead of "
+                "TestClient(raise_server_exceptions=False). Remove an entry once its site is gone."
+            ),
+        )
 
 
 class TestGuardMetaTests:

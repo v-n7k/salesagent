@@ -70,6 +70,8 @@ import ast
 from collections.abc import Iterator
 from pathlib import Path
 
+from tests.unit._architecture_helpers import call_callee_name, iter_call_expressions
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 
@@ -118,12 +120,8 @@ def _call_sites(root: Path, *, modules: frozenset[str], callees: frozenset[str])
         rel = path.relative_to(root).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
         names = _local_names(tree, modules=modules, callees=callees)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            callee = node.func
-            name = callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", None)
-            if name in names:
+        for node in iter_call_expressions(tree):
+            if call_callee_name(node) in names:
                 yield rel, node
 
 

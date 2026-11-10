@@ -22,6 +22,8 @@ import ast
 import re
 from pathlib import Path
 
+from tests.unit._architecture_helpers import assert_violations_match_allowlist
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: Capability-gap phrasing. Matched against the joined literal fragments of
@@ -87,15 +89,25 @@ class TestAdapterCapabilityRaiseGuard:
         )
 
     def test_allowlist_prefixes_still_match_a_site(self):
-        """Stale-entry check: every allowlisted prefix still has a live site."""
-        live: set[str] = set()
+        """The allowlisted prefixes cover exactly the live sites.
+
+        A site is keyed by every allowlisted prefix its message starts with, or by its
+        own message when no prefix covers it. A prefix that matches no site is then a
+        stale entry, and a site no prefix covers is a new violation.
+        """
+        found: set[str] = set()
         for path in (REPO_ROOT / "src" / "adapters").rglob("*.py"):
             for msg, _ in _find_capability_valueerrors(ast.parse(path.read_text())):
-                for prefix in ALLOWLIST_PREFIXES:
-                    if msg.startswith(prefix):
-                        live.add(prefix)
-        stale = ALLOWLIST_PREFIXES - live
-        assert not stale, f"Allowlist prefixes with no matching site — remove them: {sorted(stale)}"
+                found |= {prefix for prefix in ALLOWLIST_PREFIXES if msg.startswith(prefix)} or {msg}
+        assert_violations_match_allowlist(
+            found,
+            ALLOWLIST_PREFIXES,
+            fix_hint=(
+                "A capability-gap raise must use AdCPCapabilityNotSupportedError "
+                "(UNSUPPORTED_FEATURE/correctable), not bare ValueError. Remove a prefix "
+                "from ALLOWLIST_PREFIXES once no site matches it."
+            ),
+        )
 
 
 class TestGuardMetaTests:

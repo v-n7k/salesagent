@@ -42,12 +42,8 @@ instead.
 from __future__ import annotations
 
 import ast
-from pathlib import Path
 
-# Derived locally rather than imported from ``tests.unit._architecture_helpers``: this
-# guard needs one Path constant and nothing else from that 1700-line module, and
-# importing it would make a pure-AST check depend on the whole helper surface loading.
-REPO_ROOT = Path(__file__).resolve().parents[2]
+from tests.unit._architecture_helpers import REPO_ROOT, called_function_names
 
 CANONICAL_MODULE = REPO_ROOT / "src" / "core" / "schemas" / "_base.py"
 FUNCTION_NAME = "canonical_agent_url"
@@ -76,13 +72,7 @@ def function_delegates_to_signing_gate(func: ast.FunctionDef | ast.AsyncFunction
     Shared predicate so the real-source test and the positive/negative
     meta-tests exercise the exact same logic.
     """
-    for node in ast.walk(func):
-        if isinstance(node, ast.Call):
-            callee = node.func
-            name = callee.attr if isinstance(callee, ast.Attribute) else getattr(callee, "id", None)
-            if name in REQUIRED_CALLEES:
-                return True
-    return False
+    return bool(called_function_names(func) & REQUIRED_CALLEES)
 
 
 def _module_tree() -> ast.Module:

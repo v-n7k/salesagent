@@ -9,10 +9,12 @@ from pathlib import Path
 import pytest
 
 from tests.unit._architecture_helpers import (
+    GUARD_MODULE_PREFIXES,
     assert_anchor_consistency,
     assert_check_rejects_mutation,
     assert_detector_ignores_ast_snippets,
     assert_violations_match_allowlist,
+    iter_architecture_guard_trees,
     iter_call_expressions,
     iter_git_tracked_files,
     postgres_image_ref,
@@ -311,3 +313,16 @@ def test_rejects_mutation_helper_demands_a_pass_then_a_failure(tmp_path):
     assert_check_rejects_mutation(check, paths=["pin.txt"], mutate=bump, source_root=tmp_path)
     with pytest.raises(AssertionError, match="check accepted the mutated copy: noop"):
         assert_check_rejects_mutation(check, paths=["pin.txt"], mutate=noop, source_root=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# The guard inventory. Guard modules are spelled with three prefixes, and a
+# meta-guard that reads the inventory grades only the modules it yields.
+# ---------------------------------------------------------------------------
+
+
+def test_guard_inventory_covers_the_three_prefixes():
+    paths = {rel.name for _tree, rel in iter_architecture_guard_trees()}
+    assert any(p.startswith("test_guards_") for p in paths)
+    assert any(p.startswith("test_ast_grep_") for p in paths)
+    assert all(p.startswith(GUARD_MODULE_PREFIXES) for p in paths)

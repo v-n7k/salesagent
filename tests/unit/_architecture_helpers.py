@@ -865,14 +865,24 @@ def find_raw_select_violations(
     return violations
 
 
+#: The file-name prefixes a structural guard module in ``tests/unit/`` is spelled with.
+GUARD_MODULE_PREFIXES: tuple[str, ...] = ("test_architecture_", "test_guards_", "test_ast_grep_")
+
+
 def iter_architecture_guard_trees(
     *,
     exempt: Iterable[Path] | None = None,
 ) -> Iterator[tuple[ast.Module, Path]]:
-    """Yield ``(parsed_tree, repo_relative_path)`` for each ``test_architecture_*.py`` module."""
+    """Yield ``(parsed_tree, repo_relative_path)`` for each guard module in ``tests/unit/``.
+
+    A guard module is one whose name starts with any of ``GUARD_MODULE_PREFIXES``.
+    The paths of all the prefixes are sorted together, so the order follows the path
+    and not the prefix.
+    """
     repo = repo_root()
     skip = set(exempt or ())
-    for path in sorted((repo / "tests" / "unit").glob("test_architecture_*.py")):
+    unit_dir = repo / "tests" / "unit"
+    for path in sorted(p for p in unit_dir.glob("test_*.py") if p.name.startswith(GUARD_MODULE_PREFIXES)):
         rel = path.relative_to(repo)
         if rel in skip:
             continue

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import ast
 
-from tests.unit._architecture_helpers import REPO_ROOT, iter_module_trees
+from tests.unit._architecture_helpers import REPO_ROOT, iter_call_expressions, iter_module_trees
 
 SRC_ROOT = REPO_ROOT / "src"
 
@@ -44,13 +44,7 @@ def find_structured_content_calls_outside_helper(src_files: dict[str, ast.AST]) 
     for path, tree in sorted(src_files.items()):
         if path == "src/core/tools/_mcp.py":
             continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            fn = node.func
-            name = fn.id if isinstance(fn, ast.Name) else (fn.attr if isinstance(fn, ast.Attribute) else None)
-            if name != "ToolResult":
-                continue
+        for node in iter_call_expressions(tree, name="ToolResult"):
             for kw in node.keywords:
                 if kw.arg == "structured_content":
                     offenders.append(f"{path}:{node.lineno}")

@@ -19,6 +19,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.unit._architecture_helpers import assert_violations_match_allowlist
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: JSONType collections with concurrent-append semantics.
@@ -76,10 +78,16 @@ class TestJsontypeAppendRmwGuard:
         )
 
     def test_allowlist_entries_still_violate(self):
-        """Stale-entry check: every allowlisted pair still has a live violation."""
+        """The allowlist equals the live violations: a stale entry or an unlisted violation fails."""
         actual = {(v[0], v[1]) for v in _scan_src()}
-        stale = ALLOWLIST - actual
-        assert not stale, f"Allowlist entries no longer violating — remove them: {sorted(stale)}"
+        assert_violations_match_allowlist(
+            actual,
+            ALLOWLIST,
+            fix_hint=(
+                "Append through the atomic append (append_step_comment / jsonb_list_append). "
+                "Remove an entry once its pair no longer violates."
+            ),
+        )
 
 
 class TestGuardMetaTests:

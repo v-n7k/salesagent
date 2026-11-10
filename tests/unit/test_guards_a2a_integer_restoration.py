@@ -38,6 +38,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.unit._architecture_helpers import assert_violations_match_allowlist
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: The construction sites the integer-restoration fix actually covers: ``_dict_to_value``
@@ -237,12 +239,13 @@ class TestIntegerSetMatchesTheSchemas:
         known_ambiguous = frozenset({"impressions", "limit"})
 
         ambiguous = A2A_WIRE_INTEGER_FIELDS & number_names
-        new = sorted(ambiguous - known_ambiguous)
-        assert not new, (
-            f"{new} are listed for int coercion but the pinned schemas also declare them "
-            f"`number` somewhere. A whole-valued float at that key would be retyped to int "
-            f"on the wire. Narrow the coercion (key it on the response type, not the bare "
-            f"name) rather than widening this set."
+        assert_violations_match_allowlist(
+            ambiguous,
+            known_ambiguous,
+            fix_hint=(
+                "A new name is listed for int coercion although the pinned schemas also declare it "
+                "`number` somewhere, so a whole-valued float at that key would be retyped to int on "
+                "the wire. Narrow the coercion (key it on the response type, not the bare name) "
+                "rather than widening known_ambiguous. A stale entry is no longer ambiguous: delete it."
+            ),
         )
-        stale = sorted(known_ambiguous - ambiguous)
-        assert not stale, f"known_ambiguous lists {stale}, no longer ambiguous -- delete the entry"

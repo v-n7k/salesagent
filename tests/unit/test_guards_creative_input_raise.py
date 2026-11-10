@@ -20,6 +20,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.unit._architecture_helpers import assert_violations_match_allowlist
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _BANNED = {"ValueError", "Exception"}
@@ -67,8 +69,14 @@ class TestCreativeInputRaiseGuard:
 
     def test_allowlist_entries_still_violate(self):
         actual = {(v[0], v[1]) for v in _scan()}
-        stale = ALLOWLIST - actual
-        assert not stale, f"Allowlist entries no longer violating — remove them: {sorted(stale)}"
+        assert_violations_match_allowlist(
+            actual,
+            ALLOWLIST,
+            fix_hint=(
+                "A creative-input rejection raises AdCPCreativeRejectedError; an internal "
+                "invariant raises AssertionError. Remove an entry once its (file, exception) pair no longer violates."
+            ),
+        )
 
 
 class TestGuardMetaTests:
