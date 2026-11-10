@@ -141,6 +141,15 @@ def collect_error_aliases(tree: ast.AST) -> set[str]:
     return aliases
 
 
+def trailing_name(node: ast.expr) -> str | None:
+    """``Foo`` for ``Foo`` and for ``mod.Foo``; ``None`` for any other expression."""
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Harness-env class index — which classes under tests/ derive from an env root
 # ---------------------------------------------------------------------------
@@ -164,13 +173,7 @@ def iter_test_module_trees() -> list[tuple[str, ast.Module]]:
 
 def _base_names(cls: ast.ClassDef) -> set[str]:
     """Base-class NAMES of *cls* — ``Foo`` and ``mod.Foo`` both yield ``Foo``."""
-    names: set[str] = set()
-    for base in cls.bases:
-        if isinstance(base, ast.Name):
-            names.add(base.id)
-        elif isinstance(base, ast.Attribute):
-            names.add(base.attr)
-    return names
+    return {name for base in cls.bases if (name := trailing_name(base)) is not None}
 
 
 def class_base_index(modules: list[tuple[str, ast.Module]]) -> dict[str, set[str]]:
@@ -248,7 +251,7 @@ def orm_model_class_defs() -> Iterator[ast.ClassDef]:
         if not isinstance(node, ast.ClassDef) or node.name == "Base":
             continue
         for base in node.bases:
-            base_name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
+            base_name = trailing_name(base)
             if base_name in _ORM_MODEL_BASES:
                 yield node
                 break
@@ -300,7 +303,7 @@ def _class_body_column_assignments(cls: ast.ClassDef) -> Iterator[tuple[str, ast
         value = stmt.value
         if not isinstance(value, ast.Call):
             continue
-        func_name = value.func.attr if isinstance(value.func, ast.Attribute) else getattr(value.func, "id", None)
+        func_name = trailing_name(value.func)
         if func_name in {"mapped_column", "Column"}:
             yield target, value
 
@@ -327,7 +330,7 @@ def _model_unique_keys(cls: ast.ClassDef) -> Iterator[UniqueKey]:
             yield UniqueKey(cls.name, f"{cls.name}.{column}", frozenset({column}), "column-unique", True, "")
 
     for call in _table_args_calls(cls):
-        func_name = call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, "id", None)
+        func_name = trailing_name(call.func)
         if func_name == "UniqueConstraint":
             columns, expressions = _string_columns(list(call.args))
             name = next(
@@ -395,7 +398,7 @@ def handles_integrity_error(handler: ast.ExceptHandler) -> bool:
         return False
     candidates = node.elts if isinstance(node, ast.Tuple) else [node]
     for candidate in candidates:
-        name = candidate.attr if isinstance(candidate, ast.Attribute) else getattr(candidate, "id", None)
+        name = trailing_name(candidate)
         if name == "IntegrityError":
             return True
     return False
@@ -495,9 +498,7 @@ def structural_guard_marker_re(guard_name: str) -> re.Pattern[str]:
 
 def _base_expr_is_tenant(node: ast.expr) -> bool:
     """True when *node* is a tenant reference (``tenant``, ``self.tenant``, ``ctx.tenant``, …)."""
-    if isinstance(node, ast.Name) and node.id == "tenant":
-        return True
-    return isinstance(node, ast.Attribute) and node.attr == "tenant"
+    return trailing_name(node) == "tenant"
 
 
 def _snippet_labels(
@@ -592,17 +593,11 @@ def find_plain_json_column_violations(tree: ast.Module) -> list[int]:
     """Return line numbers of mapped_column/Column calls using plain JSON."""
     lines: list[int] = []
     for call in iter_call_expressions(tree):
-        func_name: str | None = None
-        if isinstance(call.func, ast.Name):
-            func_name = call.func.id
-        elif isinstance(call.func, ast.Attribute):
-            func_name = call.func.attr
+        func_name = trailing_name(call.func)
         if func_name not in {"Column", "mapped_column"} or not call.args:
             continue
         first_arg = call.args[0]
-        uses_plain_json = (isinstance(first_arg, ast.Name) and first_arg.id == "JSON") or (
-            isinstance(first_arg, ast.Attribute) and first_arg.attr == "JSON"
-        )
+        uses_plain_json = trailing_name(first_arg) == "JSON"
         if uses_plain_json:
             lines.append(call.lineno)
     return lines
@@ -756,14 +751,10 @@ def call_callee_name(call: ast.Call) -> str | None:
     lambda. The canonical form: this idiom was hand-rolled at 15 sites across
     13 files in three mutually inconsistent spellings, none of which R0801 sees
     (they are 1-3 line clones, under `min-similarity-lines=6`). Migrating the
-    other sites is tracked separately.
+    other sites is tracked separately. ``trailing_name`` is the general form,
+    for an expression that is not a callee.
     """
-    func = call.func
-    if isinstance(func, ast.Attribute):
-        return func.attr
-    if isinstance(func, ast.Name):
-        return func.id
-    return None
+    return trailing_name(call.func)
 
 
 def find_import_time_fs_io_violations(tree: ast.Module) -> list[int]:
@@ -790,10 +781,7 @@ def iter_call_expressions(tree: ast.AST, name: str | None = None) -> Iterator[as
         if name is None:
             yield node
             continue
-        f = node.func
-        if isinstance(f, ast.Name) and f.id == name:
-            yield node
-        elif isinstance(f, ast.Attribute) and f.attr == name:
+        if trailing_name(node.func) == name:
             yield node
 
 
@@ -809,14 +797,7 @@ def called_function_names(node: ast.AST) -> set[str]:
     guards independently grew this loop, which is what
     ``test_architecture_no_handrolled_call_walk`` exists to prevent.
     """
-    names: set[str] = set()
-    for call in iter_call_expressions(node):
-        func = call.func
-        if isinstance(func, ast.Name):
-            names.add(func.id)
-        elif isinstance(func, ast.Attribute):
-            names.add(func.attr)
-    return names
+    return {name for call in iter_call_expressions(node) if (name := trailing_name(call.func)) is not None}
 
 
 def select_call_model_name(call: ast.Call) -> str | None:
@@ -828,11 +809,7 @@ def select_call_model_name(call: ast.Call) -> str | None:
     if not (isinstance(call.func, ast.Name) and call.func.id == "select") or not call.args:
         return None
     model_arg = call.args[0]
-    if isinstance(model_arg, ast.Name):
-        return model_arg.id
-    if isinstance(model_arg, ast.Attribute):
-        return model_arg.attr
-    return None
+    return trailing_name(model_arg)
 
 
 def extract_select_calls(
