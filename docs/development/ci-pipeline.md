@@ -191,7 +191,8 @@ The job has the following blind spots:
   `integration_db` fixture builds a fresh database with `create_all` from the models of
   the tree under test, so the base run sees the base schema. Only a test that reads
   `adcp_test` directly runs base code on the head schema.
-- An edit that changes only literals, names, or docstrings is not a changed test.
+- An edit that changes only literal values, local names, or docstrings is not a changed
+  test.
 - A test that the AST lists but pytest never collects reads `not collected`. The verdict
   treats it as unhosted and does not fail it.
 
