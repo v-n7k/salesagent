@@ -194,9 +194,10 @@ def verdict(
     2. A title whose type is not gated, or a pull request that changed no production root, is ``advisory``.
     3. A pull request that touched no file under ``tests/`` is a ``fail``.
     4. A pull request whose changed tests are all deleted, in an unhosted suite, or not collected on the
-       head is a ``skip``. The head run does not collect a test that its marker expression deselects (the
-       creative integration group runs in-network, not on this host) or one that pytest does not collect
-       at all, such as a ``test_`` function outside a ``Test`` class or one nested in another function.
+       head is a ``skip``. The head run does not collect a test that its marker expression deselects. That
+       covers the creative integration group, which runs in-network and not on this host, and ``skip_ci``
+       tests. A test in a ``Test`` class that pytest refuses to collect, such as a class with an
+       ``__init__`` method, is not collected either.
     5. A pull request with a hosted changed test that is red on the base and green on the head is a ``pass``.
     6. Any other pull request is a ``fail``. That includes one whose changes under ``tests/`` hold no test
        function, such as a change to a conftest.
