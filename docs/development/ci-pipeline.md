@@ -219,7 +219,8 @@ The job has the following blind spots:
 - A base run can abort before it runs a test, and then it writes no report. The usual
   cause is a conftest that imports a symbol which the PR moved or renamed.
   `tests/integration/conftest.py` imports `create_app` from `src.admin.app` at module
-  level, for one, so pytest exits with code 4 while it loads that conftest on the base.
+  level, for one, so a PR that moves `create_app` makes pytest exit with code 4 while it
+  loads that conftest on the base.
   On a PR that the gate grades, the verdict is `error` with the reason
   `base integration: no report`, or `base integration: unreadable report`. Open the
   "Base run (integration, host groups)" step to read the import error. The

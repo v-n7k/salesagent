@@ -862,7 +862,8 @@ jobs:
   # changed one of those roots must bring a test that is red on the base and green on the head.
   # scripts/ci/redden_on_base.py picks the tests, grades the two runs, and writes the table to the
   # step summary. The four pytest steps continue on error because a red run is the evidence. The
-  # verdict step fails the job on a fail, and also when a run did not complete.
+  # verdict step fails the job on a fail, on a head run that did not complete, and on a base run
+  # that did not complete when the pull request is gated.
   tests-redden-on-base:
     name: Tests Redden On Base
     runs-on: ubuntu-latest

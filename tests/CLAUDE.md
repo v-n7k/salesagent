@@ -668,8 +668,8 @@ file under `src/`, `templates/`, `static/`, or `alembic/`. The `Tests Redden On 
 job checks this rule. It runs the changed tests of the PR on the head, then again with
 those four roots reset to the base. It lists each test with both outcomes in its step
 summary. When the job fails, read that table: a test that is `passed` on both sides did
-not exercise the change. A PR that only deletes tests fails too, because a deleted test
-cannot fail on the base. The job does not run the suites in `tests/admin/`, `tests/bdd/`,
+not exercise the change. A PR that only deletes hosted tests fails too, because a deleted
+test cannot fail on the base. The job does not run the suites in `tests/admin/`, `tests/bdd/`,
 `tests/e2e/`, `tests/quality/`, `tests/smoke/`, `tests/storyboard/`, and `tests/ui/`. Most
 files there hold no `test_` function, such as a feature file, a step module, a
 known-failures ledger, or a conftest. The job lists those files under "Touched without a
