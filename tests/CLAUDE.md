@@ -660,6 +660,18 @@ def then_response_has_formats(ctx, count):
     assert len(wire_field(ctx, "formats")) == count
 ```
 
+**A `fix`, `feat`, or `security` pull request (PR) needs at least one added or changed
+test that fails without its production change.** The rule applies when the PR changes a
+file under `src/`, `templates/`, `static/`, or `alembic/`. The `Tests Redden On Base`
+job checks this rule. It runs the changed tests of the PR on the head, then again with
+those four roots reset to the base. It lists each test with both outcomes in its step
+summary. When the job fails, read that table: a test that is `passed` on both sides did
+not exercise the change. The job cannot run a test in an unhosted suite, such as BDD or
+e2e, or in the creative integration group. Such a test shows as `unhosted` or
+`not collected`, and it counts neither way. See
+[Tests redden on base](../docs/development/ci-pipeline.md#tests-redden-on-base) for the
+verdict rules and the blind spots.
+
 ## Error verification policy
 
 ### Principle: Assert on the wire envelope, not reconstructed exceptions

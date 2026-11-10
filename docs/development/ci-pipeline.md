@@ -18,7 +18,7 @@ git rebase upstream/main
 git diff upstream/main --stat   # target: ~20-30 files, no alembic/versions/ changes
 ```
 
-## Required checks (20 rendered names after PR #1379)
+## Required checks (20 rendered names after PR #1379, plus Tests Redden On Base)
 
 Run `./scripts/capture-rendered-names.sh` after any job rename. The frozen guard
 [`tests/unit/test_architecture_required_ci_checks_frozen.py`](../../tests/unit/test_architecture_required_ci_checks_frozen.py)
@@ -26,6 +26,8 @@ must stay in sync.
 
 PR #1372 (PR3) establishes **18** checks. PR #1379 adds **2 BDD shard** checks
 plus the aggregate `CI / BDD Tests` status proxy (replacing PR3's single BDD job).
+The `tests-redden-on-base` job adds one more, `CI / Tests Redden On Base`, which is
+advisory. See [Tests redden on base](#tests-redden-on-base).
 
 | Rendered check name | Job |
 |---------------------|-----|
@@ -48,7 +50,163 @@ plus the aggregate `CI / BDD Tests` status proxy (replacing PR3's single BDD job
 | `CI / BDD Tests` | aggregate status proxy (shard pass/fail) |
 | `CI / Migration Roundtrip` | alembic upgrade |
 | `CI / Coverage` | `--fail-under` from `.coverage-baseline` using unit + BDD artifacts |
+| `CI / Tests Redden On Base` | PR's changed tests on head and base (advisory) |
 | `CI / Summary` | aggregation gate |
+
+## Tests redden on base
+
+The `tests-redden-on-base` job (`CI / Tests Redden On Base`) runs the tests that a pull
+request (PR) adds or changes twice. It checks that a `fix`, `feat`, or `security` PR
+brings a test that fails without its production change. The job runs on `pull_request`
+only, because a push has no PR base to compare with. Its verdicts are advisory: see
+[What blocks a merge](#what-blocks-a-merge).
+
+### What it runs
+
+The job takes the following steps:
+
+1. Lists the test functions that the PR added, changed, or deleted.
+2. Runs the added and changed tests on the head, which is the merge commit of the PR.
+3. Resets the production roots (`src`, `templates`, `static`, and `alembic`) to `HEAD^1`
+   in place.
+4. Runs the same tests again.
+5. Grades the two runs and writes a table to the step summary.
+
+**The changed set.** The job reads each `test_*.py` file that the PR touched under
+`tests/`. It compares every `test_*` function, and every `test_*` method of a `Test*`
+class, with its version on the base. The comparison lives in
+[`scripts/ci/changed_functions.py`](../../scripts/ci/changed_functions.py) and uses the
+normalized abstract syntax tree (AST) from
+[`scripts/ci/ast_normalize.py`](../../scripts/ci/ast_normalize.py). The normalized form
+ignores docstrings and the values of string, bytes, and number literals. It also ignores
+the names that a function binds, such as parameters, assignment targets, and loop
+variables. An edit that changes only those is not a changed test. A change to `None`,
+`True`, or `False` still counts. A renamed test function reads as an added test, and its
+old name reads as a deleted test.
+
+**The reset.** The job runs `git rm -f -r` on the production roots, then checks them out
+from `HEAD^1`. A file that the PR added under a root is absent on the base. The `-f`
+flag lets `git rm` remove a tracked file that a head run modified, and the checkout
+rebuilds the roots from git. `HEAD^1`, the first parent of that merge commit, is the tip
+of the base branch, so the job fetches two commits. Everything else stays at head:
+tests, `conftest.py` files, `scripts/`, and configs.
+
+**Duration.** Replaying three merged PRs on a laptop, migrations included, took 34, 44,
+and 162 seconds. The job's `timeout-minutes` is 10.
+
+### How pytest is called
+
+Each run is
+`uv run pytest <the changed files> -p scripts.ci.pytest_only_ids --only-ids <ids file>`,
+called through the `_pytest` action. The run also passes
+`--continue-on-collection-errors` and writes a `pytest-json-report` file for each suite
+and side. The plugin in
+[`scripts/ci/pytest_only_ids.py`](../../scripts/ci/pytest_only_ids.py) keeps only the
+changed node ids.
+
+The job gives pytest the files and lets the plugin select the ids. An explicit node id
+that names a test in a module that cannot import makes pytest exit with code 4 and run
+nothing. A module that imports a symbol that the PR added cannot import on the base.
+With files as arguments, pytest records such a module as a failed collector and runs the
+rest. A test in that module reads `error` on the base, which counts as red.
+
+Pytest imports a `-p` plugin before any conftest puts the repository root on `sys.path`,
+so the job sets `PYTHONPATH=.` for `scripts` to resolve.
+
+### Hosted and unhosted suites
+
+A suite is hosted when this job runs its tests. The job hosts the following suites:
+
+| Directory | Hosted | Run |
+|-----------|--------|-----|
+| `tests/unit/` and `tests/harness/` | Yes | One run |
+| `tests/integration/` | Yes, except the creative group and `skip_ci` tests | One run on the job's Postgres service, with `-m "not creative and not skip_ci"` |
+| `tests/bdd/`, `tests/admin/`, `tests/e2e/`, `tests/ui/`, and any other directory | No | Listed as `unhosted`, with `-` in both outcome cells |
+
+The creative integration group needs the
+[reference creative agent](#reference-creative-agent), so CI runs it in-network, inside
+the Docker stack, in the `Integration (creative)` shard. This job does not host that
+group.
+
+A changed test that the head run did not collect shows its suite and `not collected` in
+both outcome cells. The verdict treats such a test as unhosted. That covers the creative
+group and `skip_ci` tests. It also covers a test in a class that pytest does not
+collect, such as a `Test*` class with an `__init__` method.
+
+The storyboard guards under `tests/unit` need the pinned compliance bundle, which the
+`_adcp-bundle` action downloads. This job does not run that action, so those guards read
+`skipped` on both sides and never count as red on the base.
+
+### Verdict rules
+
+The `verdict` function in
+[`scripts/ci/redden_on_base.py`](../../scripts/ci/redden_on_base.py) applies the first
+of the following rules that fits:
+
+| Order | Verdict | When |
+|-------|---------|------|
+| 1 | `error` | A suite with changed tests has no report for a run, or its report records a pytest exit code other than 0, 1, or 5. |
+| 2 | `advisory` | The Conventional Commits type of the PR title is not `fix`, `feat`, or `security`, or no production root changed. The gate does not grade the PR. |
+| 3 | `fail` | The PR touches no file under `tests/`. |
+| 4 | `skip` | Every changed test is deleted, unhosted, or not collected on the head. |
+| 5 | `pass` | Some hosted changed test is red (`failed` or `error`) on the base and `passed` on the head. |
+| 6 | `fail` | None of the earlier rules applies. |
+
+Rule 2 reads the PR title from the event payload. The `pull_request` trigger runs on
+`opened`, `synchronize`, and `reopened`. A re-run reuses the event payload, so a
+retitled PR keeps the verdict of its last push until the next push.
+
+Rule 1 comes first so that a `refactor` title cannot hide a broken job. Codes 2, 3, and
+4 mean interrupted, internal error, and usage error. The gate fails closed: a run that
+did not complete fails the job. Rule 6 also covers a PR whose touched files under
+`tests/` hold no test function, such as a change to a `conftest.py` file.
+
+The job exits with code 1 for `fail` and `error`, and with code 0 for the other
+verdicts.
+
+### The step summary
+
+Whatever the verdict, the verdict step writes a table to the step summary, under the
+heading `Tests redden on base`. Its columns are `test`, `kind`, `suite`, `on base`, and
+`on head`, with one row for each changed test. `kind` is `added`, `changed`, or
+`deleted`. A deleted test and a test in an unhosted suite show `-` in both outcome
+cells. After the table, a list names the touched files under `tests/` that hold no
+changed test function.
+
+The base runs of a `fix` PR fail by design. The four pytest steps run with
+`continue-on-error: true`, so a failing pytest step does not fail the job. The run page
+still shows a red "Process completed with exit code 1" annotation for each failing
+pytest step. The verdict step decides the job result, and the step summary table is the
+result to read.
+
+### Blind spots
+
+The job has the following blind spots:
+
+- A test that is red on the base for the wrong reason counts as red. Two causes are an
+  import error from a renamed helper and a module that imports a symbol that the PR
+  added. Both read `error` on the base.
+- A migration that the PR adds reaches the base run only through the `adcp_test`
+  database, which the `_postgres` step migrates with the head's `alembic`. The
+  `integration_db` fixture builds a fresh database with `create_all` from the models of
+  the tree under test, so the base run sees the base schema. Only a test that reads
+  `adcp_test` directly runs base code on the head schema.
+- An edit that changes only literals, names, or docstrings is not a changed test.
+- A test that the AST lists but pytest never collects reads `not collected`. The verdict
+  treats it as unhosted and does not fail it.
+
+### The Summary job
+
+The job is in `summary.needs`. The validate step of `summary` accepts `skipped` for it,
+because the job does not run on `push`. Every other job must report `success`.
+
+### What blocks a merge
+
+Every verdict is advisory until a maintainer requires `CI / Summary` on the `main`
+ruleset. A `fail` or `error` verdict turns the job red on the PR. It blocks the merge
+only after that requirement exists. A ruleset is a repository setting, so no file in
+this repository can add the requirement. The job needs no change when a maintainer adds
+it.
 
 ## BDD Test Shards
 
