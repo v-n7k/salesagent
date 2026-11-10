@@ -145,7 +145,7 @@ class TestCISuiteCoverage:
 
     @pytest.mark.arch_guard
     def test_host_integration_groups_upload_coverage(self):
-        """Every host integration group writes its own data file and uploads it; creative uploads nothing."""
+        """Every host integration group writes its own data file and uploads it; creative uploads no coverage."""
         from scripts.ci.shard_split import INTEGRATION_HOST_GROUPS
 
         job = load_ci_workflow()["jobs"]["integration-tests"]
@@ -161,7 +161,7 @@ class TestCISuiteCoverage:
             xml="coverage-integration-${{ matrix.group }}.xml",
             pytest_if="matrix.group != 'creative'",
         )
-        assert "matrix.group != 'creative'" in str(upload.get("if", "")), "the creative group must upload nothing"
+        assert "matrix.group != 'creative'" in str(upload.get("if", "")), "the creative group must upload no coverage"
 
     @pytest.mark.arch_guard
     def test_admin_job_uploads_coverage(self):
@@ -207,10 +207,22 @@ class TestCISuiteCoverage:
         assert "--format markdown:diff-cover.md" in run_steps
         assert "--fail-under" not in run_steps, "stage 1 is report only (spec § 7.2); the threshold is stage 2"
         assert 'diff-cover.md >> "$GITHUB_STEP_SUMMARY"' in run_steps
-        uploads = [
-            step.get("with", {}) for step in job["steps"] if "actions/upload-artifact" in str(step.get("uses", ""))
-        ]
-        assert any(w.get("name") == "diff-cover" and "diff-cover.md" in w.get("path", "") for w in uploads)
+        upload = next(
+            step["with"]
+            for step in job["steps"]
+            if "actions/upload-artifact" in str(step.get("uses", "")) and step["with"].get("name") == "diff-cover"
+        )
+        assert "diff-cover.md" in upload["path"] and "coverage-combined.xml" in upload["path"], (
+            "the artifact carries the report and the XML it was computed from"
+        )
+        assert upload.get("if-no-files-found") == "error", "a missing report must fail the upload, not warn"
+
+    @pytest.mark.arch_guard
+    def test_coverage_floor_runs_last(self):
+        """The floor is the last step, so the diff-cover report and its artifact exist on a run under the floor."""
+        job = load_ci_workflow()["jobs"]["coverage"]
+        assert job["steps"][-1]["name"] == "Coverage floor", "nothing enforces .coverage-baseline without this step"
+        assert job["steps"][-1]["run"].strip() == "./scripts/ci/coverage_report.sh --data-file .coverage.combined"
 
     @pytest.mark.arch_guard
     def test_quality_gate_does_not_run_unit_tests(self):
@@ -234,12 +246,12 @@ class TestCISuiteCoverage:
         assert "bdd-tests-shard" in needs, "coverage job must depend on bdd-tests-shard."
         assert "integration-tests" in needs, "coverage job must depend on integration-tests."
         assert "admin-ui-tests" in needs, "coverage job must depend on admin-ui-tests."
-        assert steps_text.count("download-artifact") >= 2, (
-            "coverage job must download unit and BDD shard coverage artifacts."
+        assert steps_text.count("download-artifact") == 4, (
+            "coverage job must download exactly the unit, BDD shard, integration group and admin coverage artifacts."
         )
         run_steps = " ".join(str(step.get("run", "")) for step in coverage_job.get("steps", []))
         assert "pytest" not in run_steps, "coverage job must not re-run tests."
-        assert "coverage combine" in run_steps, "coverage job must combine unit and BDD coverage data."
+        assert "coverage combine" in run_steps, "coverage job must combine every suite's coverage data."
 
     @pytest.mark.arch_guard
     def test_coverage_gate_requires_all_bdd_shard_artifacts(self):
@@ -252,6 +264,10 @@ class TestCISuiteCoverage:
         assert "Missing BDD coverage artifact for shard" in run_steps, (
             "coverage gate must fail when any shard's .coverage.bdd-N file is missing."
         )
+        assert 'bdd_shards="$(seq 1 "${expected_bdd_shards}")"' in run_steps, (
+            "the shard ids are bound before the call, so a failing seq stops the step under set -e"
+        )
+        assert "no ids to collect" in run_steps, "an empty id list must fail the step, not combine nothing"
         bdd_downloads = [
             step.get("with", {})
             for step in coverage_job.get("steps", [])

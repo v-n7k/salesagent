@@ -876,6 +876,10 @@ jobs:
           collect_data_files() {
             local -n collected_ref="$1"
             local dir="$2" prefix="$3" missing="$4" ids="$5" id found
+            if [ -z "${ids}" ]; then
+              echo "::error::${missing}: no ids to collect"
+              exit 1
+            fi
             for id in ${ids}; do
               found=""
               # find on a missing directory would stop the step here, before the error below names the id.
@@ -890,11 +894,12 @@ jobs:
             done
           }
           expected_bdd_shards="$(uv run python -c "from scripts.ci.shard_split import SHARD_COUNTS; print(SHARD_COUNTS['bdd'])")"
+          bdd_shards="$(seq 1 "${expected_bdd_shards}")"
           bdd_data_files=()
           collect_data_files bdd_data_files bdd-coverage-shards .coverage.bdd- \
-            "Missing BDD coverage artifact for shard" "$(seq 1 "${expected_bdd_shards}")"
+            "Missing BDD coverage artifact for shard" "${bdd_shards}"
           if [ ! -f .coverage ]; then
-            echo "Unit coverage data file missing."
+            echo "::error::Unit coverage data file missing."
             exit 1
           fi
           host_groups="$(uv run python -c "from scripts.ci.shard_split import INTEGRATION_HOST_GROUPS; print(' '.join(INTEGRATION_HOST_GROUPS))")"
