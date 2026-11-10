@@ -96,6 +96,8 @@ class Normalizer(ast.NodeTransformer):
     position in ``bound``. A bound name gets the same rename where it is declared. The declaration
     sites are an ``except ... as`` name, an ``import ... as`` alias, and the name of a ``def`` or
     ``class``. Every other ``Name`` stays, and so do attribute names and keyword argument names.
+    A ``match`` capture and a name in a ``global`` or ``nonlocal`` statement keep their spelling, and so
+    does a ``lambda`` parameter, unless the function binds the same name as a local.
     A ``str``, ``bytes``, ``int``, ``float``, or ``complex`` constant becomes a ``Name`` that holds
     its type name in upper case. ``None``, ``True``, ``False``, and ``...`` stay.
     The transformer edits the tree in place, so pass it a copy.

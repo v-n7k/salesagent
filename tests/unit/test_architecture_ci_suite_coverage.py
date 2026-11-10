@@ -231,6 +231,9 @@ class TestCISuiteCoverage:
         assert verdict_step["env"]["PR_TITLE"] == "${{ github.event.pull_request.title }}"
         assert '--summary "$GITHUB_STEP_SUMMARY"' in verdict_step["run"]
         assert '--title="$PR_TITLE"' in verdict_step["run"]
+        # Refuses an `if` that skips the verdict (a skipped step passes), and a `||` that swallows its exit code.
+        assert "if" not in verdict_step, "the Verdict step runs on every pull request, so it carries no condition"
+        assert "||" not in verdict_step["run"], "an `|| true` would turn a fail or an error into a pass"
         assert (
             "--head-report unit=head-unit.json" in verdict_step["run"]
             and "--base-report integration=base-integration.json" in verdict_step["run"]
@@ -251,8 +254,14 @@ class TestCISuiteCoverage:
         summary = workflow["jobs"]["summary"]
         assert "tests-redden-on-base" in summary["needs"]
         validate = " ".join(str(s.get("run", "")) for s in summary["steps"])
-        assert 'needs.tests-redden-on-base.result }}" != "skipped"' in validate, (
-            "summary accepts skipped for the one job that runs on pull_request only"
+        group = (
+            '{ [ "${{ needs.tests-redden-on-base.result }}" != "success" ] && '
+            '[ "${{ needs.tests-redden-on-base.result }}" != "skipped" ]; }'
+        )
+        # The group is true, and so fails the summary, only for a result that is neither success nor skipped. The text
+        # is pinned in full because `||` in place of `&&` makes the group true for every result.
+        assert group in " ".join(validate.replace("\\\n", " ").split()), (
+            "summary accepts success or skipped, and nothing else, for the one job that runs on pull_request only"
         )
 
     @pytest.mark.arch_guard

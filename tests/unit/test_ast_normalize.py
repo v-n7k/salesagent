@@ -45,10 +45,14 @@ def test_normalize_function_renames_locals_and_types_constants() -> None:
 
 
 def test_normalize_function_keeps_none_and_bools_and_free_names() -> None:
-    f = fn("def f():\n    x = helper(None, True)\n    return x\n")
-    assert "Name('None'" not in dump_statements(normalize_function(f))
-    assert "Constant(None)" in dump_statements(normalize_function(f))
-    assert "Name('helper'" in dump_statements(normalize_function(f))
+    f = fn("def f():\n    x = helper(None, True, False)\n    return x\n")
+    dumped = dump_statements(normalize_function(f))
+    assert "Name('None'" not in dumped
+    assert "Constant(None)" in dumped
+    # ``bool`` is a subclass of ``int``, so a check that tests for ``int`` first would turn these into ``BOOL``.
+    assert "Constant(True)" in dumped and "Constant(False)" in dumped
+    assert "Name('BOOL'" not in dumped
+    assert "Name('helper'" in dumped
 
 
 def test_normalize_function_leaves_the_tree_untouched() -> None:
@@ -103,6 +107,9 @@ def test_fingerprint_ignores_the_spelling_of_declared_names() -> None:
     helper = fn("def t():\n    def helper():\n        pass\n    helper()\n")
     renamed_helper = fn("def t():\n    def _helper():\n        pass\n    _helper()\n")
     assert function_fingerprint(helper) == function_fingerprint(renamed_helper)
+    async_helper = fn("def t():\n    async def helper():\n        pass\n    helper()\n")
+    renamed_async_helper = fn("def t():\n    async def _helper():\n        pass\n    _helper()\n")
+    assert function_fingerprint(async_helper) == function_fingerprint(renamed_async_helper)
     scopes = fn("def t():\n    class Fake:\n        pass\n    async def run():\n        pass\n    return Fake, run\n")
     renamed_scopes = fn(
         "def t():\n    class _Fake:\n        pass\n    async def _run():\n        pass\n    return _Fake, _run\n"

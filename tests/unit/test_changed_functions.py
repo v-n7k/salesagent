@@ -60,16 +60,31 @@ def test_node_id_uses_pytest_separators() -> None:
 
 
 def test_changed_test_functions_reads_both_sides_from_git(tmp_path: Path) -> None:
-    repo = git_repo(tmp_path, {"tests/unit/test_a.py": "def test_one():\n    pass\n", "tests/conftest.py": ""})
+    base_files = {
+        "tests/unit/test_a.py": "def test_one():\n    pass\n",
+        "tests/unit/test_c.py": "def test_four():\n    assert 4\n",
+        "tests/conftest.py": "",
+    }
+    repo = git_repo(tmp_path, base_files)
     write(repo, "tests/unit/test_a.py", "def test_one():\n    assert 2\ndef test_two():\n    assert 1\n")
     write(repo, "tests/unit/test_b.py", "def test_three():\n    assert 1\n")  # The head adds this file.
     git(repo, "mv", "tests/conftest.py", "tests/conftest2.py")  # A rename reads as a deletion plus an addition.
+    git(repo, "mv", "tests/unit/test_c.py", "tests/unit/test_d.py")  # So does the rename of a test module.
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "head")
     touched, changes = changed_test_functions(repo, "HEAD^1")
-    assert touched == ["tests/conftest.py", "tests/conftest2.py", "tests/unit/test_a.py", "tests/unit/test_b.py"]
-    assert [(c.qualname, c.kind) for c in changes] == [
-        ("test_one", CHANGED),
-        ("test_two", ADDED),
-        ("test_three", ADDED),
+    assert touched == [
+        "tests/conftest.py",
+        "tests/conftest2.py",
+        "tests/unit/test_a.py",
+        "tests/unit/test_b.py",
+        "tests/unit/test_c.py",
+        "tests/unit/test_d.py",
+    ]
+    assert changes == [
+        FunctionChange("tests/unit/test_a.py", "test_one", CHANGED),
+        FunctionChange("tests/unit/test_a.py", "test_two", ADDED),
+        FunctionChange("tests/unit/test_b.py", "test_three", ADDED),
+        FunctionChange("tests/unit/test_c.py", "test_four", DELETED),  # The old path of the renamed module.
+        FunctionChange("tests/unit/test_d.py", "test_four", ADDED),  # The new path of the renamed module.
     ]
