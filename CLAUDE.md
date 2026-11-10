@@ -43,7 +43,7 @@ This guide surfaces the repository-specific rules for the Prebid Sales Agent cod
 ### Structural guards (automated architecture enforcement)
 AST-scanning tests enforce architecture invariants on every `make quality` run. New violations fail the build immediately.
 
-**The following table is a representative subset, not the full set.** There are over 150 guard tests (`tests/unit/test_architecture_*.py`, plus a handful of boundary guards like `test_transport_agnostic_impl.py`); `ls tests/unit/test_architecture_*.py` prints the current set, which is the only count that cannot go stale. See [docs/development/structural-guards.md](docs/development/structural-guards.md) for design rationale (its written inventory covers only a subset).
+**The following table is a representative subset, not the full set.** There are over 150 guard tests (`tests/unit/test_architecture_*.py`, plus a handful of boundary guards like `test_transport_agnostic_impl.py`); `ls tests/unit/test_architecture_*.py tests/unit/test_guards_*.py tests/unit/test_ast_grep_*.py` prints the current set, which is the only count that cannot go stale. See [docs/development/structural-guards.md](docs/development/structural-guards.md) for design rationale (its written inventory covers only a subset).
 
 | Guard | Enforces | Test file |
 |-------|----------|-----------|
@@ -61,7 +61,10 @@ AST-scanning tests enforce architecture invariants on every `make quality` run. 
 | Environment read once | No `os.environ` / `os.getenv` under `src/` or `scripts/` outside the settings loader (`src/core/config.py`) and the two writes of variables another library reads; a composition root calls `load_settings()` and everything else reads a named fact off the object | `ruff-environment.toml` (TID251) + `test_ruff_boundary_bans.py` |
 | Test flags never reach production | No read of `adcp_testing` under `src/` outside the settings loader that declares it; a behavior that differs under test reads a real input (a tenant column, an `AdapterConfig` row, a settings field) that the test seeds. The loader's seven properties that still fork on it are pinned shrink-only, not exempted (GH #2255) | `.ast-grep/rules/test-flag-never-reaches-production.yml` + `test_ast_grep_test_flag_ban.py` + `test_test_flag_properties_only_shrink.py` |
 | internal_detail is an exception | `internal_detail=` (and `x.internal_detail =`) never takes an authored string in any spelling (literal, f-string, `+`, `%`, `.format`, `str()`, conditional), under `src/`, `scripts/` or `tests/`; the parameter is typed `BaseException \| None`, and the boundary writes one record per failure with the traceback attached when the error has a `__cause__` or an `internal_detail` | `.ast-grep/rules/internal-detail-is-an-exception.yml` + mypy on `src/` + `test_tool_error_logging.py` |
-| No direct DB access | No `get_db_session()` or `session.add()` anywhere outside repositories/UoW/infrastructure | `test_architecture_repository_pattern.py` |
+| No direct DB access | No `get_db_session()` in `_impl` code (`src/core/tools/`, `src/core/helpers/`); no function or fixture in a tracked `.py` under `tests/` calls `get_db_session()`, or `add` / `add_all` on a session (`session`, `self.session`, `env._session`, ...) | `test_architecture_repository_pattern.py` |
+| Every model has a factory | Every ORM model in `src/core/database/models.py` has a `SQLAlchemyModelFactory` in `tests/factories/`; a model without one is what forces a test into `session.add()` | `test_architecture_every_model_has_a_factory.py` |
+| No private env subclass | No class outside `tests/harness/`, at module level or inside a function, derives through any chain of bases from `BaseTestEnv`, `IntegrationEnv` or `BareIntegrationEnv`; a test that needs more from an env adds a method to it in `tests/harness/` | `test_architecture_no_private_env_subclass.py` |
+| App built by the harness | No test module outside `tests/harness/` and `tests/helpers/` calls `create_app`, `Flask`, `TestClient` or `.test_client()`; a test takes the `admin_client` fixture, `env.get_rest_client()` or `admin_test_app()` | `test_architecture_app_built_by_harness_only.py` |
 | Migration completeness | Every migration has non-empty `upgrade()` and `downgrade()` | `test_architecture_migration_completeness.py` |
 | No raw MediaPackage select | All MediaPackage access goes through repository, not raw `select()` | `test_architecture_no_raw_media_package_select.py` |
 | No import-time filesystem I/O | `src/` and `scripts/` modules touch no files while being imported | `test_architecture_no_import_time_fs_io.py` |
@@ -83,11 +86,13 @@ AST-scanning tests enforce architecture invariants on every `make quality` run. 
 | JSONType columns | JSON DB columns use `JSONType`, not plain `JSON` | `test_architecture_jsontype_columns.py` |
 | No defensive RootModel | No `hasattr(x, "root")` without `# noqa: rootmodel` | `test_architecture_no_defensive_rootmodel.py` |
 | Import usage in src/ | Classes/functions used in `src/` must be imported | `test_architecture_import_usage.py` |
+| Every guard has a self-test | Every guard module (`test_architecture_*`, `test_guards_*`, `test_ast_grep_*` in `tests/unit/`) calls a shared self-test helper named in `SELF_TEST_HELPERS`; an import with no call, or a hand-rolled check, does not count | `test_architecture_guards_have_self_tests.py` |
 
 **Rules for guards:**
 - Allowlists can only shrink — never add new violations, fix them instead
 - Every allowlisted violation has a `# FIXME(#<gh-issue>)` comment at the source location — reference a GitHub issue/PR number, never a local beads id (beads ids don't resolve for outside contributors)
 - When you fix a violation, remove it from the allowlist (the stale-entry test reminds you)
+- Every guard module calls a shared self-test helper; `test_architecture_guards_have_self_tests.py` lists the ones that do not yet
 
 ---
 

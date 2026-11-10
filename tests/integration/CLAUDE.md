@@ -38,5 +38,6 @@ The full order, and why a lacking harness is not a licence to monkey-patch, is i
 `docs/development/fixture-layer-audit.md` measures this directory against BDD: 547 raw
 `session.add()` calls across 92 files here, versus zero in BDD, and the failure counts track
 that difference. It also names the duplication — `_make_identity` defined 16 times while
-`PrincipalFactory.make_identity` exists — and the 15 ORM models with no factory, which is
-what forces the `session.add()`.
+`PrincipalFactory.make_identity` exists — and the ORM models with no factory, which is what
+forces the `session.add()`. The current list of those models is `KNOWN_MODELS_WITHOUT_FACTORY`
+in `tests/unit/test_architecture_every_model_has_a_factory.py`.

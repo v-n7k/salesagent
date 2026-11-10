@@ -38,10 +38,9 @@ signature, is how one of them comes to seed the row without the join.
 
 ## The gap that forces `session.add()`
 
-15 of 39 ORM models have no factory: `AuditLog`, `Context`, `CreativeReview`, `GAMLineItem`,
-`GAMOrder`, `IdempotencyAttempt`, `ObjectWorkflowMapping`, `ProductInventoryMapping`,
-`Strategy`, `StrategyState`, `SyncJob`, `TenantManagementConfig`, `WebhookDeliveryLog`,
-`WebhookDeliveryRecord`, `WorkflowStep`. A test needing one has no option but a raw
+Some ORM models have no factory. `KNOWN_MODELS_WITHOUT_FACTORY` in
+`tests/unit/test_architecture_every_model_has_a_factory.py` is the one list of them, and the
+guard fails when it falls out of date. A test needing one has no option but a raw
 `session.add()`, which is most of the 547 in `tests/integration/`. **Adding the missing
 factory is the fix; the `session.add()` is the symptom.**
 `docs/development/fixture-layer-audit.md` has the measurement.

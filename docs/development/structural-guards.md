@@ -17,13 +17,15 @@ shrink as invariants move into types and lint rules.
 - [Guard design rules](#guard-design-rules) — shrinking allowlists and the other invariants every guard follows
 - [Guard inventory](#guard-inventory) — every active guard, with how it works, its tests, and its known violations:
   - [Transport-boundary guards](#transport-boundary-guards)
-  - [Schema inheritance guard](#schema-inheritance-guard)
-  - [Boundary completeness guard](#boundary-completeness-guard)
+  - [Implementation signature](#implementation-signature)
   - [Query type safety guard](#query-type-safety-guard)
-  - [No model_dump() in _impl guard](#no-model_dump-in-_impl-guard)
+  - [internal_detail is an exception](#internal_detail-is-an-exception)
+  - [Serialize only at the edges](#serialize-only-at-the-edges)
   - [Repository pattern guard](#repository-pattern-guard)
+  - [Self-test and harness guards](#self-test-and-harness-guards)
   - [BDD step quality guards](#bdd-step-quality-guards)
   - [Single migration head guard](#single-migration-head-guard)
+  - [No request-supplied session default guard](#no-request-supplied-session-default-guard)
   - [Hook-relocation guards](#hook-relocation-guards)
 - [Add a guard](#add-a-guard) — the procedure, and the shared helpers to build on
 - [Symbol subjects and shape subjects](#symbol-subjects-and-shape-subjects) — bind a symbol, allowlist a shape
@@ -137,6 +139,34 @@ already-imported modules.
 **Shared helpers, not re-implemented traversal.** A guard uses the helpers in
 `tests/unit/_architecture_helpers.py` rather than writing its own AST
 machinery. See [Add a guard](#add-a-guard).
+
+**Every guard module calls a shared self-test helper.** A detector nobody has
+seen fire grades nothing: one that has stopped matching reports "no
+violations" over a tree it cannot read, and that pass looks the same as a
+clean tree. So every guard module, a `tests/unit/` module whose name starts
+with one of `GUARD_MODULE_PREFIXES` (`test_architecture_`, `test_guards_`,
+`test_ast_grep_`), calls at least one of the helpers in `SELF_TEST_HELPERS`:
+
+- `assert_detector_catches_ast_snippets`: an AST detector flags each
+  known-bad snippet.
+- `assert_detector_ignores_ast_snippets`: the detector flags no known-good
+  snippet.
+- `anchor_consistency_detects_drift`: an anchor-consistency check reports
+  sources that disagree.
+- `stage_ast_grep_root` and `write_ast_grep_probe`: a disposable root holding
+  the real `sgconfig.yml` and `.ast-grep/` rules, and a probe file written
+  into it for a rule to match.
+- `assert_check_rejects_mutation`: a check that reads files passes on a copy
+  of them and rejects the copy once it has been broken.
+
+`tests/unit/test_architecture_guards_have_self_tests.py` holds the rule (see
+[Self-test and harness guards](#self-test-and-harness-guards)). It looks for
+a call to one of the helpers by name, bare or as an attribute
+(`helpers.write_ast_grep_probe(...)`), so an import with no call does not
+count, and a hand-rolled self-test, which calls none of them, is not
+credited. `KNOWN_WITHOUT_SELF_TEST` lists the guard modules that called no
+helper when the rule landed. Give a new guard module a self-test instead of
+a row.
 
 ## Guard inventory
 
@@ -302,12 +332,24 @@ recorded on salesagent-3cs7o.12.
 
 **File:** `tests/unit/test_architecture_repository_pattern.py`
 
-**What it enforces:** Two invariants:
+**What it enforces:** Three invariants:
 
-1. **No `get_db_session()` in business logic.** Functions in `_impl` files must
-   not call `get_db_session()` directly — data access belongs in repository classes.
-2. **No `session.add()` in integration tests.** Test functions must not construct
-   ORM objects inline — use polyfactory-based fixtures instead.
+1. **No `get_db_session()` in business logic.** No function in the `_impl`
+   modules calls `get_db_session()` directly — data access belongs in
+   repository classes.
+2. **No `session.add()` or `session.add_all()` in test code.** No test,
+   fixture or helper function under `tests/` adds a row through a session —
+   the factories in `tests/factories/` add it.
+3. **No `get_db_session()` in test code.** No test, fixture or helper
+   function under `tests/` opens a raw session — it reaches the database
+   through factories and the harness UoW
+   (`with AccountUoW(tenant_id) as uow: uow.accounts`).
+
+The same file also holds a reverse-layer check (no module under
+`src/core/database/repositories/` imports from `adcp.types.domains.protocol`)
+and two shape checks on signed outbound delivery
+(`TestDeliveryBoundaryTakesNoDonatedSession` and
+`TestQueuedWebhookCarriesPrimitivesOnly`); their docstrings describe them.
 
 **Why it matters:** When business logic directly opens database sessions, it
 becomes impossible to test without a real database, impossible to swap storage
@@ -322,10 +364,16 @@ shrinks.
 
 #### How it works
 
-The guard scans 14 production files and 10 integration test files using AST:
+The guard parses each scanned file and reports, per function or fixture, the
+first call that matches. A row is `(path, function name)`, so a new function
+in a file that already has rows is still caught. Calls outside a function
+body are not read.
 
-**Invariant 1** finds function definitions that contain `get_db_session()` calls
-(both `get_db_session()` and `module.get_db_session()` forms):
+**Invariant 1** reads every tracked module under `src/core/tools/` and
+`src/core/helpers/`, found by a glob on each run, plus
+`src/core/context_manager.py` and `src/admin/blueprints/creatives.py`. It
+flags `get_db_session()` in both the bare and the `module.get_db_session()`
+form:
 
 ```python
 # FLAGGED: business logic opens its own session
@@ -334,42 +382,291 @@ async def _create_media_buy_impl(req, identity):
         media_buy = MediaBuy(...)
         session.add(media_buy)
 
-# CORRECT: repository encapsulates data access
-async def _create_media_buy_impl(req, identity, repo: MediaBuyRepository):
-    media_buy = repo.create_from_request(req, identity)
+# CORRECT: a repository, reached through the Unit of Work, encapsulates data access
+async def _create_media_buy_impl(req, identity):
+    with MediaBuyUoW(identity.tenant_id) as uow:
+        media_buy = uow.media_buys.create_from_request(req=req, ...)
 ```
 
-**Invariant 2** finds test functions/fixtures that call `session.add()`,
-`db_session.add()`, or similar patterns:
+**Invariants 2 and 3** read every `.py` file under `tests/` that git tracks:
+test modules, conftest files, BDD step modules, helpers, fixtures, factories
+and the harness. A file git does not track is skipped, so the Python that the
+storyboard env's `npm ci` leaves under `tests/storyboard/runner/node_modules/`
+on the CI box is not read there, and a new file is scanned once it is staged.
+The scan stops nowhere because a call that moves out of the scanned files
+disappears from the guard: two rows were once removed as fixed when their
+calls had only moved into `tests/utils/`, and an enumerated list of roots
+missed `tests/bdd/steps/` and `tests/conftest_db.py` the same way.
+
+Invariant 2 matches `add` and `add_all` on a receiver named in
+`SESSION_RECEIVERS` (`session`, `db_session`, `mock_session`, `s`,
+`_session`, `factory_session`). The receiver is a bare name or the last
+attribute of a chain, so `self.session.add(row)` and `env._session.add(row)`
+are flagged and `seen.add(x)` on a set is not. Invariant 3 matches
+`get_db_session()` the way invariant 1 does:
 
 ```python
-# FLAGGED: inline fixture setup
+# FLAGGED: rows added by hand, through a bare or an attribute receiver
 def test_something(integration_db):
-    with get_db_session() as session:
-        tenant = Tenant(name="test")
-        session.add(tenant)             # ← violation
+    with get_db_session() as session:     # ← invariant 3
+        session.add(Tenant(name="test"))  # ← invariant 2
+        session.add_all(products)         # ← invariant 2
 
-# CORRECT: factory-based fixture
-def test_something(integration_db, sample_tenant):
-    # sample_tenant created by polyfactory fixture
-    pass
+class _Seeder:
+    def seed(self, row):
+        self.session.add(row)             # ← invariant 2
+
+# CORRECT: a factory adds the row, through the session the harness binds
+def test_something(integration_db):
+    with DeliveryPollEnv(tenant_id="t1", principal_id="p1") as env:
+        tenant = TenantFactory(tenant_id="t1")
 ```
 
 #### Tests
 
 | Test | What it checks |
 |------|---------------|
-| `test_no_new_get_db_session_in_impl` | No new `get_db_session()` calls outside the allowlist |
-| `test_allowlist_entries_still_exist` (impl) | Stale allowlist detection for impl violations |
-| `test_no_new_session_add_in_tests` | No new `session.add()` calls outside the allowlist |
-| `test_allowlist_entries_still_exist` (tests) | Stale allowlist detection for test violations |
+| `test_no_new_get_db_session_in_impl` | No `get_db_session()` in the scanned `src/` modules (`IMPL_SESSION_ALLOWLIST` is empty) |
+| `test_no_new_session_add_in_tests` | No `add` / `add_all` on a session receiver under `tests/` outside `INTEGRATION_SESSION_ADD_ALLOWLIST` |
+| `test_no_new_get_db_session_in_tests` | No `get_db_session()` under `tests/` outside `GET_DB_SESSION_IN_TESTS_ALLOWLIST` |
+| `test_allowlist_entries_still_exist` (one per invariant) | Stale allowlist detection: a row whose call is gone fails |
+| `test_session_add_detector_sees_add_all_and_attribute_receivers` | Self-test: `session.add`, `session.add_all`, `self.session.add`, `env._session.add` and `factory_session.add` are flagged |
+| `test_session_add_detector_ignores_sets_and_other_receivers` | Self-test: `seen.add(x)` and `batch.add_all(rows)` are not flagged |
+| `test_scan_roots_include_unit_bdd_and_harness` | The scanned files include modules under `tests/unit/`, `tests/bdd/steps/`, `tests/harness/`, `tests/fixtures/` and `tests/factories/` |
+| `test_discovery_glob_catches_a_synthetic_new_file` | The invariant 1 glob picks up a file it has never seen, so the scan set is computed on each run |
+| `test_discovery_glob_covers_the_files_the_old_list_missed` | The invariant 1 scan includes `src/core/tools/accounts.py` and modules under `src/core/helpers/` |
 
-#### Current known violations
+#### Allowlists
 
-- **27 `get_db_session()` calls** across 10 production files (media_buy_create, update, delivery, list, products, creatives, task_management, admin blueprints)
-- **58 `session.add()` calls** across 10 integration test files
+Each is keyed `(path, function name)`.
 
-All tracked by `salesagent-qo8a`.
+- `IMPL_SESSION_ALLOWLIST` is empty and stays empty: the `_impl` migration
+  finished in [#1094](https://github.com/prebid/salesagent/issues/1094), so a
+  row there is a regression.
+- `INTEGRATION_SESSION_ADD_ALLOWLIST` holds the existing `session.add()` and
+  `add_all()` sites in test code; its header cites
+  [#2133](https://github.com/prebid/salesagent/issues/2133).
+- `GET_DB_SESSION_IN_TESTS_ALLOWLIST` holds the existing `get_db_session()`
+  sites in test code; its header cites
+  [#2538](https://github.com/prebid/salesagent/issues/2538).
+
+### Self-test and harness guards
+
+The first of these guards holds every guard module to the self-test rule in
+[Guard design rules](#guard-design-rules). The other three keep a test on the
+harness: a test takes its env from `tests/harness/`, its app and its client
+from the harness, and its rows from a factory in `tests/factories/`. The
+[repository pattern guard](#repository-pattern-guard) fails the
+`session.add()` that a missing factory forces; the factory guard below fails
+the missing factory.
+
+Each of these guards calls both `assert_detector_catches_ast_snippets` and
+`assert_detector_ignores_ast_snippets`. Each allowlist lists the sites that
+existed when its guard landed, only shrinks, and carries a
+`# FIXME(#<issue>)` comment on every row. Rows are keyed by name, never by
+line number, so an edit above a site does not stale its row. To leave an
+allowlist, fix the site and delete its row in the same change; the
+stale-entry check fails until the row is gone.
+
+#### Every guard module has a self-test
+
+**File:** `tests/unit/test_architecture_guards_have_self_tests.py`
+
+**What it enforces:** Every guard module, a `tests/unit/` module named with
+one of `GUARD_MODULE_PREFIXES`, calls at least one helper named in
+`SELF_TEST_HELPERS`.
+
+**Why it matters:** A guard that has never been seen to fail is not known to
+grade anything ([tests/unit/CLAUDE.md](../../tests/unit/CLAUDE.md)). A
+self-test keeps that check in the suite, where it runs on every
+`make quality`.
+
+**How it works:** `iter_architecture_guard_trees()` yields each guard module,
+and `called_function_names()` collects every callee name in it, the bare name
+or the last attribute (`helpers.write_ast_grep_probe(...)`). A module passes
+when one of those names is in `SELF_TEST_HELPERS`. A call anywhere in the
+module counts, including one in a function that no test calls; the
+detector's docstring names that ceiling.
+
+```python
+# FLAGGED: a hand-rolled self-test calls no shared helper
+def test_self():
+    assert find(ast.parse("bad()"))
+
+# CORRECT: a shared helper, called bare or as an attribute
+def test_detector_catches_known_bad():
+    assert_detector_catches_ast_snippets(find, snippets={"call": "bad()\n"})
+```
+
+**Tests:**
+
+| Test | What it checks |
+|------|---------------|
+| `test_every_guard_module_calls_a_shared_self_test_helper` | Every guard module that calls no helper is a row in `KNOWN_WITHOUT_SELF_TEST`, and no row is stale |
+| `test_meta_guard_flags_a_module_with_no_helper_call` | A module with only plain asserts, and one with a hand-rolled self-test, are flagged |
+| `test_meta_guard_accepts_each_helper_by_name_and_as_attribute` | A call to each name in `SELF_TEST_HELPERS` passes, and so does the attribute form |
+
+**Allowlist:** `KNOWN_WITHOUT_SELF_TEST`, keyed `(path,)`; every row carries
+`# FIXME(#2534)` ([#2534](https://github.com/prebid/salesagent/issues/2534)).
+
+#### No env subclass outside the harness
+
+**File:** `tests/unit/test_architecture_no_private_env_subclass.py`
+
+**What it enforces:** No class outside `tests/harness/` derives from a
+harness env root (`ENV_ROOTS`: `BaseTestEnv`, `IntegrationEnv`,
+`BareIntegrationEnv`), directly or through any chain of bases, including a
+class defined inside a test function.
+
+**Why it matters:** A test module that subclasses an env defines a private
+env: its own `EXTERNAL_PATCHES`, seeding or dispatch. When a test cannot
+express the state it needs, the harness is what changes
+([tests/harness/CLAUDE.md](../../tests/harness/CLAUDE.md)). A private
+subclass leaves that change undone, and the next test that needs the same
+state copies the subclass.
+
+**How it works:** `iter_test_module_trees()` parses every tracked module under
+`tests/`, harness included, and `class_base_index()` maps each class name to
+the base names it is declared with. `derives_from_env()` follows that index
+to a root, so a class that reaches one through a local mixin or through a
+harness env is found. Only classes outside `tests/harness/` are reported.
+The scan reads the AST, so a class written inside a string literal is not a
+class.
+
+```python
+# FLAGGED in tests/integration/: a private copy of an env the harness has
+class _RepoEnv(IntegrationEnv):
+    EXTERNAL_PATCHES: dict[str, str] = {}
+
+    def get_session(self):
+        self._commit_factory_data()
+        return self._session
+
+# CORRECT: the harness env; a method a test needs is added to it in tests/harness/
+with BareIntegrationEnv(tenant_id="t1") as env:
+    session = env.get_session()
+```
+
+**Tests:**
+
+| Test | What it checks |
+|------|---------------|
+| `test_no_env_subclass_outside_the_harness` | Every env subclass outside `tests/harness/` is a row in `KNOWN_PRIVATE_ENV_SUBCLASSES`, and no row is stale |
+| `test_flags_a_subclass_at_module_level_and_inside_a_function` | A subclass at module level, one inside a test function, and one through a local mixin are flagged |
+| `test_ignores_classes_that_do_not_derive_from_an_env_root` | A subclass of the e2e `_LiveDBEnv` shim, which has no env base, a plain class, and a class inside a string literal are not flagged |
+
+**Allowlist:** `KNOWN_PRIVATE_ENV_SUBCLASSES`, keyed `(path, class name)`;
+every row carries `# FIXME(#2535)`
+([#2535](https://github.com/prebid/salesagent/issues/2535)). A row leaves
+when its test uses `BareIntegrationEnv` or the domain env, with any method
+it needs added to that env.
+
+#### The app and its clients built by the harness
+
+**File:** `tests/unit/test_architecture_app_built_by_harness_only.py`
+
+**What it enforces:** No module under `tests/` outside `tests/harness/` and
+`tests/helpers/` calls a name in `APP_CONSTRUCTORS` (`create_app`, `Flask`,
+`TestClient`), bare or as an attribute, or the `test_client` method
+(`CLIENT_METHOD`).
+
+**Why it matters:** A test takes its app and its client from the harness:
+the `admin_client` fixture, `env.get_rest_client()`, or
+`tests/helpers/admin_session.admin_test_app()`. A module that builds its own
+app builds a second one that the harness does not configure, so a patch the
+harness applies misses it.
+
+**How it works:** The scan walks every tracked module under `tests/` outside
+those two directories with `walk_with_enclosing_function()` and flags each
+matching call; a string that mentions `create_app()` is not a call. Rows are
+keyed `(path, enclosing function)`, a call at module level keys under
+`"<module>"`, and one row covers every construction in a function. The match
+is by callee name, so a constructor imported under another name
+(`TestClient as Client`) is not seen. The two `admin_client` fixtures, in
+`tests/admin/conftest.py` and `tests/integration/conftest.py`, build their
+app and client themselves and are rows; a test that takes the fixture adds
+none.
+
+```python
+# FLAGGED: a second app, built when the module is imported, and its client
+from src.admin.app import create_app
+
+app = create_app()
+
+@pytest.fixture
+def client():
+    with app.test_client() as client:
+        yield client
+
+# CORRECT: the client comes from the harness
+def test_accounts_page(admin_client):
+    response = admin_client.get(url)
+```
+
+**Tests:**
+
+| Test | What it checks |
+|------|---------------|
+| `test_tests_build_no_app_or_client_outside_the_harness` | Every construction outside `tests/harness/` and `tests/helpers/` is a row in `KNOWN_APP_CONSTRUCTIONS`, and no row is stale |
+| `test_flags_each_construction_form` | `create_app()` at module level, `admin.create_app(...)`, `Flask(...)`, `TestClient(...)` and `app.test_client()` are flagged |
+| `test_ignores_the_harness_names_and_unrelated_calls` | `admin_test_app()`, `env.get_rest_client()` and `make_users_test_client()` are not flagged |
+
+**Allowlist:** `KNOWN_APP_CONSTRUCTIONS`, keyed `(path, enclosing function)`;
+every row carries `# FIXME(#2536)`
+([#2536](https://github.com/prebid/salesagent/issues/2536)).
+
+#### Every ORM model has a factory
+
+**File:** `tests/unit/test_architecture_every_model_has_a_factory.py`
+
+**What it enforces:** Every ORM model in `src/core/database/models.py` has a
+`SQLAlchemyModelFactory` in a module directly under `tests/factories/`.
+
+**Why it matters:** A test seeds a row through a factory, and the harness
+binds a session to each factory registered in `ALL_FACTORIES`. A model with
+no factory leaves the test one way to create the row: construct the model
+and call `session.add()`, which the
+[repository pattern guard](#repository-pattern-guard) bans in test code. The
+missing factory is the defect, and the `session.add()` is its symptom.
+
+**How it works:** The scan collects the class name of every ORM model
+(`orm_model_class_defs()`) and reads the modules directly under
+`tests/factories/`, not its subdirectories. A class is a factory when one of
+its bases is `SQLAlchemyModelFactory`, bare or as an attribute
+(`factory.alchemy.SQLAlchemyModelFactory`); it credits the model its nested
+`Meta` assigns, `model = Tenant` or `model = models.Tenant`. A Pydantic
+factory (`factory.Factory`) named after a model builds a schema object, not a
+row, and credits nothing. The scan reads class definitions, not
+`ALL_FACTORIES`, and does not follow a base chain, so a factory that derives
+from another factory class credits no model.
+
+```python
+# FLAGGED: Tenant still has no factory, because factory.Factory builds a schema object
+class TenantFactory(factory.Factory):
+    class Meta:
+        model = Tenant
+
+# CORRECT: a SQLAlchemyModelFactory credits Tenant
+class TenantFactory(factory.alchemy.SQLAlchemyModelFactory):
+    class Meta:
+        model = Tenant
+```
+
+**Tests:**
+
+| Test | What it checks |
+|------|---------------|
+| `test_every_orm_model_has_a_factory` | Every model without an ORM factory is a row in `KNOWN_MODELS_WITHOUT_FACTORY`, and no row is stale |
+| `test_flags_a_model_with_no_orm_factory` | A module with only another model's factory, or only a Pydantic factory named like the model, leaves the model missing |
+| `test_credits_bare_and_attribute_model_names` | `model = Tenant`, `model = models.Tenant`, and a factory defined inside a function body credit `Tenant` |
+
+**Allowlist:** `KNOWN_MODELS_WITHOUT_FACTORY`, keyed `(model name,)`; every
+row carries `# FIXME(#2537)`
+([#2537](https://github.com/prebid/salesagent/issues/2537)). It is the one
+list of the models without a factory: a document that needs the list names
+this constant instead of restating it. A row leaves when the model's factory
+is added in `tests/factories/` and registered in `ALL_FACTORIES` in
+`tests/factories/__init__.py`.
 
 ### BDD step quality guards
 
@@ -527,14 +824,14 @@ They replaced grep-based pre-commit hooks (issue #1234).
 | `test_architecture_query_type_safety.py` | `enforce-sqlalchemy-2-0` (partial) | `test_no_legacy_session_query`, `test_models_use_mapped_not_column` |
 | `test_architecture_pre_commit_hook_count.py` | — | Commit-stage hook count ≤12 (D27) |
 | `test_architecture_pre_commit_no_additional_deps.py` | — | No `additional_dependencies` in pre-commit config |
-| `test_architecture_ci_bdd_shard_manifest.py` | — | BDD CI shards partition suite; matrix matches `SHARD_COUNTS` |
 | `test_architecture_repo_invariants.py` | `repo-invariants` (partial) | Self-tests for `.fn()` detection in consolidated hook |
 
 Guards use the `@pytest.mark.arch_guard` marker (distinct from the
 entity-marker `architecture`).
 
-Each of these guards includes a **known-bad self-test** (inline snippet or tmp
-fixture) so a narrowed detector fails CI instead of passing green silently.
+A module in this table that `KNOWN_WITHOUT_SELF_TEST` in
+`tests/unit/test_architecture_guards_have_self_tests.py` lists calls no shared
+self-test helper yet; the others do.
 
 CI-only hook enforcement runs in `make quality-ci`: duplication, GAM auth
 support, response attribute access, roundtrip tests. See
@@ -555,8 +852,12 @@ it, use it, and delete it with the refactor — don't add it here.
 4. Include an allowlist for pre-existing violations
 5. Include a stale-allowlist test that fails when a violation is fixed but the
    entry remains
-6. Add FIXME comments at each violation site: `# FIXME(#<gh-issue>): description` (GitHub issue/PR number, never a beads id)
-7. Document the guard in this file
+6. Call a shared self-test helper from a test in the module (see
+   [Guard design rules](#guard-design-rules));
+   `test_architecture_guards_have_self_tests.py` fails a guard module that
+   calls none
+7. Add FIXME comments at each violation site: `# FIXME(#<gh-issue>): description` (GitHub issue/PR number, never a beads id)
+8. Document the guard in this file
 
 ### Use the shared helpers
 
@@ -571,7 +872,22 @@ guards use:
   unparseable file.
 - `iter_module_trees()` — yields `(tree, repo_relative_path)` for every
   `.py` file under the given directories, through the shared cache, and
-  raises on an unparseable file instead of silently dropping it.
+  raises on an unparseable file instead of silently dropping it. It lists
+  only files git tracks (`is_untracked_repo_file()`): the storyboard env's
+  `npm ci` leaves Python under `tests/storyboard/runner/node_modules/` on the
+  CI box, and a walk of the disk would read those files there and not on a
+  developer machine. A new file is walked once it is staged, and a path
+  outside the repository is never skipped, so a self-test can point the walk
+  at a `tmp_path` tree.
+- `iter_test_module_trees()` — `(repo_relative_path, tree)`, path first, for
+  every tracked `.py` under `tests/`, through `iter_module_trees()`.
+- `GUARD_MODULE_PREFIXES` and `iter_architecture_guard_trees()` — the
+  file-name prefixes a guard module in `tests/unit/` is spelled with, and a
+  walk that yields `(tree, repo_relative_path)` for each such module.
+- `ENV_ROOTS`, `class_base_index()` and `derives_from_env()` — the roots of
+  the harness env hierarchy, an index from each class name in the given
+  modules to its base-class names (classes nested in a function body
+  included), and whether a class name reaches a root through that index.
 - `src_python_files()` and `iter_call_expressions()` — source-file iteration
   and call-node filtering.
 - `walk_with_enclosing_function()` — yields each node with the name of its
@@ -581,12 +897,30 @@ guards use:
 - `format_failure()` — the standard failure-message formatter.
 - `assert_detector_catches_ast_snippets()` — feeds known-bad inline snippets
   to your detector and fails if any go unflagged.
+- `assert_detector_ignores_ast_snippets()` — the inverse: feeds known-good
+  snippets and fails if the detector flags any. A detector that flags a
+  legitimate shape is as wrong as one that misses a violation.
+- `assert_check_rejects_mutation()` — for a guard that reads files (a pin, a
+  config, a workflow) rather than the AST: copies the named paths into a
+  temporary directory, requires the check to pass on the copy, breaks the
+  copy with the given mutation, and fails unless the check now rejects it.
+  The real tree is never touched.
+- `anchor_consistency_detects_drift()` — true when the given sources carry
+  conflicting anchors; the mutation probe for a guard built on
+  `assert_anchor_consistency()`.
+- `stage_ast_grep_root()` and `write_ast_grep_probe()` — a disposable project
+  root holding the real `sgconfig.yml` and `.ast-grep/` rules, and a probe
+  module written at a unique path under it, in the directory a rule's
+  `files:` glob covers. The probe never lands in `src/` or `tests/`, where
+  another guard's scan could list it and then fail to read it once it is
+  deleted.
 
 `assert_detector_catches_ast_snippets` matters more than it looks: a
 detector nobody proved can fire is a guard that passes vacuously. A green
 run then reports "no violations" over a tree the detector cannot actually
 read, which is indistinguishable from a clean tree. Every guard's detector
-gets a known-bad self-test.
+gets a known-bad self-test, and every guard module calls at least one of the
+self-test helpers (see [Guard design rules](#guard-design-rules)).
 
 ### Write a guard with the helpers
 
@@ -684,9 +1018,11 @@ What each helper is doing, and what goes wrong without it:
   clean tree. Include a snippet for each spelling the rule must catch — an
   attribute call, an aliased import, a call inside a nested function.
 
-Two further helpers cover cases the example does not: `parse_module()` when
-you need a single file rather than a tree walk, and `iter_call_expressions()`
-when the rule is about calls to one named function. `format_failure()` renders
+Further helpers cover cases the example does not: `parse_module()` when you
+need a single file rather than a tree walk, `iter_call_expressions()` when the
+rule is about calls to one named function, and `trailing_name()` when the rule
+matches a name written bare or as an attribute: it returns `Foo` for `Foo` and
+for `mod.Foo`, and `None` for any other expression. `format_failure()` renders
 a failure with a summary, a fix hint, and a documentation link, for guards
 that assert directly rather than through the allowlist comparison.
 
@@ -734,7 +1070,7 @@ symbols, which is exactly the artifact that goes stale without anything noticing
 make quality
 
 # Just the architecture guards
-uv run pytest tests/unit/test_architecture_*.py tests/unit/test_*impl*.py -v
+uv run pytest tests/unit/test_architecture_*.py tests/unit/test_guards_*.py tests/unit/test_ast_grep_*.py tests/unit/test_*impl*.py -v
 
 # Single guard
 uv run pytest tests/unit/test_architecture_no_raw_select.py -v

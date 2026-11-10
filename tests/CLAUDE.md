@@ -109,7 +109,7 @@ because a restated rule drifts from the one it copied:
 | [integration](integration/CLAUDE.md) | the two-part bar for landing here at all, and the fixture debt |
 | [bdd](bdd/CLAUDE.md) · [bdd/steps](bdd/steps/CLAUDE.md) | helper-per-situation; what a step author gets wrong, and why a Given never mocks |
 | [harness](harness/CLAUDE.md) | what `EXTERNAL_PATCHES` may target, and what an env owns instead |
-| [factories](factories/CLAUDE.md) | one factory per model, one seeder for multi-row facts, and the 15 missing |
+| [factories](factories/CLAUDE.md) | one factory per model, one seeder for multi-row facts, and the models still without one (`KNOWN_MODELS_WITHOUT_FACTORY` in `tests/unit/test_architecture_every_model_has_a_factory.py`) |
 
 ## The harness system (use this)
 
@@ -536,8 +536,8 @@ transport it does not even pass. Full policy: § Error verification policy.
 ## Anti-patterns in this codebase
 
 The recipes above say what to do; these are the shapes to recognize and never copy.
-They exist in older code but **MUST NOT be used in new tests**. Structural guards
-(`test_architecture_repository_pattern.py`) catch new violations.
+They exist in older code but **MUST NOT be used in new tests**. Where an entry names a
+structural guard, that guard fails a new violation at `make quality`.
 
 ### `session.add()` in test bodies
 
@@ -553,6 +553,10 @@ with DeliveryPollEnv(tenant_id="t1", principal_id="p1") as env:
     tenant = TenantFactory(tenant_id="t1")
 ```
 
+Caught by `tests/unit/test_architecture_repository_pattern.py`, which reads `add` and
+`add_all` on a session, bare or as an attribute (`self.session.add`, `env._session.add`),
+in every tracked `.py` under `tests/`.
+
 ### `get_db_session()` in test bodies
 
 ```python
@@ -564,6 +568,8 @@ with get_db_session() as session:
 # CORRECT — use harness or integration_db fixture
 # The harness manages the session; factories commit via the bound session
 ```
+
+Caught by `tests/unit/test_architecture_repository_pattern.py`.
 
 ### Dict-based factories from `tests/fixtures/`
 
@@ -600,12 +606,55 @@ with DeliveryPollEnv(tenant_id="t1", principal_id="p1") as env:
     result = env.call_impl(media_buy_ids=[buy_id])
 ```
 
+### An env subclass outside `tests/harness/`
+
+```python
+# WRONG — a test module defines a private env
+class _RepoEnv(IntegrationEnv):
+    EXTERNAL_PATCHES: dict[str, str] = {}
+
+    def get_session(self):
+        self._commit_factory_data()
+        return self._session
+
+# CORRECT — use the env the harness defines; add a method to it when a test needs one
+with BareIntegrationEnv(tenant_id="t1") as env:
+    session = env.get_session()
+```
+
+Caught by `tests/unit/test_architecture_no_private_env_subclass.py`, which follows a class's
+bases through mixins and harness envs, and finds a class defined inside a test function too.
+
+### `create_app()` or `.test_client()` in a test module
+
+```python
+# WRONG — a module-level app that the harness does not configure
+from src.admin.app import create_app
+
+app = create_app()
+
+@pytest.fixture
+def client():
+    with app.test_client() as client:
+        yield client
+
+# CORRECT — take the client from the harness: the admin_client fixture here,
+# env.get_rest_client() for REST, or admin_test_app() from tests/helpers/admin_session.py
+def test_accounts_page(admin_client):
+    response = admin_client.get(url)
+```
+
+Caught by `tests/unit/test_architecture_app_built_by_harness_only.py`, which flags
+`create_app`, `Flask`, `TestClient` and `.test_client()` in any module outside
+`tests/harness/` and `tests/helpers/`, at module level or inside a function.
+
 ### Why these anti-patterns exist
 
 These are **pre-existing debt**, not established patterns. They predate the harness system
 and factory-boy migration. They are tracked in guard allowlists with `FIXME` comments and
-shrink over time. The structural guard `test_architecture_repository_pattern.py` has an
-allowlist of files permitted to use `get_db_session()` — **new files are never added**.
+shrink over time. The structural guard `test_architecture_repository_pattern.py` keys its
+allowlists by `(path, function)`, so a new function in an allowlisted file fails too —
+**a new violation never gets a row**.
 
 **When you see existing tests using these patterns: do not copy them.** Use the harness
 and factories regardless of what the surrounding tests do.

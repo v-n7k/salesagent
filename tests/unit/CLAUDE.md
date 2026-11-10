@@ -29,7 +29,14 @@ config files, the rule set) and assert an invariant about the codebase. They bel
 because they need no infrastructure, not because they are unit tests. Two rules bind them:
 
 - **A guard must be seen to fail.** Reintroduce the defect it targets and watch it go red
-  before trusting it. A guard that has never fired is not known to grade anything.
+  before trusting it. A guard that has never fired is not known to grade anything. Keep
+  that check in the module: every guard module (`test_architecture_*`, `test_guards_*`,
+  `test_ast_grep_*`) calls one of the shared self-test helpers in `_architecture_helpers.py`:
+  `assert_detector_catches_ast_snippets`, `assert_detector_ignores_ast_snippets`,
+  `anchor_consistency_detects_drift`, `write_ast_grep_probe`, `stage_ast_grep_root` or
+  `assert_check_rejects_mutation`. `test_architecture_guards_have_self_tests.py` fails a
+  guard module that calls none; its `KNOWN_WITHOUT_SELF_TEST` lists the modules that
+  predate the rule, and only shrinks.
 - **A guard that can be a ruff or ast-grep rule should be one.** A rule refuses at the point
   of writing; a test reports after the fact. `test_ast_grep_test_flag_ban.py` is the shape
   to copy when a rule needs a companion: it shells out to the real rule rather than
