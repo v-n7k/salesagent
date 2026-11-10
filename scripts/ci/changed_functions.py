@@ -112,9 +112,10 @@ def touched_paths(repo_root: Path, base: str, roots: Sequence[str]) -> list[str]
     ``--no-renames`` lists a rename as a deletion of the source path and an addition of the target path.
     """
     # Ceiling: git quotes a path with unusual characters in this output, and test modules here have
-    # plain names. To lift it, add ``-z`` and split the output on NUL. A path with a space has a second
-    # cost: the ``_pytest`` action splits its ``paths`` input on spaces, so pytest exits 4 on the two
-    # halves and the verdict reads ``error``. No test path in this repository has a space.
+    # plain names. To lift it, add ``-z`` and split the output on NUL. A second ceiling: git does not
+    # quote a path with a space, but the ``_pytest`` action splits its ``paths`` input on spaces, so
+    # pytest exits 4 on the two halves and the verdict reads ``error``. No test path in this repository
+    # has a space.
     result = _run_git(repo_root, "diff", "--name-only", "--no-renames", "--diff-filter=AMD", base, "HEAD", "--", *roots)
     result.check_returncode()
     return sorted(result.stdout.splitlines())

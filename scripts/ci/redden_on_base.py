@@ -19,10 +19,11 @@ file as an argument and ``--continue-on-collection-errors``, pytest records the 
 collector, runs the rest, and exits 1.
 
 The ``verdict`` subcommand grades the pytest reports of the two runs and appends the summary. A run did
-not complete when it has no report or its report records a pytest exit code of 2, 3, or 4. A head run
-that did not complete makes the verdict an ``error`` for every title. A base run that did not complete
-does so for a pull request that the gate grades, so the gate fails closed. The exit code is 1 for a
-``fail`` or ``error`` verdict and 0 otherwise.
+not complete when it has no report, when its report is not valid JSON, or when its report records a pytest
+exit code of 2, 3, or 4. A head run that did not complete makes the verdict an ``error`` for every title.
+A base run that did not complete does so for a pull request that the gate grades, so the gate fails
+closed. The exit code is 1 for a ``fail`` or ``error`` verdict and 0 otherwise. Those two verdicts also
+print a GitHub ``::error`` annotation with the reason, which the run page shows.
 """
 
 from __future__ import annotations
@@ -207,7 +208,8 @@ def verdict(
     """Return the verdict for a pull request, from the first rule that decides.
 
     1. A head run that did not complete is an ``error`` for every title, because the job itself is broken.
-       This rule comes first so that a ``refactor`` title cannot hide a broken job.
+       This rule comes first so that a ``refactor`` title cannot hide a broken job. The reason names a base
+       run that did not complete as well.
     2. A title whose type is not gated is ``advisory``.
     3. A pull request that changed no production root is ``advisory``.
     4. A base run that did not complete is an ``error``, because on a gated pull request an absent base

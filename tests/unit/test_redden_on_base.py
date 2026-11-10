@@ -529,9 +529,8 @@ def test_main_verdict_prints_the_reason_of_a_fail_as_an_annotation(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     changed = _changed_json(_fix_repo(tmp_path, "unit"), tmp_path / "changed.json")
-    report = _write_report(
-        tmp_path / "report.json", FIX_ID, PASSED
-    )  # Green on both sides, so the test does not redden.
+    # Green on both sides, so the test does not redden.
+    report = _write_report(tmp_path / "report.json", FIX_ID, PASSED)
     reports = ("--head-report", f"unit={report}", "--base-report", f"unit={report}")
     assert main(_verdict_argv(*reports, changed=changed, summary=tmp_path / "summary.md")) == 1
     assert capsys.readouterr().out == (
@@ -551,7 +550,7 @@ def test_main_verdict_grades_the_two_sides_apart_when_the_title_is_not_gated(
     base_aborted = ("--head-report", f"unit={ok}", "--base-report", f"unit={tmp_path / 'absent-base.json'}")
     assert main(_verdict_argv(*base_aborted, changed=changed, summary=summary, title="refactor: x")) == 0
     assert capsys.readouterr().out == "advisory: title type 'refactor' is not gated\n"
-    # A head run that aborted is the job's own fault, whatever the title is.
+    # A head run that aborted means the job is broken, whatever the title is.
     head_aborted = ("--head-report", f"unit={tmp_path / 'absent-head.json'}", "--base-report", f"unit={ok}")
     assert main(_verdict_argv(*head_aborted, changed=changed, summary=summary, title="refactor: x")) == 1
     assert capsys.readouterr().out == _failing_stdout("error", "a run did not complete: head unit: no report")
