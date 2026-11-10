@@ -536,7 +536,7 @@ def sample_products(integration_db, sample_tenant):
     """Create sample products that comply with AdCP protocol."""
     from src.core.database.database_session import get_db_session
     from src.core.database.models import Product
-    from tests.factories import PricingOptionFactory
+    from tests.factories import PricingOptionFactory, StoredPlacementFactory
 
     with get_db_session() as session:
         products = [
@@ -561,30 +561,30 @@ def sample_products(integration_db, sample_tenant):
                 properties=None,
                 # Placements for placement-targeting validation (adcp#208)
                 placements=[
-                    {
-                        "placement_id": "homepage_atf",
-                        "name": "Homepage Above the Fold",
-                        "description": "Premium above-the-fold placement on homepage",
-                        "format_ids": [
+                    StoredPlacementFactory(
+                        placement_id="homepage_atf",
+                        name="Homepage Above the Fold",
+                        description="Premium above-the-fold placement on homepage",
+                        format_ids=[
                             {"agent_url": "https://creative.adcontextprotocol.org", "id": "display_300x250"},
                         ],
-                    },
-                    {
-                        "placement_id": "sidebar",
-                        "name": "Sidebar",
-                        "description": "Standard sidebar placement",
-                        "format_ids": [
+                    ),
+                    StoredPlacementFactory(
+                        placement_id="sidebar",
+                        name="Sidebar",
+                        description="Standard sidebar placement",
+                        format_ids=[
                             {"agent_url": "https://creative.adcontextprotocol.org", "id": "display_300x250"},
                         ],
-                    },
-                    {
-                        "placement_id": "article_inline",
-                        "name": "Article Inline",
-                        "description": "Inline placement within article content",
-                        "format_ids": [
+                    ),
+                    StoredPlacementFactory(
+                        placement_id="article_inline",
+                        name="Article Inline",
+                        description="Inline placement within article content",
+                        format_ids=[
                             {"agent_url": "https://creative.adcontextprotocol.org", "id": "display_728x90"},
                         ],
-                    },
+                    ),
                 ],
             ),
             Product(
@@ -1264,17 +1264,10 @@ def bound_factory_session(integration_db):
     because a caller that only borrowed the binding would still have to manage the
     SASession itself and that is where the hand-rolled versions diverge.
     """
-    from sqlalchemy.orm import Session as SASession
+    from tests.utils.database_helpers import bound_factory_session as bound
 
-    from src.core.database.database_session import get_engine
-    from tests.utils.database_helpers import bind_factories_to_session
-
-    session = SASession(bind=get_engine())
-    try:
-        with bind_factories_to_session(session):
-            yield session
-    finally:
-        session.close()
+    with bound() as session:
+        yield session
 
 
 #: Integration tests ledgered pending rewrite — see ``known_failures.txt`` next to this
