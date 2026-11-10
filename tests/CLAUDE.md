@@ -645,8 +645,8 @@ def test_accounts_page(admin_client):
 ```
 
 Caught by `tests/unit/test_architecture_app_built_by_harness_only.py`, which flags
-`create_app`, `Flask`, `TestClient` and `.test_client()` in any module outside
-`tests/harness/` and `tests/helpers/`, at module level or inside a function.
+`create_app`, `Flask`, `FastAPI`, `TestClient` and `.test_client()` in any module under
+`tests/` outside `tests/harness/` and `tests/helpers/`, at module level or inside a function.
 
 ### Why these anti-patterns exist
 

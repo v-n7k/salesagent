@@ -124,9 +124,10 @@ fails CI immediately. When an existing violation is fixed, the stale-allowlist
 test forces you to remove the entry.
 
 **FIXME comments link to a GitHub issue/PR.** Every allowlisted violation has a
-corresponding `# FIXME(#<gh-issue>)` comment at the source location, linking to
-a tracked GitHub issue/PR. Use the GitHub number, never a local beads id — beads
-ids don't resolve for outside contributors reading the code.
+`# FIXME(#<gh-issue>)` comment on its allowlist row, or on the comment that
+heads its block of rows, linking to a tracked GitHub issue/PR. Use the GitHub
+number, never a local beads id — beads ids don't resolve for outside
+contributors reading the code.
 
 **AST scanning, not runtime execution.** Guards parse Python source with the
 `ast` module. They don't import or execute business logic, so they run fast
@@ -503,7 +504,7 @@ def test_detector_catches_known_bad():
 | Test | What it checks |
 |------|---------------|
 | `test_every_guard_module_calls_a_shared_self_test_helper` | Every guard module that calls no helper is a row in `KNOWN_WITHOUT_SELF_TEST`, and no row is stale |
-| `test_meta_guard_flags_a_module_with_no_helper_call` | A module with only plain asserts, and one with a hand-rolled self-test, are flagged |
+| `test_meta_guard_flags_a_module_with_no_helper_call` | A module with only plain asserts, one with a hand-rolled self-test, and one that imports a helper without calling it are flagged |
 | `test_meta_guard_accepts_each_helper_by_name_and_as_attribute` | A call to each name in `SELF_TEST_HELPERS` passes, and so does the attribute form |
 
 **Allowlist:** `KNOWN_WITHOUT_SELF_TEST`, keyed `(path,)`; every row carries
@@ -552,7 +553,7 @@ with BareIntegrationEnv(tenant_id="t1") as env:
 | Test | What it checks |
 |------|---------------|
 | `test_no_env_subclass_outside_the_harness` | Every env subclass outside `tests/harness/` is a row in `KNOWN_PRIVATE_ENV_SUBCLASSES`, and no row is stale |
-| `test_flags_a_subclass_at_module_level_and_inside_a_function` | A subclass at module level, one inside a test function, and one through a local mixin are flagged |
+| `test_flags_a_subclass_at_module_level_and_inside_a_function` | A subclass at module level, one inside a test function, one with a local mixin beside a root, and one that reaches a root through a harness env (`TaskManagementEnv`) are flagged |
 | `test_ignores_classes_that_do_not_derive_from_an_env_root` | A subclass of the e2e `_LiveDBEnv` shim, which has no env base, a plain class, and a class inside a string literal are not flagged |
 
 **Allowlist:** `KNOWN_PRIVATE_ENV_SUBCLASSES`, keyed `(path, class name)`;
@@ -567,7 +568,7 @@ it needs added to that env.
 
 **What it enforces:** No module under `tests/` outside `tests/harness/` and
 `tests/helpers/` calls a name in `APP_CONSTRUCTORS` (`create_app`, `Flask`,
-`TestClient`), bare or as an attribute, or the `test_client` method
+`FastAPI`, `TestClient`), bare or as an attribute, or the `test_client` method
 (`CLIENT_METHOD`).
 
 **Why it matters:** A test takes its app and its client from the harness:
@@ -608,7 +609,7 @@ def test_accounts_page(admin_client):
 | Test | What it checks |
 |------|---------------|
 | `test_tests_build_no_app_or_client_outside_the_harness` | Every construction outside `tests/harness/` and `tests/helpers/` is a row in `KNOWN_APP_CONSTRUCTIONS`, and no row is stale |
-| `test_flags_each_construction_form` | `create_app()` at module level, `admin.create_app(...)`, `Flask(...)`, `TestClient(...)` and `app.test_client()` are flagged |
+| `test_flags_each_construction_form` | `create_app()` at module level, `admin.create_app(...)`, `Flask(...)`, `FastAPI(...)`, `TestClient(...)` and `app.test_client()` are flagged |
 | `test_ignores_the_harness_names_and_unrelated_calls` | `admin_test_app()`, `env.get_rest_client()` and `make_users_test_client()` are not flagged |
 
 **Allowlist:** `KNOWN_APP_CONSTRUCTIONS`, keyed `(path, enclosing function)`;
@@ -829,9 +830,9 @@ They replaced grep-based pre-commit hooks (issue #1234).
 Guards use the `@pytest.mark.arch_guard` marker (distinct from the
 entity-marker `architecture`).
 
-A module in this table that `KNOWN_WITHOUT_SELF_TEST` in
-`tests/unit/test_architecture_guards_have_self_tests.py` lists calls no shared
-self-test helper yet; the others do.
+`KNOWN_WITHOUT_SELF_TEST` in
+`tests/unit/test_architecture_guards_have_self_tests.py` lists the modules in
+this table that call no shared self-test helper yet; the others call one.
 
 CI-only hook enforcement runs in `make quality-ci`: duplication, GAM auth
 support, response attribute access, roundtrip tests. See
@@ -856,7 +857,7 @@ it, use it, and delete it with the refactor — don't add it here.
    [Guard design rules](#guard-design-rules));
    `test_architecture_guards_have_self_tests.py` fails a guard module that
    calls none
-7. Add FIXME comments at each violation site: `# FIXME(#<gh-issue>): description` (GitHub issue/PR number, never a beads id)
+7. Put a `# FIXME(#<gh-issue>)` comment on each allowlist row, or on the comment that heads a block of rows (GitHub issue/PR number, never a beads id)
 8. Document the guard in this file
 
 ### Use the shared helpers

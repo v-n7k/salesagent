@@ -36,7 +36,7 @@ because they need no infrastructure, not because they are unit tests. Two rules 
   `anchor_consistency_detects_drift`, `write_ast_grep_probe`, `stage_ast_grep_root` or
   `assert_check_rejects_mutation`. `test_architecture_guards_have_self_tests.py` fails a
   guard module that calls none; its `KNOWN_WITHOUT_SELF_TEST` lists the modules that
-  predate the rule, and only shrinks.
+  called none when the rule landed, and only shrinks.
 - **A guard that can be a ruff or ast-grep rule should be one.** A rule refuses at the point
   of writing; a test reports after the fact. `test_ast_grep_test_flag_ban.py` is the shape
   to copy when a rule needs a companion: it shells out to the real rule rather than

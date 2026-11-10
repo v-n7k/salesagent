@@ -43,7 +43,7 @@ This guide surfaces the repository-specific rules for the Prebid Sales Agent cod
 ### Structural guards (automated architecture enforcement)
 AST-scanning tests enforce architecture invariants on every `make quality` run. New violations fail the build immediately.
 
-**The following table is a representative subset, not the full set.** There are over 150 guard tests (`tests/unit/test_architecture_*.py`, plus a handful of boundary guards like `test_transport_agnostic_impl.py`); `ls tests/unit/test_architecture_*.py tests/unit/test_guards_*.py tests/unit/test_ast_grep_*.py` prints the current set, which is the only count that cannot go stale. See [docs/development/structural-guards.md](docs/development/structural-guards.md) for design rationale (its written inventory covers only a subset).
+**The following table is a representative subset, not the full set.** There are over 150 guard tests (`tests/unit/test_architecture_*.py`, `test_guards_*.py` and `test_ast_grep_*.py`, plus a handful of boundary guards like `test_transport_agnostic_impl.py`); `ls tests/unit/test_architecture_*.py tests/unit/test_guards_*.py tests/unit/test_ast_grep_*.py` prints the modules with those three prefixes, which is the only count that cannot go stale. See [docs/development/structural-guards.md](docs/development/structural-guards.md) for design rationale (its written inventory covers only a subset).
 
 | Guard | Enforces | Test file |
 |-------|----------|-----------|
@@ -64,7 +64,7 @@ AST-scanning tests enforce architecture invariants on every `make quality` run. 
 | No direct DB access | No `get_db_session()` in `_impl` code (`src/core/tools/`, `src/core/helpers/`); no function or fixture in a tracked `.py` under `tests/` calls `get_db_session()`, or `add` / `add_all` on a session (`session`, `self.session`, `env._session`, ...) | `test_architecture_repository_pattern.py` |
 | Every model has a factory | Every ORM model in `src/core/database/models.py` has a `SQLAlchemyModelFactory` in `tests/factories/`; a model without one is what forces a test into `session.add()` | `test_architecture_every_model_has_a_factory.py` |
 | No private env subclass | No class outside `tests/harness/`, at module level or inside a function, derives through any chain of bases from `BaseTestEnv`, `IntegrationEnv` or `BareIntegrationEnv`; a test that needs more from an env adds a method to it in `tests/harness/` | `test_architecture_no_private_env_subclass.py` |
-| App built by the harness | No test module outside `tests/harness/` and `tests/helpers/` calls `create_app`, `Flask`, `TestClient` or `.test_client()`; a test takes the `admin_client` fixture, `env.get_rest_client()` or `admin_test_app()` | `test_architecture_app_built_by_harness_only.py` |
+| App built by the harness | No test module outside `tests/harness/` and `tests/helpers/` calls `create_app`, `Flask`, `FastAPI`, `TestClient` or `.test_client()`; a test takes the `admin_client` fixture, `env.get_rest_client()` or `admin_test_app()` | `test_architecture_app_built_by_harness_only.py` |
 | Migration completeness | Every migration has non-empty `upgrade()` and `downgrade()` | `test_architecture_migration_completeness.py` |
 | No raw MediaPackage select | All MediaPackage access goes through repository, not raw `select()` | `test_architecture_no_raw_media_package_select.py` |
 | No import-time filesystem I/O | `src/` and `scripts/` modules touch no files while being imported | `test_architecture_no_import_time_fs_io.py` |
@@ -90,7 +90,7 @@ AST-scanning tests enforce architecture invariants on every `make quality` run. 
 
 **Rules for guards:**
 - Allowlists can only shrink — never add new violations, fix them instead
-- Every allowlisted violation has a `# FIXME(#<gh-issue>)` comment at the source location — reference a GitHub issue/PR number, never a local beads id (beads ids don't resolve for outside contributors)
+- Every allowlisted violation has a `# FIXME(#<gh-issue>)` comment on its allowlist row, or on the comment that heads its block of rows — reference a GitHub issue/PR number, never a local beads id (beads ids don't resolve for outside contributors)
 - When you fix a violation, remove it from the allowlist (the stale-entry test reminds you)
 - Every guard module calls a shared self-test helper; `test_architecture_guards_have_self_tests.py` lists the ones that do not yet
 
