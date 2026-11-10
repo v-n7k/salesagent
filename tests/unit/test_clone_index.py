@@ -53,12 +53,17 @@ def test_renamed_locals_and_different_literals_are_one_window(tmp_path: Path) ->
 
 
 def test_relabel_window_numbers_labels_by_first_appearance() -> None:
+    # The second line names the second label first. `api_v1` and `_v1_x` are not labels.
     dump = (
-        "Assign([Name('_v3', Store())], Call(Name('api_v1', Load()), [Name('_v1', Load())], []))\nReturn(Name('_v3'))"
+        "Assign([Name('_v3')], Call(Name('api_v1'), [Name('_v12'), Name('_v1_x')]))\n"
+        "Return(Tuple([Name('_v12'), Name('_v3')]))"
     )
-    assert relabel_window(dump) == (
-        "Assign([Name('_w0', Store())], Call(Name('api_v1', Load()), [Name('_w1', Load())], []))\nReturn(Name('_w0'))"
+    expected = (
+        "Assign([Name('_w0')], Call(Name('api_v1'), [Name('_w1'), Name('_v1_x')]))\n"
+        "Return(Tuple([Name('_w1'), Name('_w0')]))"
     )
+    assert relabel_window(dump) == expected
+    assert relabel_window(expected) == expected
 
 
 @pytest.mark.parametrize(
@@ -190,13 +195,15 @@ def test_groups_are_connected_components(tmp_path: Path) -> None:
 
 def test_partners_and_new_pairs(tmp_path: Path) -> None:
     base = _write_and_index(tmp_path / "base", {"src/a.py": SEED_A, "tests/b.py": SEED_B})
+    # In head, a blank first line moves seed_tenant to line 2; a function that only moved is not new.
     head = _write_and_index(
         tmp_path / "head",
-        {"src/a.py": SEED_A, "tests/b.py": SEED_B, "tests/c.py": SEED_B.replace("seed_other", "seed_third")},
+        {"src/a.py": "\n" + SEED_A, "tests/b.py": SEED_B, "tests/c.py": SEED_B.replace("seed_other", "seed_third")},
     )
     third = FunctionRef("tests/c.py", "seed_third", 1)
-    assert clone_partners(head)[third] == FunctionRef("src/a.py", "seed_tenant", 1)
-    assert new_clone_pairs(head, base) == [(third, FunctionRef("src/a.py", "seed_tenant", 1))]
+    moved = FunctionRef("src/a.py", "seed_tenant", 2)
+    assert clone_partners(head)[third] == moved
+    assert new_clone_pairs(head, base) == [(third, moved)]
 
 
 def test_count_by_root_uses_the_longest_root_prefix() -> None:

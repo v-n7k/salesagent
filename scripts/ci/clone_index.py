@@ -223,9 +223,13 @@ def _connected(start: FunctionRef, neighbours: Mapping[FunctionRef, set[Function
 def new_clone_pairs(
     head: Mapping[str, list[Window]], base: Mapping[str, list[Window]]
 ) -> list[tuple[FunctionRef, FunctionRef]]:
-    """Return each function clone-bearing in ``head`` and not in ``base``, with its partner in ``head``, sorted."""
-    before = clone_bearing_functions(base)
-    return sorted((fn, partner) for fn, partner in clone_partners(head).items() if fn not in before)
+    """Return each function clone-bearing in ``head`` and not in ``base``, with its partner in ``head``, sorted.
+
+    A function is the same function in both trees when its path and qualname match, so a function
+    that only moved to another line is not new. Each pair carries the ``FunctionRef`` from ``head``.
+    """
+    before = {(fn.path, fn.qualname) for fn in clone_bearing_functions(base)}
+    return sorted((fn, partner) for fn, partner in clone_partners(head).items() if (fn.path, fn.qualname) not in before)
 
 
 def count_by_root(functions: Iterable[FunctionRef], roots: Sequence[str] = ROOTS) -> dict[str, int]:
