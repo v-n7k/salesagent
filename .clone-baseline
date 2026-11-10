@@ -1,0 +1,7 @@
+{
+  "src": 70,
+  "tests": 973,
+  "scripts": 15,
+  ".pre-commit-hooks": 4,
+  ".claude/scripts": 0
+}
