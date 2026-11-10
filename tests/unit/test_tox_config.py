@@ -11,6 +11,7 @@ import configparser
 import tomllib
 from pathlib import Path
 
+import coverage
 import pytest
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -87,17 +88,23 @@ class TestCoverageConfig:
         """[tool.coverage.report] should exist with show_missing."""
         assert "[tool.coverage.report]" in pyproject_content, "Missing [tool.coverage.report] in pyproject.toml"
 
-    def test_no_root_coveragerc_shadows_pyproject(self):
-        """A root .coveragerc wins over [tool.coverage.*] and silently turns branch coverage off."""
-        assert not (PROJECT_ROOT / ".coveragerc").exists(), (
-            ".coveragerc shadows pyproject.toml's [tool.coverage.run]; delete it, pyproject is the one config"
-        )
+    def test_pyproject_is_the_effective_coverage_config(self, monkeypatch):
+        """Coverage reads pyproject.toml, with branch coverage on, when run from the repository root.
+
+        Coverage stops at the first of .coveragerc, .coveragerc.toml, setup.cfg, tox.ini and pyproject.toml that
+        holds a coverage section, so a stray earlier file would turn branch coverage off with no error.
+        """
+        monkeypatch.chdir(PROJECT_ROOT)
+        cfg = coverage.Coverage(config_file=True).config
+        assert Path(cfg.config_file).resolve() == PYPROJECT.resolve(), cfg.config_file
+        assert cfg.branch is True, "branch coverage is what .coverage-baseline was seeded with"
 
     def test_coverage_omits_in_tree_test_modules(self, pyproject_content):
         """src/admin/tests/ is collected by no CI job; measured, it reads as 0%."""
         assert 'omit = ["src/admin/tests/*"]' in pyproject_content
 
     def test_diff_cover_is_a_locked_dev_dependency(self, pyproject_content):
+        """diff-cover is declared with a floor in the dev group and resolved to one version in uv.lock."""
         assert '"diff-cover>=11.0.1"' in pyproject_content
         assert 'name = "diff-cover"' in (PROJECT_ROOT / "uv.lock").read_text()
 
