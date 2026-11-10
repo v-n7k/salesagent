@@ -190,6 +190,13 @@ def test_read_json_baseline_reads_object(tmp_path: Path) -> None:
     }
 
 
+def test_count_regex_in_sources_sums_matches_over_python_files_only(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("x = 1  # pragma: no cover\n")
+    (tmp_path / "b.py").write_text("if TYPE_CHECKING:  #pragma:  no cover\n    pass\ny = 2  # pragma: no cover\n")
+    (tmp_path / "c.txt").write_text("# pragma: no cover\n")
+    assert count_ratchet.count_regex_in_sources(tmp_path, re.compile(r"#\s*pragma:\s*no cover")) == 3
+
+
 _DONE = "DONE"
 
 

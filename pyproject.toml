@@ -272,7 +272,6 @@ source = [
 show_missing = true
 skip_covered = true
 exclude_also = [
-    "pragma: no cover",
     "def __repr__",
     "raise AssertionError",
     "raise NotImplementedError",

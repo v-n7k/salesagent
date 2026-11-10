@@ -96,6 +96,12 @@ FAST_RATCHETS = (
         lambda hook, root: hook.count_raw_session_usage(root),
     ),
     RatchetCounter(
+        "no-cover-no-regression",
+        "check_no_cover_count",
+        ".no-cover-baseline",
+        lambda hook, root: {SINGLE_KEY: hook.count_no_cover(root / hook.SRC_DIR)},
+    ),
+    RatchetCounter(
         "ruff-complexity-no-regression",
         "check_ruff_complexity_count",
         ".ruff-complexity-baseline",

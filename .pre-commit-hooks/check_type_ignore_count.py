@@ -23,8 +23,8 @@ import sys
 from pathlib import Path
 
 from count_ratchet import (
+    count_regex_in_sources,
     int_baseline_io,
-    iter_python_sources,
     parse_ratchet_args,
     resolve_ratchet_paths,
     run_count_ratchet,
@@ -35,17 +35,12 @@ SRC_DIR = "src"
 MAIN_REF = "origin/main"
 KEY = "type_ignores"
 KEYS = (KEY,)
+TYPE_IGNORE = re.compile(r"#\s*type:\s*ignore")
 
 
 def count_type_ignores(src_path: Path) -> int:
     """Count all # type: ignore comments in Python files within src/."""
-    count = 0
-    pattern = re.compile(r"#\s*type:\s*ignore")
-
-    for _path, content in iter_python_sources(src_path):
-        count += len(pattern.findall(content))
-
-    return count
+    return count_regex_in_sources(src_path, TYPE_IGNORE)
 
 
 def main() -> int:

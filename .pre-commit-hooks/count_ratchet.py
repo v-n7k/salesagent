@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -84,6 +85,11 @@ def iter_python_sources(root: Path) -> Iterator[tuple[Path, str]]:
         except FileNotFoundError:
             continue
         yield path, text
+
+
+def count_regex_in_sources(root: Path, pattern: re.Pattern[str]) -> int:
+    """Count the matches of *pattern* across every ``.py`` file under *root*."""
+    return sum(len(pattern.findall(content)) for _path, content in iter_python_sources(root))
 
 
 def read_json_baseline(baseline_file: Path, keys: Sequence[str]) -> dict[str, int] | None:

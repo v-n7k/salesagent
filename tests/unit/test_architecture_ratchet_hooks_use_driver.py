@@ -29,6 +29,7 @@ RATCHET_HOOKS: dict[str, str] = {
     "check_code_duplication": ".duplication-baseline",
     "check_fixme_citation_count": ".fixme-citation-baseline",
     "check_admin_raw_session_count": ".admin-raw-session-baseline",
+    "check_no_cover_count": ".no-cover-baseline",
 }
 
 #: Names a hook must NOT define: the per-hook probe copies the driver replaced.
