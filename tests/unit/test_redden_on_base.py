@@ -1,6 +1,13 @@
-"""Tests for the verdict of the red-on-base gate: the outcome of each test, the rules in order, and the summary."""
+"""Tests for the red-on-base gate: the outcome of each test, the rules in order, the summary, and the command line."""
 
 from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
 
 from scripts.ci.changed_functions import ADDED, CHANGED, DELETED, FunctionChange
 from scripts.ci.redden_on_base import (
@@ -11,11 +18,14 @@ from scripts.ci.redden_on_base import (
     SKIPPED,
     Verdict,
     bucket_for,
+    main,
     outcomes,
     render_summary,
     title_prefix,
     verdict,
 )
+from tests.helpers.scratch_repo import git, git_repo, write
+from tests.unit._architecture_helpers import repo_root
 
 
 def test_title_prefix_reads_the_conventional_type() -> None:
@@ -245,3 +255,167 @@ def test_render_summary_orders_base_before_head_and_dashes_the_tests_that_do_not
     assert "| tests/bdd/test_uc.py::test_s | added | unhosted | - | - |" in text
     assert "| tests/unit/test_a.py::test_old | deleted | unit | - | - |" in text
     assert "Touched without" not in text  # Every touched path holds a change.
+
+
+def test_render_summary_prints_the_title_between_the_heading_and_the_verdict() -> None:
+    text = render_summary(title="fix: x", verdict=Verdict("pass", "r"), touched=[], changes=[], head={}, base={})
+    assert text.startswith("## Tests redden on base\n\nTitle: fix: x\n\n**pass**: r\n\n| test |")
+
+
+FIX_ID = "tests/unit/test_a.py::test_one"
+INTEGRATION_FIX_ID = "tests/integration/test_a.py::test_one"
+
+
+def _fix_repo(tmp_path: Path, *suites: str, production: bool = True) -> Path:
+    """Return a scratch repo whose HEAD commit changes ``test_one`` in ``tests/<suite>/test_a.py`` of each suite.
+
+    The commit changes ``src/x.py`` too, unless ``production`` is false.
+    """
+    test_paths = [f"tests/{suite}/test_a.py" for suite in suites]
+    repo = git_repo(tmp_path, {"src/x.py": "VALUE = 1\n", **dict.fromkeys(test_paths, "def test_one():\n    pass\n")})
+    if production:
+        write(repo, "src/x.py", "VALUE = 2\n")
+    for test_path in test_paths:
+        write(repo, test_path, "def test_one():\n    from src.x import VALUE\n    assert VALUE == 2\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "fix")
+    return repo
+
+
+def _changed_json(repo: Path, out: Path) -> Path:
+    """Run ``changed`` on ``repo`` against its first parent and return ``out``."""
+    assert main(["changed", "--repo", str(repo), "--base", "HEAD^1", "--out", str(out)]) == 0
+    return out
+
+
+def _write_report(path: Path, node_id: str, outcome: str) -> Path:
+    """Write a pytest-json-report document with one row, for ``node_id``, and return ``path``."""
+    path.write_text(json.dumps({"tests": [{"nodeid": node_id, "outcome": outcome}], "collectors": []}))
+    return path
+
+
+def _verdict_argv(*reports: str, changed: str | Path = "changed.json", summary: str | Path = "summary.md") -> list[str]:
+    """Return the arguments of a ``verdict`` call for the title ``fix: x``, followed by the given report options."""
+    return ["verdict", "--changed", str(changed), "--title", "fix: x", "--summary", str(summary), *reports]
+
+
+def test_main_changed_then_ids_then_verdict_round_trip(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repo = _fix_repo(tmp_path, "unit")  # The base commit has src/x.py and tests/unit/test_a.py::test_one.
+    changed = tmp_path / "changed.json"
+    assert main(["changed", "--repo", str(repo), "--base", "HEAD^1", "--out", str(changed)]) == 0
+    doc = json.loads(changed.read_text())
+    assert doc["production_changed"] is True
+    assert [c["node_id"] for c in doc["changes"]] == [FIX_ID]
+    assert (doc["base"], doc["touched"]) == ("HEAD^1", ["tests/unit/test_a.py"])
+    assert main(["ids", str(changed), "unit"]) == 0
+    assert capsys.readouterr().out.strip() == FIX_ID
+    head = _write_report(tmp_path / "head.json", FIX_ID, PASSED)
+    base = _write_report(tmp_path / "base.json", FIX_ID, FAILED)
+    summary = tmp_path / "summary.md"
+    summary.write_text("earlier step\n")  # The summary file collects what the other steps of the job wrote.
+    reports = ("--head-report", f"unit={head}", "--base-report", f"unit={base}")
+    assert main(_verdict_argv(*reports, changed=changed, summary=summary)) == 0
+    assert capsys.readouterr().out.strip() == f"pass: {FIX_ID} is red on base and green on head"
+    text = summary.read_text()
+    assert text.startswith("earlier step\n## Tests redden on base\n")
+    assert "\nTitle: fix: x\n" in text
+    assert f"| {FIX_ID} | changed | unit | failed | passed |" in text
+
+
+def test_main_verdict_reads_each_suite_from_its_own_report_on_each_side(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    changed = _changed_json(_fix_repo(tmp_path, "unit", "integration"), tmp_path / "changed.json")
+    summary = tmp_path / "summary.md"
+    # Only the integration test is red on the base, so the verdict depends on the report of each suite on each side.
+    head_unit = _write_report(tmp_path / "head-unit.json", FIX_ID, PASSED)
+    head_integration = _write_report(tmp_path / "head-integration.json", INTEGRATION_FIX_ID, PASSED)
+    base_unit = _write_report(tmp_path / "base-unit.json", FIX_ID, PASSED)
+    base_integration = _write_report(tmp_path / "base-integration.json", INTEGRATION_FIX_ID, FAILED)
+    head = ("--head-report", f"unit={head_unit}", "--head-report", f"integration={head_integration}")
+    base = ("--base-report", f"unit={base_unit}", "--base-report", f"integration={base_integration}")
+    assert main(_verdict_argv(*head, *base, changed=changed, summary=summary)) == 0
+    assert capsys.readouterr().out == f"pass: {INTEGRATION_FIX_ID} is red on base and green on head\n"
+    text = summary.read_text()
+    assert f"| {FIX_ID} | changed | unit | passed | passed |" in text
+    assert f"| {INTEGRATION_FIX_ID} | changed | integration | failed | passed |" in text
+
+
+def test_main_verdict_treats_a_missing_bucket_report_as_errors(tmp_path: Path) -> None:
+    changed = _changed_json(_fix_repo(tmp_path, "integration"), tmp_path / "changed.json")
+    summary = tmp_path / "summary.md"
+    # The one changed test is an integration test, and the only report named is a unit head report whose file is absent.
+    absent = f"unit={tmp_path / 'absent-head.json'}"
+    assert main(_verdict_argv("--head-report", absent, changed=changed, summary=summary)) == 1
+    assert "| error | error |" in summary.read_text()
+
+
+def test_main_verdict_is_advisory_when_no_production_root_changed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    changed = _changed_json(_fix_repo(tmp_path, "unit", production=False), tmp_path / "changed.json")
+    assert json.loads(changed.read_text())["production_changed"] is False
+    assert main(_verdict_argv(changed=changed, summary=tmp_path / "summary.md")) == 0
+    assert capsys.readouterr().out == "advisory: no production root changed\n"
+
+
+@pytest.mark.parametrize(
+    ("argv", "reason"),
+    [
+        (_verdict_argv("--head-report", "head.json"), "expected BUCKET=PATH"),
+        (_verdict_argv("--base-report", "bdd=base.json"), "expected BUCKET=PATH"),
+        (_verdict_argv("--head-report", "unit="), "expected BUCKET=PATH"),
+        (_verdict_argv("--head-report", "unit=a.json", "--head-report", "unit=b.json"), "'unit' is named twice"),
+        (["ids", "changed.json", "bdd"], "invalid choice: 'bdd'"),
+    ],
+)
+def test_main_refuses_a_bucket_argument_that_is_malformed_or_repeated(
+    argv: list[str], reason: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as refused:
+        main(argv)
+    assert refused.value.code == 2
+    assert reason in capsys.readouterr().err
+
+
+def test_main_ids_skips_deleted_tests_and_prints_an_empty_line_when_a_suite_has_none(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = git_repo(tmp_path, {"tests/unit/test_a.py": "def test_gone():\n    pass\n"})
+    write(repo, "tests/unit/test_a.py", "def test_new():\n    pass\ndef test_other():\n    pass\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "head")
+    changed = _changed_json(repo, tmp_path / "changed.json")
+    assert main(["ids", str(changed), "unit"]) == 0
+    assert capsys.readouterr().out == "tests/unit/test_a.py::test_new tests/unit/test_a.py::test_other\n"
+    assert main(["ids", str(changed), "integration"]) == 0
+    assert capsys.readouterr().out == "\n"
+
+
+def test_main_changed_reads_the_current_directory_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(_fix_repo(tmp_path, "unit"))
+    out = tmp_path / "changed.json"
+    assert main(["changed", "--base", "HEAD^1", "--out", str(out)]) == 0
+    assert json.loads(out.read_text())["touched"] == ["tests/unit/test_a.py"]
+
+
+def test_main_changed_writes_gits_message_to_stderr_before_it_raises(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = git_repo(tmp_path, {"README.md": "x\n"})
+    with pytest.raises(subprocess.CalledProcessError):
+        main(["changed", "--repo", str(repo), "--base", "no-such-ref", "--out", str(tmp_path / "changed.json")])
+    assert "no-such-ref" in capsys.readouterr().err
+
+
+def test_main_run_as_a_module_exits_with_the_code_of_the_verdict(tmp_path: Path) -> None:
+    changed = _changed_json(_fix_repo(tmp_path, "unit"), tmp_path / "changed.json")
+    command = [
+        sys.executable,
+        "-m",
+        "scripts.ci.redden_on_base",
+        *_verdict_argv(changed=changed, summary=tmp_path / "s.md"),
+    ]
+    run = subprocess.run(command, cwd=repo_root(), capture_output=True, text=True)
+    # With no report, the test reads ERROR on the head, which is never green, so the verdict is a fail.
+    assert (run.returncode, run.stdout) == (1, "fail: no hosted changed test is red on base and green on head\n")
