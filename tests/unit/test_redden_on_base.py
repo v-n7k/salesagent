@@ -335,6 +335,17 @@ def test_incomplete_runs_accepts_only_the_exit_codes_of_a_run_that_went_through_
     )
 
 
+@pytest.mark.parametrize(
+    "text", ["", '{"exitcode": 1, "tests": [{"nodeid": "tests/unit/te'], ids=["empty", "truncated"]
+)
+def test_incomplete_runs_names_a_report_that_does_not_parse_as_unreadable(tmp_path: Path, text: str) -> None:
+    unit = FunctionChange("tests/unit/test_a.py", "test_x", CHANGED)
+    report = tmp_path / "unit.json"
+    report.write_text(text)  # A run that was killed leaves a file like this, and the file exists.
+    assert incomplete_runs("base", {"unit": report}, [unit]) == ["base unit: unreadable report"]
+    assert incomplete_runs("head", {"unit": tmp_path / "absent.json"}, [unit]) == ["head unit: no report"]
+
+
 def test_render_summary_lists_every_change_and_the_untested_touches() -> None:
     text = render_summary(
         title="fix: x",
@@ -429,6 +440,11 @@ def _verdict_argv(
     return ["verdict", "--changed", str(changed), "--title", title, "--summary", str(summary), *reports]
 
 
+def _failing_stdout(status: str, reason: str) -> str:
+    """Return what ``verdict`` prints for a ``fail`` or an ``error``: the status line, then the run page annotation."""
+    return f"{status}: {reason}\n::error title=Tests redden on base::{reason}\n"
+
+
 def test_main_changed_then_ids_then_verdict_round_trip(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     repo = _fix_repo(tmp_path, "unit")  # The base commit has src/x.py and tests/unit/test_a.py::test_one.
     changed = tmp_path / "changed.json"
@@ -479,7 +495,7 @@ def test_main_verdict_errors_when_the_base_report_is_absent(tmp_path: Path, caps
     # A base run that died before it wrote its report must not read as a test that is red on the base.
     reports = ("--head-report", f"unit={head}", "--base-report", f"unit={tmp_path / 'absent-base.json'}")
     assert main(_verdict_argv(*reports, changed=changed, summary=summary)) == 1
-    assert capsys.readouterr().out == "error: a run did not complete: base unit: no report\n"
+    assert capsys.readouterr().out == _failing_stdout("error", "a run did not complete: base unit: no report")
     assert f"| {FIX_ID} | changed | unit | error | passed |" in summary.read_text()
 
 
@@ -491,7 +507,37 @@ def test_main_verdict_errors_when_a_report_records_an_aborted_run(
     base = _write_report(tmp_path / "base.json", FIX_ID, FAILED)
     reports = ("--head-report", f"unit={head}", "--base-report", f"unit={base}")
     assert main(_verdict_argv(*reports, changed=changed, summary=tmp_path / "summary.md")) == 1
-    assert capsys.readouterr().out == "error: a run did not complete: head unit: pytest exit 4\n"
+    assert capsys.readouterr().out == _failing_stdout("error", "a run did not complete: head unit: pytest exit 4")
+
+
+def test_main_verdict_errors_and_still_writes_the_table_when_a_report_is_unreadable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    changed = _changed_json(_fix_repo(tmp_path, "unit"), tmp_path / "changed.json")
+    summary = tmp_path / "summary.md"
+    head = _write_report(tmp_path / "head.json", FIX_ID, PASSED)
+    base = tmp_path / "base.json"
+    base.write_text("")  # The file exists and holds no JSON, as when a run is killed while pytest writes it.
+    reports = ("--head-report", f"unit={head}", "--base-report", f"unit={base}")
+    assert main(_verdict_argv(*reports, changed=changed, summary=summary)) == 1
+    reason = "a run did not complete: base unit: unreadable report"
+    assert capsys.readouterr().out == _failing_stdout("error", reason)
+    assert f"| {FIX_ID} | changed | unit | error | passed |" in summary.read_text()
+
+
+def test_main_verdict_prints_the_reason_of_a_fail_as_an_annotation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    changed = _changed_json(_fix_repo(tmp_path, "unit"), tmp_path / "changed.json")
+    report = _write_report(
+        tmp_path / "report.json", FIX_ID, PASSED
+    )  # Green on both sides, so the test does not redden.
+    reports = ("--head-report", f"unit={report}", "--base-report", f"unit={report}")
+    assert main(_verdict_argv(*reports, changed=changed, summary=tmp_path / "summary.md")) == 1
+    assert capsys.readouterr().out == (
+        "fail: no hosted changed test is red on base and green on head\n"
+        "::error title=Tests redden on base::no hosted changed test is red on base and green on head\n"
+    )
 
 
 def test_main_verdict_grades_the_two_sides_apart_when_the_title_is_not_gated(
@@ -500,14 +546,15 @@ def test_main_verdict_grades_the_two_sides_apart_when_the_title_is_not_gated(
     changed = _changed_json(_fix_repo(tmp_path, "unit"), tmp_path / "changed.json")
     summary = tmp_path / "summary.md"
     ok = _write_report(tmp_path / "ok.json", FIX_ID, PASSED)
-    # The base run of a refactor can abort while pytest loads a conftest, and then it writes no report. That is no error.
+    # The base run of a refactor can abort while pytest loads a conftest, and then it writes no report.
+    # The gate does not grade that PR, so it is no error.
     base_aborted = ("--head-report", f"unit={ok}", "--base-report", f"unit={tmp_path / 'absent-base.json'}")
     assert main(_verdict_argv(*base_aborted, changed=changed, summary=summary, title="refactor: x")) == 0
     assert capsys.readouterr().out == "advisory: title type 'refactor' is not gated\n"
     # A head run that aborted is the job's own fault, whatever the title is.
     head_aborted = ("--head-report", f"unit={tmp_path / 'absent-head.json'}", "--base-report", f"unit={ok}")
     assert main(_verdict_argv(*head_aborted, changed=changed, summary=summary, title="refactor: x")) == 1
-    assert capsys.readouterr().out == "error: a run did not complete: head unit: no report\n"
+    assert capsys.readouterr().out == _failing_stdout("error", "a run did not complete: head unit: no report")
 
 
 def test_main_verdict_is_advisory_when_no_production_root_changed(
@@ -603,4 +650,4 @@ def test_main_run_as_a_module_exits_with_the_code_of_the_verdict(tmp_path: Path)
     run = subprocess.run(command, cwd=repo_root(), capture_output=True, text=True)
     # With no report, neither run completed, so the verdict is an error, and an error exits 1.
     reason = "a run did not complete: head unit: no report; base unit: no report"
-    assert (run.returncode, run.stdout) == (1, f"error: {reason}\n")
+    assert (run.returncode, run.stdout) == (1, f"error: {reason}\n::error title=Tests redden on base::{reason}\n")

@@ -118,7 +118,7 @@ def production_changed(repo_root: Path, base: str) -> bool:
     return bool(touched_paths(repo_root, base, PRODUCTION_ROOTS))
 
 
-def test_node_id(nodeid: str) -> str:
+def function_node_id(nodeid: str) -> str:
     """Return the node id of the test that a report row or a collected item belongs to.
 
     The node id drops the parameter set, so that ``test_p[1]`` and ``test_p[2]`` both belong to ``test_p``.
@@ -146,7 +146,7 @@ def outcomes(report: Mapping[str, Any] | None, node_ids: Iterable[str]) -> dict[
 def _row_outcomes_by_test(rows: Iterable[Mapping[str, Any]]) -> dict[str, set[str]]:
     by_test: dict[str, set[str]] = {}
     for row in rows:
-        by_test.setdefault(test_node_id(row["nodeid"]), set()).add(row["outcome"])
+        by_test.setdefault(function_node_id(row["nodeid"]), set()).add(row["outcome"])
     return by_test
 
 
@@ -173,12 +173,12 @@ def _covers(collector: str, node_id: str) -> bool:
 
 
 def incomplete_runs(side: str, reports: Mapping[str, Path], changes: Sequence[FunctionChange]) -> list[str]:
-    """Return a line for each run on one side that has no report or that pytest aborted.
+    """Return a line for each run on one side that has no usable report or that pytest aborted.
 
     ``side`` is ``head`` or ``base``, and ``reports`` names the report file of each suite on that side. Only
     a suite with a hosted changed test needs a run. A line names the suite and the problem, as in
-    ``base unit: no report`` or ``base unit: pytest exit 4``, and the lines follow the order of the suites.
-    A report that records no exit code counts as complete.
+    ``base unit: no report``, ``base unit: unreadable report``, or ``base unit: pytest exit 4``, and the
+    lines follow the order of the suites. A report that records no exit code counts as complete.
     """
     problems: list[str] = []
     for bucket in _BUCKETS:
@@ -186,7 +186,8 @@ def incomplete_runs(side: str, reports: Mapping[str, Path], changes: Sequence[Fu
             continue
         report = _read_report(reports, bucket)
         if report is None:
-            problems.append(f"{side} {bucket}: no report")
+            cause = "no report" if _report_file(reports, bucket) is None else "unreadable report"
+            problems.append(f"{side} {bucket}: {cause}")
         elif (exitcode := report.get("exitcode", 0)) not in _COMPLETE_EXIT_CODES:
             problems.append(f"{side} {bucket}: pytest exit {exitcode}")
     return problems
@@ -428,6 +429,10 @@ def _verdict(args: argparse.Namespace) -> int:
     with args.summary.open("a") as summary_file:
         summary_file.write(markdown)
     print(f"{decision.status}: {decision.reason}")
+    if decision.exit_code:
+        # Without this line the run page shows only "Process completed with exit code 1" for the step. The reasons
+        # are fixed sentences, so they need none of the escaping that a workflow command applies to its message.
+        print(f"::error title=Tests redden on base::{decision.reason}")
     return decision.exit_code
 
 
@@ -446,20 +451,34 @@ def _hosted_ids(changes: Iterable[FunctionChange], bucket: str) -> list[str]:
     return [change.node_id for change in _hosted_changes(changes, bucket)]
 
 
+def _report_file(reports: Mapping[str, Path], bucket: str) -> Path | None:
+    """Return the file that ``reports`` names for ``bucket``, or ``None`` when it names none or the file is absent."""
+    path = reports.get(bucket)
+    return path if path is not None and path.exists() else None
+
+
 def _read_report(reports: Mapping[str, Path], bucket: str) -> dict[str, Any] | None:
     """Return the ``pytest-json-report`` document that ``reports`` names for ``bucket``, or ``None`` when there is none.
 
-    That is the case when ``reports`` names no file for the suite, and when the file does not exist.
+    That is the case when ``reports`` names no file for the suite, when the file does not exist, and when
+    the file does not parse as JSON, as an empty or a truncated one does. The caller treats all three as
+    an absent report, so the summary table still renders and the verdict is an ``error``.
     """
-    path = reports.get(bucket)
-    return json.loads(path.read_text()) if path is not None and path.exists() else None
+    path = _report_file(reports, bucket)
+    if path is None:
+        return None
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return None
 
 
 def _side_outcomes(changes: Sequence[FunctionChange], reports: Mapping[str, Path]) -> dict[str, str]:
     """Return the outcome of each hosted changed test on one side, read from the report of its suite.
 
-    A suite that has no named report, or whose report file does not exist, reads ``ERROR`` for each of its
-    tests. Those rows fill the table, and ``incomplete_runs`` is what turns the missing report into an error.
+    A suite that has no named report, or whose report file does not exist or cannot be read, reads ``ERROR``
+    for each of its tests. Those rows fill the table, and ``incomplete_runs`` is what turns the missing report
+    into an error.
     """
     merged: dict[str, str] = {}
     for bucket in _BUCKETS:

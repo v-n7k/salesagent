@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.ci.redden_on_base import test_node_id
+from scripts.ci.redden_on_base import function_node_id
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -36,7 +36,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     kept: list[pytest.Item] = []
     deselected: list[pytest.Item] = []
     for item in items:
-        if test_node_id(item.nodeid) in wanted:
+        if function_node_id(item.nodeid) in wanted:
             kept.append(item)
         else:
             deselected.append(item)
