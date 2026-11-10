@@ -103,13 +103,11 @@ FAST_RATCHETS = (
         ".ruff-complexity-baseline",
         lambda hook, root: hook.count_rule_violations(root, root / hook.SRC_DIR),
     ),
-    # The one fast ratchet above a second: one count takes about 14 s alone and 18 to
-    # 20 s inside pytest (the cost comment above `index_tree` in
-    # `scripts/ci/clone_index.py` is the one place the number lives), against under a
-    # second in total for the four above. It is here anyway because the clone count
-    # moves on more PRs than any other, so it is graded exactly, in every unit-suite
-    # run, rather than in the slower `quality` env (review-feedback guards design,
-    # § 13.2).
+    # The one fast ratchet above a second (the cost comment above `index_tree` in
+    # `scripts/ci/clone_index.py` carries the measured figures), against under a second
+    # in total for the four above. It is here anyway because the clone count moves on
+    # more PRs than any other, so it is graded exactly, in every unit-suite run, rather
+    # than in the slower `quality` env (review-feedback guards design, § 13.2).
     RatchetCounter(
         "clone-count-no-regression",
         "check_clone_count",

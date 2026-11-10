@@ -13,6 +13,8 @@ from tests.unit._architecture_helpers import load_hook_module
 from tests.unit._clone_index_helpers import SEED_A, SEED_B, write_sources
 
 NO_CLONES = {"src": 0, "tests": 0, "scripts": 0, ".pre-commit-hooks": 0, ".claude/scripts": 0}
+# A code ``main`` can only have got back from the driver, so a literal ``return 0`` fails the wiring test.
+DRIVER_EXIT = 7
 
 
 @pytest.fixture(scope="module")
@@ -81,7 +83,7 @@ def _run_main(hook, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[in
     Returns the exit code and the keyword arguments ``main`` passed to ``run_count_ratchet``.
     """
     seen: dict[str, Any] = {}
-    monkeypatch.setattr(hook, "run_count_ratchet", lambda **kwargs: seen.update(kwargs) or 0)
+    monkeypatch.setattr(hook, "run_count_ratchet", lambda **kwargs: seen.update(kwargs) or DRIVER_EXIT)
     monkeypatch.setattr(
         hook, "resolve_ratchet_paths", lambda *, baseline_name: (tmp_path, tmp_path / "src", tmp_path / baseline_name)
     )
@@ -92,6 +94,6 @@ def _run_main(hook, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[in
 
 def test_main_wires_the_roots_into_the_driver(hook, monkeypatch, tmp_path: Path) -> None:
     rc, kwargs = _run_main(hook, monkeypatch, tmp_path)
-    assert (rc, kwargs["keys"], kwargs["upstream_paths"]) == (0, ROOTS, ROOTS)
+    assert (rc, kwargs["keys"], kwargs["upstream_paths"]) == (DRIVER_EXIT, ROOTS, ROOTS)
     assert kwargs["count_upstream"] is hook.count_clone_bearing
     assert (kwargs["current"], kwargs["baseline_file"]) == (NO_CLONES, tmp_path / ".clone-baseline")
