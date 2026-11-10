@@ -22,6 +22,37 @@ from scripts.ci.workflow_helpers import load_ci_workflow
 REQUIRED_SUMMARY_GATES = frozenset({"unit-tests", "integration-tests", "e2e-tests", "bdd-tests", "admin-ui-tests"})
 
 
+def _assert_job_uploads_coverage(
+    job: dict, *, artifact: str, data_file: str, xml: str, pytest_if: str | None = None
+) -> dict:
+    """Assert that one `_pytest` step writes `data_file` and `xml`, and one upload named `artifact` carries both.
+
+    `pytest_if` narrows the `_pytest` steps to those whose `if` equals it; None counts every `_pytest` step.
+    Returns the upload step, so a caller can assert what is specific to its job.
+    """
+    pytest_steps = [
+        step
+        for step in job["steps"]
+        if str(step.get("uses", "")).endswith("/_pytest") and (pytest_if is None or step.get("if") == pytest_if)
+    ]
+    assert len(pytest_steps) == 1, f"expected one _pytest step (if={pytest_if!r}), found {len(pytest_steps)}"
+    assert pytest_steps[0].get("env", {}).get("COVERAGE_FILE") == data_file, "the suite must write its own data file"
+    assert pytest_steps[0].get("with", {}).get("coverage_xml") == xml, "the suite must write its own XML report"
+    uploads = [
+        step
+        for step in job["steps"]
+        if "actions/upload-artifact" in str(step.get("uses", "")) and step.get("with", {}).get("name") == artifact
+    ]
+    assert len(uploads) == 1, f"expected one upload named {artifact!r}, found {len(uploads)}"
+    upload = uploads[0]
+    assert "always()" in str(upload.get("if", "")), "the upload must run when the suite fails, or its data is lost"
+    assert data_file in upload["with"].get("path", ""), "the upload must carry the data file"
+    assert xml in upload["with"].get("path", ""), "the upload must carry the XML report"
+    assert upload["with"].get("include-hidden-files") is True, "the data file is a dotfile; upload skips it otherwise"
+    assert upload["with"].get("if-no-files-found") == "error", "a missing data file must fail the upload, not warn"
+    return upload
+
+
 class TestCISuiteCoverage:
     """BDD and E2E suites must run in CI and gate the test summary."""
 
@@ -123,40 +154,63 @@ class TestCISuiteCoverage:
             "the matrix's host groups and shard_split.INTEGRATION_HOST_GROUPS must be the same list; "
             "the coverage gate loops over the constant"
         )
-        host_pytest = [
-            step
-            for step in job["steps"]
-            if str(step.get("uses", "")).endswith("/_pytest") and step.get("if") == "matrix.group != 'creative'"
-        ]
-        assert len(host_pytest) == 1
-        assert host_pytest[0]["with"]["coverage_xml"] == "coverage-integration-${{ matrix.group }}.xml"
-        assert host_pytest[0]["env"]["COVERAGE_FILE"] == ".coverage.integration-${{ matrix.group }}"
-        uploads = [
-            step
-            for step in job["steps"]
-            if "actions/upload-artifact" in str(step.get("uses", ""))
-            and step.get("with", {}).get("name") == "integration-${{ matrix.group }}-coverage"
-        ]
-        assert len(uploads) == 1, "one upload step per host group, keyed by group"
-        assert "matrix.group != 'creative'" in str(uploads[0].get("if", ""))
-        assert ".coverage.integration-${{ matrix.group }}" in uploads[0]["with"]["path"]
-        assert uploads[0]["with"].get("if-no-files-found") == "error"
+        upload = _assert_job_uploads_coverage(
+            job,
+            artifact="integration-${{ matrix.group }}-coverage",
+            data_file=".coverage.integration-${{ matrix.group }}",
+            xml="coverage-integration-${{ matrix.group }}.xml",
+            pytest_if="matrix.group != 'creative'",
+        )
+        assert "matrix.group != 'creative'" in str(upload.get("if", "")), "the creative group must upload nothing"
 
     @pytest.mark.arch_guard
     def test_admin_job_uploads_coverage(self):
-        job = load_ci_workflow()["jobs"]["admin-ui-tests"]
-        pytest_steps = [s for s in job["steps"] if str(s.get("uses", "")).endswith("/_pytest")]
-        assert len(pytest_steps) == 1
-        assert pytest_steps[0]["env"]["COVERAGE_FILE"] == ".coverage.admin"
-        assert pytest_steps[0]["with"]["coverage_xml"] == "coverage-admin.xml"
-        uploads = [
-            s
-            for s in job["steps"]
-            if "actions/upload-artifact" in str(s.get("uses", "")) and s.get("with", {}).get("name") == "admin-coverage"
+        """The admin suite writes its own data file and uploads it for the Coverage job to combine."""
+        _assert_job_uploads_coverage(
+            load_ci_workflow()["jobs"]["admin-ui-tests"],
+            artifact="admin-coverage",
+            data_file=".coverage.admin",
+            xml="coverage-admin.xml",
+        )
+
+    @pytest.mark.arch_guard
+    def test_coverage_gate_requires_every_host_suite_artifact(self):
+        """A missing data file fails the gate by name; a partial combine would report a lower number as the truth."""
+        job = load_ci_workflow()["jobs"]["coverage"]
+        run_steps = " ".join(str(step.get("run", "")) for step in job["steps"])
+        assert "INTEGRATION_HOST_GROUPS" in run_steps, "the gate loops over shard_split.INTEGRATION_HOST_GROUPS"
+        assert "Missing integration coverage artifact for group" in run_steps
+        assert "Missing admin coverage artifact" in run_steps
+        assert '"${bdd_data_files[@]}" "${integration_data_files[@]}" admin-coverage/.coverage.admin' in run_steps, (
+            "the combine must name every suite's data file"
+        )
+        downloads = [
+            step.get("with", {}) for step in job["steps"] if "actions/download-artifact" in str(step.get("uses", ""))
         ]
-        assert len(uploads) == 1
-        assert ".coverage.admin" in uploads[0]["with"]["path"]
-        assert uploads[0]["with"].get("if-no-files-found") == "error"
+        assert any(
+            w.get("pattern") == "integration-*-coverage" and w.get("path") == "integration-coverage-groups"
+            for w in downloads
+        )
+        assert any(w.get("name") == "admin-coverage" and w.get("path") == "admin-coverage" for w in downloads)
+        assert "needs.integration-tests.result == 'success'" in str(job["if"])
+        assert "needs.admin-ui-tests.result == 'success'" in str(job["if"])
+
+    @pytest.mark.arch_guard
+    def test_coverage_job_reports_diff_coverage(self):
+        """The report is computed against HEAD^1 on a two-commit checkout and lands in the step summary."""
+        job = load_ci_workflow()["jobs"]["coverage"]
+        checkout = next(step for step in job["steps"] if "actions/checkout" in str(step.get("uses", "")))
+        assert checkout["with"]["fetch-depth"] == 2, "HEAD^1 (the PR base) must be in the clone"
+        run_steps = " ".join(str(step.get("run", "")) for step in job["steps"])
+        assert "coverage xml --data-file=.coverage.combined -o coverage-combined.xml" in run_steps
+        assert "uv run diff-cover coverage-combined.xml --compare-branch=HEAD^1 --diff-range-notation=.." in run_steps
+        assert "--format markdown:diff-cover.md" in run_steps
+        assert "--fail-under" not in run_steps, "stage 1 is report only (spec § 7.2); the threshold is stage 2"
+        assert 'diff-cover.md >> "$GITHUB_STEP_SUMMARY"' in run_steps
+        uploads = [
+            step.get("with", {}) for step in job["steps"] if "actions/upload-artifact" in str(step.get("uses", ""))
+        ]
+        assert any(w.get("name") == "diff-cover" and "diff-cover.md" in w.get("path", "") for w in uploads)
 
     @pytest.mark.arch_guard
     def test_quality_gate_does_not_run_unit_tests(self):
@@ -169,7 +223,7 @@ class TestCISuiteCoverage:
 
     @pytest.mark.arch_guard
     def test_coverage_job_reuses_test_artifacts(self):
-        """Coverage gate must not re-run pytest; it combines unit + BDD artifacts."""
+        """Coverage gate must not re-run pytest; it combines the unit, BDD, integration and admin artifacts."""
         coverage_job = load_ci_workflow()["jobs"]["coverage"]
         needs = coverage_job.get("needs", [])
         steps_text = " ".join(
@@ -178,6 +232,8 @@ class TestCISuiteCoverage:
 
         assert "unit-tests" in needs, "coverage job must depend on unit-tests."
         assert "bdd-tests-shard" in needs, "coverage job must depend on bdd-tests-shard."
+        assert "integration-tests" in needs, "coverage job must depend on integration-tests."
+        assert "admin-ui-tests" in needs, "coverage job must depend on admin-ui-tests."
         assert steps_text.count("download-artifact") >= 2, (
             "coverage job must download unit and BDD shard coverage artifacts."
         )
