@@ -42,7 +42,7 @@ was the entire enforcement, and counts drifted unnoticed (salesagent-aemue.13).
 The ratchets no longer depend on you remembering:
 
 - the fast counters (type-ignore, fixme-citation, admin-raw-session,
-  ruff-complexity) run in the unit suite —
+  ruff-complexity, no-cover) run in the unit suite —
   `tests/unit/test_architecture_ratchet_enforcement.py`;
 - the two too slow for it (mypy `--check-untyped-defs`, pylint duplication) run
   in the `quality` tox env, which `./run_all_tests.sh` executes with the rest —

@@ -167,7 +167,7 @@ Pytest guards key their allowlists on `(file_path, function_name)` tuples, not l
 
 ### Ratchet counters
 
-A counter tracks the debt that no shrink-only list can express, against a committed baseline that may only go down: type-ignores, mypy untyped defs, ruff complexity, code duplication (`.duplication-baseline`), admin raw sessions (`.admin-raw-session-baseline`), and beads ids in FIXMEs (baseline zero). The fast counters run in `make quality`; the two too slow for it (mypy `--check-untyped-defs`, pylint duplication) run in the `quality` tox env.
+A counter tracks the debt that no shrink-only list can express, against a committed baseline that may only go down: type-ignores, mypy untyped defs, ruff complexity, code duplication (`.duplication-baseline`), admin raw sessions (`.admin-raw-session-baseline`), `# pragma: no cover` comments under `src/` (`.no-cover-baseline`), and beads ids in FIXMEs (baseline zero). The fast counters run in `make quality`; the two too slow for it (mypy `--check-untyped-defs`, pylint duplication) run in the `quality` tox env.
 
 Read [Structural guards](structural-guards.md) for the design rationale, and run `ls tests/unit/test_architecture_*.py` for the full pytest inventory.
 

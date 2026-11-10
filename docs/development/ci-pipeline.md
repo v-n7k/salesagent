@@ -47,16 +47,26 @@ plus the aggregate `CI / BDD Tests` status proxy (replacing PR3's single BDD job
 | `CI / BDD Tests (Shard 2/2)` | BDD greedy scenario shard |
 | `CI / BDD Tests` | aggregate status proxy (shard pass/fail) |
 | `CI / Migration Roundtrip` | alembic upgrade |
-| `CI / Coverage` | `--fail-under` from `.coverage-baseline` using unit + BDD artifacts |
+| `CI / Coverage` | `--fail-under` from `.coverage-baseline` using unit + four BDD shard + four host integration group + admin artifacts; diff-cover report of the changed lines |
 | `CI / Summary` | aggregation gate |
 
 ## BDD Test Shards
 
 BDD tests (`tests/bdd/test_*.py`, 13 files) run in **2 parallel shards** via
 greedy min-load assignment by Gherkin scenario count (`scripts/ci/shard_split.py`).
-Each shard uploads coverage; the **Coverage** job combines unit + BDD shard
-artifacts and enforces `.coverage-baseline`. The aggregate `BDD Tests` job is
+Each shard uploads coverage; the **Coverage** job combines the unit artifact,
+the four BDD shards, the four host integration groups and the admin suite (ten
+data files in all). It writes a diff-cover report of the changed lines against
+the PR base (`HEAD^1`) into its step summary and the `diff-cover` artifact, then
+enforces `.coverage-baseline`, so the report exists even on a run under the
+floor. No threshold applies to the report. The aggregate `BDD Tests` job is
 status-only. Shard jobs route pytest through the shared `_pytest` composite.
+
+Branch coverage is on, and `pyproject.toml` is the one coverage config. A
+`.tox/.coverage.*` file written before branch coverage was on holds line data
+only, so `tox -e coverage` stops on it with
+`Can't combine statement coverage data with branch data`; remove such files
+once with `rm .tox/.coverage*`.
 
 | Shard | Files | Scenarios (approx.) |
 |-------|------:|--------------------:|
@@ -91,6 +101,12 @@ markers was 14 duplicate file assignments across shards 1–4.
 | other | negation of all 15 markers above |
 
 Each shard runs against a GitHub Actions service container (Postgres 15).
+
+The product, media-buy, infra and other groups each upload
+`integration-<group>-coverage` (a `.coverage.integration-<group>` data file and
+its XML report), which the Coverage job combines. The creative group runs the
+suite inside the Docker stack, uploads no coverage and is not in the combine, so
+a line only it exercises reads as uncovered in the diff-cover report.
 
 **Admin UI** and **BDD** jobs also require the Postgres service container plus
 `_postgres` (wait + migrate) — admin blueprint tests use the `integration_db` fixture.
@@ -299,9 +315,9 @@ Requires pre-commit ≥3.2.0. Run `pre-commit install` once per clone (installs 
 
 Running `make quality` or `make quality-ci` may update the tracked ratchet
 baselines (`.duplication-baseline`, `.type-ignore-baseline`,
-`.ruff-complexity-baseline`, `.mypy-untyped-defs-baseline`) when counts
-decrease. Commit those updates intentionally; CI runs are ephemeral and do
-not persist baseline writes.
+`.ruff-complexity-baseline`, `.mypy-untyped-defs-baseline`,
+`.no-cover-baseline`) when counts decrease. Commit those updates
+intentionally; CI runs are ephemeral and do not persist baseline writes.
 
 Checks invoked directly by `make quality-ci` (not via `pre-commit run --all-files` in the Quality Gate):
 
