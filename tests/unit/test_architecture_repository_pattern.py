@@ -2,8 +2,8 @@
 
 Three invariants:
 1. _impl functions must not call get_db_session() — data access belongs in repositories
-2. Integration test bodies must not call session.add() — use factories or fixtures
-3. Integration test bodies must not call get_db_session() — use factories or the harness UoW
+2. Test code must not call session.add() or session.add_all() — use factories or fixtures
+3. Test code must not call get_db_session() — use factories or the harness UoW
 
 Scanning approach: AST — parse source files for function calls matching prohibited
 patterns. All pre-existing violations are allowlisted; new code fails immediately.
@@ -11,13 +11,20 @@ patterns. All pre-existing violations are allowlisted; new code fails immediatel
 """
 
 import ast
-import glob
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from tests.unit._architecture_helpers import assert_violations_match_allowlist, iter_call_expressions
+from tests.unit._architecture_helpers import (
+    assert_detector_catches_ast_snippets,
+    assert_detector_ignores_ast_snippets,
+    assert_violations_match_allowlist,
+    is_untracked_repo_file,
+    iter_call_expressions,
+    parse_module,
+    trailing_name,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -38,12 +45,18 @@ _IMPL_LEGACY_EXTRA_FILES = frozenset({"src/core/context_manager.py", "src/admin/
 
 
 def _glob_python_files(root: Path, dirs: tuple[str, ...]) -> set[str]:
-    """``.py`` files under any of ``dirs`` (relative to ``root``), pycache excluded."""
+    """``.py`` files under any of ``dirs`` (relative to ``root``) that git tracks.
+
+    A file git does not track is skipped. ``npm ci`` leaves ``node_modules``, with Python in
+    it, under ``tests/storyboard/runner`` on the CI box, and the scan has to read the same
+    files there as on a developer machine. A new file is scanned once it is staged. A path
+    outside the repository is never skipped, so a test can point this at a ``tmp_path`` tree.
+    """
     return {
         str(p.relative_to(root))
         for scan_dir in dirs
         for p in (root / scan_dir).rglob("*.py")
-        if "__pycache__" not in str(p)
+        if not is_untracked_repo_file(p)
     }
 
 
@@ -62,34 +75,29 @@ IMPL_FILES = _discover_impl_files()
 IMPL_SESSION_ALLOWLIST: set[tuple[str, str]] = set()
 
 # ---------------------------------------------------------------------------
-# Invariant 2: No session.add() in integration test bodies
+# Invariant 2: No session.add() / add_all() in test modules under tests/
 # ---------------------------------------------------------------------------
 
 
 def _discover_integration_test_files() -> list[str]:
-    """Dynamically discover all DB-backed test files via glob.
+    """Every git-tracked ``.py`` file under ``tests/``, from one glob.
 
-    Scans tests/integration*/, tests/admin/, and tests/e2e/ for test_*.py and
-    conftest.py files. These suites all exercise real DB state and must use
-    factories, not inline session.add() / get_db_session() in test bodies.
+    The two session rules (no ``session.add()`` / ``add_all()``, no ``get_db_session()``)
+    apply to all test-side code: test modules, conftest files, BDD step modules, shared
+    helpers, fixtures and the harness. Factory modules are scanned like the rest; they
+    carry no site, because factory-boy adds the row. The glob is ``_glob_python_files``,
+    the helper the ``_impl`` scan also uses. It skips files git does not track, so the
+    ``node_modules`` that ``npm ci`` leaves under ``tests/storyboard/runner`` on the CI box
+    is not read there.
 
-    Also scans every module under tests/helpers/. Shared DB-seed helpers there are
-    not named test_*.py but must follow the same factory-only rule, so that new
-    session.add() debt in helper code is caught at the source rather than hidden
-    behind a module the guard never reads.
+    The glob stops nowhere because a call that moves to a module outside the scanned
+    files disappears from the guard. The consolidation moved session.add out of the test
+    bodies into tests/utils/database_helpers.py and tenant_setup.py, and two allowlist
+    rows were removed as "fixed" when the calls had only moved somewhere the glob did not
+    reach. An enumerated list of roots had the same gap for tests/bdd/steps and
+    tests/conftest_db.py.
     """
-    roots = ("tests/integration*", "tests/admin", "tests/e2e")
-    test_files: list[str] = []
-    conftest_files: list[str] = []
-    for root in roots:
-        test_files.extend(glob.glob(f"{root}/**/test_*.py", recursive=True))
-        conftest_files.extend(glob.glob(f"{root}/conftest.py", recursive=True))
-    helper_files = glob.glob("tests/helpers/**/*.py", recursive=True)
-    # tests/utils/** too: the consolidation moved session.add out of the test bodies into
-    # database_helpers.py and tenant_setup.py, and two allowlist rows were removed as
-    # "fixed" when the calls had only moved somewhere this glob did not reach.
-    util_files = glob.glob("tests/utils/**/*.py", recursive=True)
-    return sorted(set(test_files + conftest_files + helper_files + util_files))
+    return sorted(_glob_python_files(ROOT, ("tests",)))
 
 
 INTEGRATION_TEST_FILES = _discover_integration_test_files()
@@ -374,12 +382,8 @@ INTEGRATION_SESSION_ADD_ALLOWLIST = {
     # tests/integration/test_workflow_lifecycle.py
     ("tests/integration/test_workflow_lifecycle.py", "setup"),
     # tests/integration/conftest.py
-    ("tests/integration/conftest.py", "sample_tenant"),
-    ("tests/integration/conftest.py", "sample_principal"),
     ("tests/integration/conftest.py", "add_required_setup_data"),
     ("tests/integration/conftest.py", "create_test_product_with_pricing"),
-    ("tests/integration/conftest.py", "authenticated_admin_session"),
-    ("tests/integration/conftest.py", "test_tenant_with_data"),
     # tests/integration/test_admin_ui_data_validation.py
     ("tests/integration/test_admin_ui_data_validation.py", "test_products_list_no_duplicates_with_pricing_options"),
     ("tests/integration/test_admin_ui_data_validation.py", "test_principals_list_no_duplicates_with_relationships"),
@@ -473,6 +477,58 @@ INTEGRATION_SESSION_ADD_ALLOWLIST = {
     # ── tests/e2e/ — pre-existing violations from e2e lifecycle test ──
     ("tests/e2e/test_gam_lifecycle.py", "_seed_lifecycle_test_data"),
     ("tests/e2e/test_gam_lifecycle.py", "_persist_media_buy"),
+    # ── Sites the earlier matcher and scan roots could not see ──
+    # The matcher now reads add_all(), attribute receivers (self.session.add, env._session.add)
+    # and two more receiver names (_session, factory_session), and the scan now covers every
+    # tracked .py under tests/. The same debt as the rows above, listed where the guard can
+    # finally see it.
+    # tests/conftest_db.py
+    ("tests/conftest_db.py", "test_audit_log"),  # FIXME(#2133)
+    ("tests/conftest_db.py", "test_media_buy"),  # FIXME(#2133)
+    ("tests/conftest_db.py", "test_principal"),  # FIXME(#2133)
+    ("tests/conftest_db.py", "test_product"),  # FIXME(#2133)
+    ("tests/conftest_db.py", "test_tenant"),  # FIXME(#2133)
+    # tests/fixtures/builders.py
+    ("tests/fixtures/builders.py", "create_test_tenant_with_principal"),  # FIXME(#2133)
+    # tests/harness/admin_accounts.py
+    ("tests/harness/admin_accounts.py", "_ensure_tenant_for_id"),  # FIXME(#2133)
+    # tests/integration/test_creative_lifecycle_mcp.py
+    ("tests/integration/test_creative_lifecycle_mcp.py", "test_list_creatives_no_filters"),  # FIXME(#2133)
+    ("tests/integration/test_creative_lifecycle_mcp.py", "test_list_creatives_with_date_filters"),  # FIXME(#2133)
+    ("tests/integration/test_creative_lifecycle_mcp.py", "test_list_creatives_with_search"),  # FIXME(#2133)
+    ("tests/integration/test_creative_lifecycle_mcp.py", "test_list_creatives_with_status_filter"),  # FIXME(#2133)
+    # tests/integration/test_decryption_failure_raises.py
+    (
+        "tests/integration/test_decryption_failure_raises.py",
+        "test_adapter_config_gam_json_raises_on_corrupt_data",
+    ),  # FIXME(#2133)
+    ("tests/integration/test_decryption_failure_raises.py", "test_oidc_secret_raises_on_corrupt_data"),  # FIXME(#2133)
+    # tests/integration/test_integrity_resolve_or_write.py
+    (
+        "tests/integration/test_integrity_resolve_or_write.py",
+        "test_check_violation_is_not_reported_as_the_conflict",
+    ),  # FIXME(#2133)
+    (
+        "tests/integration/test_integrity_resolve_or_write.py",
+        "test_lost_race_keeps_earlier_work_staged_in_the_same_transaction",
+    ),  # FIXME(#2133)
+    ("tests/integration/test_integrity_resolve_or_write.py", "write"),  # FIXME(#2133)
+    # tests/integration/test_inventory_profile_security.py
+    (
+        "tests/integration/test_inventory_profile_security.py",
+        "test_get_products_filters_profiles_by_tenant",
+    ),  # FIXME(#2133)
+    (
+        "tests/integration/test_inventory_profile_security.py",
+        "test_profile_updates_only_affect_same_tenant_products",
+    ),  # FIXME(#2133)
+    # tests/integration/test_session_json_validation.py
+    ("tests/integration/test_session_json_validation.py", "create_tenant"),  # FIXME(#2133)
+    ("tests/integration/test_session_json_validation.py", "setup_tenant_with_products"),  # FIXME(#2133)
+    ("tests/integration/test_session_json_validation.py", "test_database_manager_class"),  # FIXME(#2133)
+    ("tests/integration/test_session_json_validation.py", "test_full_workflow"),  # FIXME(#2133)
+    # tests/manual/test_gam_automation_real.py
+    ("tests/manual/test_gam_automation_real.py", "setup_test_products"),  # FIXME(#2133)
 }
 
 
@@ -486,7 +542,7 @@ def _find_matching_calls(file_path: str, predicate: Callable[[ast.expr], bool]) 
     if not source_path.exists():
         return []
 
-    tree = ast.parse(source_path.read_text())
+    tree = parse_module(source_path)
     violations = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -505,13 +561,22 @@ def _is_get_db_session_call(func: ast.expr) -> bool:
     return isinstance(func, ast.Attribute) and func.attr == "get_db_session"
 
 
+# Names a session goes by in test code. The receiver of ``add`` / ``add_all`` is matched
+# by its last name, so ``self.session`` and ``env._session`` count as well as a bare
+# ``session``, while ``seen.add(x)`` on a set does not.
+SESSION_RECEIVERS = frozenset({"session", "db_session", "mock_session", "s", "_session", "factory_session"})
+
+
 def _is_session_add_call(func: ast.expr) -> bool:
-    """Match ``session.add(...)`` on a session-like variable."""
+    """Match ``session.add(...)`` and ``session.add_all(...)`` on a session-like receiver.
+
+    The receiver is a bare name or the last attribute of a chain, and either one is in
+    ``SESSION_RECEIVERS`` (``session``, ``self.session``, ``env._session``).
+    """
     return (
         isinstance(func, ast.Attribute)
-        and func.attr == "add"
-        and isinstance(func.value, ast.Name)
-        and func.value.id in ("session", "db_session", "mock_session", "s")
+        and func.attr in {"add", "add_all"}
+        and trailing_name(func.value) in SESSION_RECEIVERS
     )
 
 
@@ -605,7 +670,7 @@ class TestImplNoDirectDbSession:
 
 
 class TestIntegrationTestsNoInlineSessionAdd:
-    """Integration tests must use factories/fixtures, not inline session.add().
+    """Test modules under tests/ must use factories/fixtures, not inline session.add().
 
     Test data setup belongs in polyfactory-based fixtures defined in conftest.py,
     not scattered across test bodies as raw ORM model construction.
@@ -618,7 +683,7 @@ class TestIntegrationTestsNoInlineSessionAdd:
             _find_session_add_in_tests,
             INTEGRATION_TEST_FILES,
             INTEGRATION_SESSION_ADD_ALLOWLIST,
-            header="New session.add() calls in integration tests (use factories instead):",
+            header="New session.add() / add_all() calls in test modules under tests/ (use factories instead):",
             fix_hint=(
                 "Fix: Use a polyfactory fixture instead of inline model construction. "
                 "See CLAUDE.md Pattern #8 for the factory pattern."
@@ -636,8 +701,42 @@ class TestIntegrationTestsNoInlineSessionAdd:
         )
 
 
+def _add_lines(tree: ast.Module) -> list[int]:
+    return [c.lineno for c in iter_call_expressions(tree) if _is_session_add_call(c.func)]
+
+
+def test_session_add_detector_sees_add_all_and_attribute_receivers():
+    assert_detector_catches_ast_snippets(
+        _add_lines,
+        snippets={
+            "add": "session.add(row)\n",
+            "add_all": "session.add_all(rows)\n",
+            "self.session": "self.session.add(row)\n",
+            "env._session": "env._session.add(row)\n",
+            "factory_session": "factory_session.add(row)\n",
+        },
+    )
+
+
+def test_session_add_detector_ignores_sets_and_other_receivers():
+    assert_detector_ignores_ast_snippets(
+        _add_lines, snippets={"set": "seen.add(x)\n", "batch": "batch.add_all(rows)\n"}
+    )
+
+
+def test_scan_roots_include_unit_bdd_and_harness():
+    assert any(p.startswith("tests/bdd/") for p in INTEGRATION_TEST_FILES)
+    assert any(
+        p.startswith("tests/harness/") and not p.startswith("tests/harness/test_") for p in INTEGRATION_TEST_FILES
+    )
+    assert any(p.startswith("tests/unit/") for p in INTEGRATION_TEST_FILES)
+    assert any(p.startswith("tests/bdd/steps/") for p in INTEGRATION_TEST_FILES)
+    assert any(p.startswith("tests/fixtures/") for p in INTEGRATION_TEST_FILES)
+    assert any(p.startswith("tests/factories/") for p in INTEGRATION_TEST_FILES)
+
+
 # ─────────────────────────────────────────────────────────────────────────
-# Invariant 3: No get_db_session() in integration test bodies (#1417)
+# Invariant 3: No get_db_session() in test modules under tests/ (#1417)
 # ─────────────────────────────────────────────────────────────────────────
 # Invariant 1 scans get_db_session() only in src/ (_impl) files, which leaves a
 # get_db_session() opened in a test body uncovered -- including one in a NEW test
@@ -645,6 +744,8 @@ class TestIntegrationTestsNoInlineSessionAdd:
 # test scope as Invariant 2 and flags any get_db_session() in a test/fixture body
 # outside the legacy allowlist. DB access in tests belongs in factories / the harness UoW
 # (e.g. `with AccountUoW(...) as uow: uow.accounts`), never a raw inline session.
+# FIXME(#2538): test code should reach the database through factories and the harness UoW.
+# Rows that end in this comment were not visible before the scan covered every .py under tests/.
 GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
     ("tests/admin/test_accounts_blueprint.py", "test_create_account_via_post"),
     ("tests/admin/test_accounts_blueprint.py", "test_list_page_shows_created_account"),
@@ -677,8 +778,30 @@ GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
     ("tests/admin/test_workflows_blueprint.py", "test_reject_step_sets_status_rejected"),
     ("tests/admin/test_workflows_blueprint.py", "test_reject_step_without_reason_uses_default"),
     ("tests/admin/test_workflows_blueprint.py", "test_tenant"),
+    ("tests/bdd/steps/_harness_db.py", "db_session"),  # FIXME(#2538)
+    ("tests/bdd/steps/domain/uc011_accounts.py", "_persisted_accounts"),  # FIXME(#2538)
+    ("tests/bdd/steps/domain/uc011_accounts.py", "given_agent_granted_access"),  # FIXME(#2538)
+    ("tests/bdd/steps/domain/uc011_accounts.py", "then_db_field_unchanged"),  # FIXME(#2538)
+    ("tests/bdd/steps/domain/uc011_accounts.py", "then_governance_agents_stored"),  # FIXME(#2538)
+    ("tests/bdd/steps/domain/uc011_accounts.py", "then_no_deactivations"),  # FIXME(#2538)
+    ("tests/bdd/steps/domain/uc011_accounts.py", "then_no_modifications_for_domain"),  # FIXME(#2538)
+    ("tests/bdd/steps/domain/uc011_accounts.py", "then_no_real_platform_account"),  # FIXME(#2538)
+    ("tests/bdd/steps/domain/uc011_accounts.py", "then_one_access_grant"),  # FIXME(#2538)
+    ("tests/bdd/steps/domain/uc026_package_media_buy.py", "given_product_min_spend"),  # FIXME(#2538)
+    ("tests/conftest_db.py", "db_session"),  # FIXME(#2538)
     ("tests/e2e/test_gam_lifecycle.py", "_persist_media_buy"),
     ("tests/e2e/test_gam_lifecycle.py", "_seed_lifecycle_test_data"),
+    ("tests/fixtures/builders.py", "create_test_tenant_with_principal"),  # FIXME(#2538)
+    ("tests/harness/admin_accounts.py", "_account_ids_in_tenant"),  # FIXME(#2538)
+    ("tests/harness/admin_accounts.py", "_cleanup_accounts"),  # FIXME(#2538)
+    ("tests/harness/admin_accounts.py", "_ensure_tenant_for_id"),  # FIXME(#2538)
+    ("tests/harness/admin_accounts.py", "_inventory_profile"),  # FIXME(#2538)
+    ("tests/harness/admin_accounts.py", "accounts_on_natural_key"),  # FIXME(#2538)
+    ("tests/harness/admin_accounts.py", "accounts_with_brand_domain"),  # FIXME(#2538)
+    ("tests/harness/admin_accounts.py", "get_account_from_db"),  # FIXME(#2538)
+    ("tests/harness/admin_principal.py", "audit_rows"),  # FIXME(#2538)
+    ("tests/harness/admin_principal.py", "seed_principal"),  # FIXME(#2538)
+    ("tests/harness/admin_principal.py", "token_hash"),  # FIXME(#2538)
     ("tests/helpers/creative_test_helpers.py", "assert_stored_creative_assets"),
     ("tests/integration/conftest.py", "authenticated_admin_session"),
     ("tests/integration/conftest.py", "cleanup_tenant"),
@@ -686,6 +809,8 @@ GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
     ("tests/integration/conftest.py", "sample_products"),
     ("tests/integration/conftest.py", "sample_tenant"),
     ("tests/integration/conftest.py", "test_tenant_with_data"),
+    ("tests/integration/media_buy_helpers.py", "_get_tenant_dict"),  # FIXME(#2538)
+    ("tests/integration/media_buy_helpers.py", "resolve_media_buy_id_from_task"),  # FIXME(#2538)
     ("tests/integration/test_adapter_config_repository.py", "_tenants"),
     ("tests/integration/test_adapter_config_repository.py", "test_find_by_tenant_returns_config"),
     ("tests/integration/test_adapter_config_repository.py", "test_find_by_tenant_returns_none_for_unconfigured"),
@@ -1211,6 +1336,9 @@ GET_DB_SESSION_IN_TESTS_ALLOWLIST: set[tuple[str, str]] = {
     ("tests/integration/test_workflow_lifecycle.py", "test_parallel_workflow_steps"),
     ("tests/integration/test_workflow_lifecycle.py", "test_sync_operation_no_workflow"),
     ("tests/integration/test_workflow_lifecycle.py", "test_workflow_failure_handling"),
+    ("tests/manual/test_gam_automation_real.py", "cleanup_test_products"),  # FIXME(#2538)
+    ("tests/manual/test_gam_automation_real.py", "setup_test_products"),  # FIXME(#2538)
+    ("tests/storyboard/test_storyboard_conformance.py", "_drain_grading_replay_rows"),  # FIXME(#2538)
 }
 
 
@@ -1220,7 +1348,7 @@ def _find_get_db_session_in_tests(file_path: str) -> list[tuple[str, str, int]]:
 
 
 class TestIntegrationTestsNoGetDbSession:
-    """Integration tests must not open a raw get_db_session() in the test body.
+    """Test modules under tests/ must not open a raw get_db_session() in a test or fixture body.
 
     Pattern #8 (tests/CLAUDE.md): DB access in tests goes through factories and
     the harness (AccountUoW / IntegrationEnv), not a session opened inline. The
@@ -1235,7 +1363,7 @@ class TestIntegrationTestsNoGetDbSession:
             _find_get_db_session_in_tests,
             INTEGRATION_TEST_FILES,
             GET_DB_SESSION_IN_TESTS_ALLOWLIST,
-            header="New get_db_session() calls in test bodies (use factories / the harness UoW instead):",
+            header="New get_db_session() calls in test modules under tests/ (use factories / the harness UoW instead):",
             fix_hint=(
                 "Fix: obtain the session/repo via the harness "
                 "(e.g. with AccountUoW(tenant_id) as uow: uow.accounts). See CLAUDE.md Pattern #8."

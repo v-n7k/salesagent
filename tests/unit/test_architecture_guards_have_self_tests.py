@@ -169,7 +169,6 @@ KNOWN_WITHOUT_SELF_TEST: frozenset[tuple[str]] = frozenset(
         ("tests/unit/test_architecture_ratchet_hooks_use_driver.py",),  # FIXME(#2534)
         ("tests/unit/test_architecture_registration_holds_sdk_config.py",),  # FIXME(#2534)
         ("tests/unit/test_architecture_repo_invariants.py",),  # FIXME(#2534)
-        ("tests/unit/test_architecture_repository_pattern.py",),  # FIXME(#2534)
         ("tests/unit/test_architecture_required_ci_checks_frozen.py",),  # FIXME(#2534)
         ("tests/unit/test_architecture_reserved_tld_single_matcher.py",),  # FIXME(#2534)
         ("tests/unit/test_architecture_route_xfail_census.py",),  # FIXME(#2534)

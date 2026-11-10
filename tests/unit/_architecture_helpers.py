@@ -159,16 +159,13 @@ ENV_ROOTS = frozenset({"BaseTestEnv", "IntegrationEnv", "BareIntegrationEnv"})
 
 
 def iter_test_module_trees() -> list[tuple[str, ast.Module]]:
-    """``(repo_relative_path, tree)`` for every parseable ``.py`` under tests/."""
-    modules: list[tuple[str, ast.Module]] = []
-    for py_file in sorted((REPO_ROOT / "tests").rglob("*.py")):
-        if "__pycache__" in py_file.parts:
-            continue
-        tree = safe_parse(py_file)
-        if tree is None:  # pragma: no cover - a syntax error fails elsewhere
-            continue
-        modules.append((str(py_file.relative_to(repo_root())), tree))
-    return modules
+    """``(repo_relative_path, tree)`` for every git-tracked ``.py`` under tests/.
+
+    Walks with :func:`iter_module_trees`, so a file git does not track is skipped (``npm ci``
+    leaves ``node_modules`` under ``tests/storyboard/runner`` on the CI box) and an
+    unparseable file raises instead of being dropped.
+    """
+    return [(path, tree) for tree, path in iter_module_trees([REPO_ROOT / "tests"])]
 
 
 def _base_names(cls: ast.ClassDef) -> set[str]:
