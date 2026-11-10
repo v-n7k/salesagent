@@ -12,6 +12,7 @@ from scripts.ci.ast_normalize import iter_functions
 from scripts.ci.clone_index import (
     REQUIRE_CALL,
     ROOTS,
+    SKIP_PARTS,
     WINDOW,
     FunctionRef,
     Window,
@@ -25,7 +26,7 @@ from scripts.ci.clone_index import (
     relabel_window,
     statement_lists,
 )
-from tests.unit._clone_index_helpers import SEED_A, SEED_B, SEED_B_OTHER_CALL, write_sources
+from tests.unit._clone_index_helpers import SEED_A, SEED_B, SEED_B_OTHER_CALL, SEED_PAIR, write_sources
 
 
 def _write_and_index(root: Path, files: dict[str, str]) -> dict[str, list[Window]]:
@@ -42,14 +43,12 @@ def test_pins() -> None:
     assert WINDOW == 5
     assert REQUIRE_CALL is True
     assert ROOTS == ("src", "tests", "scripts", ".pre-commit-hooks", ".claude/scripts")
+    assert SKIP_PARTS == frozenset({"__pycache__", "node_modules", ".venv", ".tox", "vendor"})
 
 
 def test_renamed_locals_and_different_literals_are_one_window(tmp_path: Path) -> None:
     index = _write_and_index(tmp_path, {"src/a.py": SEED_A, "tests/b.py": SEED_B})
-    assert clone_bearing_functions(index) == {
-        FunctionRef("src/a.py", "seed_tenant", 1),
-        FunctionRef("tests/b.py", "seed_other", 1),
-    }
+    assert clone_bearing_functions(index) == SEED_PAIR
 
 
 def test_relabel_window_numbers_labels_by_first_appearance() -> None:
@@ -73,10 +72,7 @@ def test_relabel_window_numbers_labels_by_first_appearance() -> None:
 )
 def test_a_copy_is_found_whatever_precedes_it_in_its_function(tmp_path: Path, old: str, new: str) -> None:
     index = _write_and_index(tmp_path, {"src/a.py": SEED_A, "tests/b.py": SEED_B.replace(old, new)})
-    assert clone_bearing_functions(index) == {
-        FunctionRef("src/a.py", "seed_tenant", 1),
-        FunctionRef("tests/b.py", "seed_other", 1),
-    }
+    assert clone_bearing_functions(index) == SEED_PAIR
 
 
 def test_a_different_attribute_name_is_not_a_copy(tmp_path: Path) -> None:
@@ -120,17 +116,21 @@ def test_constants_bucket_by_type_and_keep_none_and_bools() -> None:
 
 def test_statement_lists_enter_every_compound_body_but_no_nested_scope() -> None:
     source = (
-        "if a:\n    s1()\nelse:\n    s2()\n"
-        "for x in y:\n    s3()\nelse:\n    s4()\n"
-        "while a:\n    s5()\n"
-        "with a:\n    s6()\n"
-        "try:\n    s7()\nexcept E:\n    s8()\nelse:\n    s9()\nfinally:\n    s10()\n"
-        "match a:\n    case 1:\n        s11()\n"
+        "if a:\n    if b:\n        s1()\n    else:\n        s2()\nelse:\n    s3()\n"
+        "for x in y:\n    s4()\nelse:\n    s5()\n"
+        "while a:\n    s6()\n"
+        "with a:\n    s7()\n"
+        "try:\n    s8()\nexcept E:\n    s9()\nexcept F:\n    s10()\nelse:\n    s11()\nfinally:\n    s12()\n"
+        "match a:\n    case 1:\n        s13()\n    case 2:\n        s14()\n"
         "def g():\n    nested()\n"
         "class C:\n    nested()\n"
     )
     inner = list(statement_lists(ast.parse(source).body))[1:]
-    assert [ast.unparse(stmts[0]) for stmts in inner] == [f"s{i}()" for i in range(1, 12)]
+    # The body of `if a` is the one statement `if b`; its own two bodies, s1 and s2, follow it.
+    assert [ast.unparse(stmts[0]) for stmts in inner] == [
+        "if b:\n    s1()\nelse:\n    s2()",
+        *(f"s{i}()" for i in range(1, 15)),
+    ]
 
 
 def test_a_window_records_the_lines_it_spans(tmp_path: Path) -> None:
@@ -162,10 +162,7 @@ def test_a_nested_def_owns_its_window(tmp_path: Path) -> None:
 
 def test_an_async_function_is_scanned(tmp_path: Path) -> None:
     index = _write_and_index(tmp_path, {"src/a.py": "async " + SEED_A, "tests/b.py": SEED_B})
-    assert clone_bearing_functions(index) == {
-        FunctionRef("src/a.py", "seed_tenant", 1),
-        FunctionRef("tests/b.py", "seed_other", 1),
-    }
+    assert clone_bearing_functions(index) == SEED_PAIR
 
 
 def test_skip_parts_are_not_scanned(tmp_path: Path) -> None:
@@ -196,11 +193,12 @@ def test_groups_are_connected_components(tmp_path: Path) -> None:
 def test_partners_and_new_pairs(tmp_path: Path) -> None:
     base = _write_and_index(tmp_path / "base", {"src/a.py": SEED_A, "tests/b.py": SEED_B})
     # In head, a blank first line moves seed_tenant to line 2; a function that only moved is not new.
+    # seed_third joins seed_other in tests/b.py, so a key by path alone would take it for a function base had.
     head = _write_and_index(
         tmp_path / "head",
-        {"src/a.py": "\n" + SEED_A, "tests/b.py": SEED_B, "tests/c.py": SEED_B.replace("seed_other", "seed_third")},
+        {"src/a.py": "\n" + SEED_A, "tests/b.py": SEED_B + SEED_B.replace("seed_other", "seed_third")},
     )
-    third = FunctionRef("tests/c.py", "seed_third", 1)
+    third = FunctionRef("tests/b.py", "seed_third", 7)
     moved = FunctionRef("src/a.py", "seed_tenant", 2)
     assert clone_partners(head)[third] == moved
     assert new_clone_pairs(head, base) == [(third, moved)]

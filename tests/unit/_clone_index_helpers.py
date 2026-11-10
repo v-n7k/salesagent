@@ -2,13 +2,16 @@
 
 ``SEED_A`` and ``SEED_B`` are the same five statements with other local names and other literal
 values, so they share one normalized window. Each source starts without a blank line, so its
-``def`` is on line 1.
+``def`` is on line 1. ``SEED_PAIR`` holds the two functions that are clone-bearing when ``SEED_A``
+is written as ``src/a.py`` and ``SEED_B`` as ``tests/b.py``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+
+from scripts.ci.clone_index import FunctionRef
 
 SEED_A = """\
 def seed_tenant(session, name):
@@ -36,6 +39,7 @@ def seed_other(db, label):
     who = PrincipalFactory(tenant=row, token="xyz")
     return who
 """
+SEED_PAIR = frozenset({FunctionRef("src/a.py", "seed_tenant", 1), FunctionRef("tests/b.py", "seed_other", 1)})
 
 
 def write_sources(root: Path, files: Mapping[str, str]) -> None:

@@ -24,6 +24,7 @@ check_admin_raw_session_count.py.
 from __future__ import annotations
 
 import sys
+import tarfile
 import tempfile
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -42,6 +43,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from scripts.ci.clone_index import (
     ROOTS,
+    WINDOW,
     FunctionRef,
     Window,
     clone_bearing_functions,
@@ -74,7 +76,9 @@ def hints_for_increase(
     A count says that a root rose, not which function is new, and a rise in one root can be hidden
     by a fall in another. So the lines name each function that is clone-bearing in ``head`` and not
     in the upstream tree, with one partner each. Without an upstream ref there is no tree to
-    compare with, and the lines are the advice alone.
+    compare with, and the lines are the advice alone. They are the advice alone too when the
+    upstream tree cannot be extracted; the failure goes to stderr as a warning, so the per-root
+    table still prints.
     """
     if baseline is None or not any(count > baseline.get(root, 0) for root, count in current.items()):
         return []
@@ -84,9 +88,12 @@ def hints_for_increase(
         "New clone-bearing functions and one partner each:",
     ]
     with tempfile.TemporaryDirectory(prefix="clone-ratchet-upstream-") as tmp:
-        upstream = materialize_upstream_tree(repo_root, ROOTS, Path(tmp))
-        if upstream is not None:
-            hints += format_new_pairs(new_clone_pairs(head, index_tree(upstream)))
+        try:
+            upstream = materialize_upstream_tree(repo_root, ROOTS, Path(tmp))
+            if upstream is not None:
+                hints += format_new_pairs(new_clone_pairs(head, index_tree(upstream)))
+        except (RuntimeError, OSError, tarfile.TarError) as exc:
+            print(f"Warning: could not name the new clone pairs: {exc}", file=sys.stderr)
     return hints
 
 
@@ -94,7 +101,7 @@ def main() -> int:
     args = parse_ratchet_args("Check that the clone-bearing function count does not increase")
     repo_root, _src_path, baseline_file = resolve_ratchet_paths(baseline_name=BASELINE_FILE)
     read_baseline, write_baseline = json_baseline_io(ROOTS)
-    print("Scanning for clone-bearing functions (five-statement windows)...")
+    print(f"Scanning for clone-bearing functions ({WINDOW}-statement windows)...")
     head = index_tree(repo_root)
     current = count_by_root(clone_bearing_functions(head), ROOTS)
     return run_count_ratchet(

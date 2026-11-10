@@ -746,11 +746,13 @@ def test_materialize_upstream_tree_extracts_first_ref(monkeypatch: pytest.Monkey
     """The merge base leads ``_upstream_refs``, and it is the tree a branch is graded against."""
     monkeypatch.setattr(count_ratchet, "_upstream_refs", lambda _repo_root: ["abc123", "origin/main"])
     calls: list[tuple] = []
-    monkeypatch.setattr(
-        count_ratchet,
-        "_extract_upstream_tree",
-        lambda _repo_root, ref, paths, dest: calls.append((ref, tuple(paths), dest)) or dest,
-    )
+
+    def fake_extract(repo_root, ref, paths, dest):
+        assert repo_root == tmp_path
+        calls.append((ref, tuple(paths), dest))
+        return dest
+
+    monkeypatch.setattr(count_ratchet, "_extract_upstream_tree", fake_extract)
     dest = tmp_path / "dest"
 
     assert count_ratchet.materialize_upstream_tree(tmp_path, ("src", "tests"), dest) == dest

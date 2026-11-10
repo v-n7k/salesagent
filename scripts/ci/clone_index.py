@@ -42,6 +42,7 @@ SKIP_PARTS: frozenset[str] = frozenset({"__pycache__", "node_modules", ".venv", 
 
 _NESTED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 # A bound-name label in a dump: the normalizer writes `_v{n}`, and `ast.dump` quotes an identifier.
+# Assumes no source identifier is spelled `_v<digits>` or `_w<digits>`; none is in the five roots.
 _BOUND_LABEL = re.compile(r"(?<=')_v\d+(?=')")
 
 
@@ -108,8 +109,10 @@ def function_windows(
 ) -> dict[str, tuple[int, int]]:
     """Map the hash of each distinct window of ``fn`` to the first and last line of its first occurrence.
 
-    The hash is the SHA-1 hex digest of ``relabel_window`` applied to ``dump_statements`` of the
-    window's normalized statements.
+    The first occurrence is the first in traversal order (the enclosing list before the lists inside
+    it), which is not source order when a copy sits inside a compound statement above a copy in the
+    body. The hash is the SHA-1 hex digest of ``relabel_window`` applied to ``dump_statements`` of
+    the window's normalized statements.
     """
     windows: dict[str, tuple[int, int]] = {}
     for stmts in statement_lists(normalize_function(fn)):
@@ -123,7 +126,7 @@ def function_windows(
 
 
 # Deliberate simplification: there is no per-file cache, so every call parses and normalizes the
-# whole tree, about 13 to 18 s for the five roots (some 1,700 files). The upgrade path is a cache
+# whole tree, about 14 s alone and 18 to 20 s inside the unit suite. The upgrade path is a cache
 # keyed by path and mtime, like `tests/unit/_architecture_helpers.parse_module`.
 def index_tree(
     root: Path, roots: Sequence[str] = ROOTS, *, window: int = WINDOW, require_call: bool = REQUIRE_CALL
@@ -132,7 +135,8 @@ def index_tree(
 
     Files are indexed in sorted path order. A root that does not exist adds nothing, and a file
     with a ``SKIP_PARTS`` component in its path is not scanned. A file that does not parse raises
-    ``SyntaxError`` with its path in the message.
+    ``SyntaxError`` with its path in the message. A file that cannot be read raises; a skipped file
+    would be a lower count the driver writes.
     """
     index: dict[str, list[Window]] = {}
     for path in _scanned_files(root, roots):
@@ -226,7 +230,9 @@ def new_clone_pairs(
     """Return each function clone-bearing in ``head`` and not in ``base``, with its partner in ``head``, sorted.
 
     A function is the same function in both trees when its path and qualname match, so a function
-    that only moved to another line is not new. Each pair carries the ``FunctionRef`` from ``head``.
+    that only moved to another line is not new. Two functions with the same path and qualname (a
+    conditional redefinition; the count includes both) are one key here, so only a hint line can be
+    lost, never a count. Each pair carries the ``FunctionRef`` from ``head``.
     """
     before = {(fn.path, fn.qualname) for fn in clone_bearing_functions(base)}
     return sorted((fn, partner) for fn, partner in clone_partners(head).items() if (fn.path, fn.qualname) not in before)
