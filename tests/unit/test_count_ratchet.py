@@ -676,6 +676,87 @@ def test_upstream_ceiling_omits_key_with_no_upstream_evidence(monkeypatch: pytes
     )
 
 
+def _run_with_stubbed_upstream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **extra: object
+) -> tuple[int, dict[str, object]]:
+    """Run a first-time ratchet whose ceiling can only come from upstream SOURCE.
+
+    A merge base resolves and carries no copy of the baseline file, so the driver
+    runs ``count_upstream`` over the extracted tree. Returns ``(exit code, seen)``
+    where ``seen["paths"]`` is what the driver asked git to archive; ``extra`` goes
+    to ``run_count_ratchet`` unchanged.
+    """
+    seen: dict[str, object] = {}
+
+    def fake_extract(_repo_root, _ref, paths, _dest):
+        seen["paths"] = tuple(paths)
+        return Path("/upstream")
+
+    monkeypatch.setattr(
+        count_ratchet.subprocess,
+        "run",
+        _git_stub({("merge-base", "HEAD", "origin/main"): _cp(stdout="deadbeef\n")}),
+    )
+    monkeypatch.setattr(count_ratchet, "_extract_upstream_tree", fake_extract)
+    read_baseline, write_baseline = count_ratchet.json_baseline_io(["a"])
+    rc = count_ratchet.run_count_ratchet(
+        keys=["a"],
+        current={"a": 1},
+        baseline_file=tmp_path / ".probe-baseline",
+        update_baseline=False,
+        read_baseline=read_baseline,
+        write_baseline=write_baseline,
+        increase_header="",
+        increase_hints=(),
+        repo_root=tmp_path,
+        count_upstream=lambda _root: {"a": 1},
+        out=io.StringIO(),
+        err=io.StringIO(),
+        **extra,
+    )
+    return rc, seen
+
+
+def test_run_count_ratchet_forwards_upstream_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A ratchet that counts other roots names them, and the driver archives exactly those."""
+    rc, seen = _run_with_stubbed_upstream(monkeypatch, tmp_path, upstream_paths=("src", ".pre-commit-hooks"))
+
+    assert rc == 0
+    assert seen["paths"] == ("src", ".pre-commit-hooks")
+
+
+def test_run_count_ratchet_default_upstream_paths_are_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A hook that names no paths still gets the four roots it always got."""
+    rc, seen = _run_with_stubbed_upstream(monkeypatch, tmp_path)
+
+    assert rc == 0
+    assert seen["paths"] == ("src", "tests", "scripts", "pyproject.toml")
+    assert count_ratchet.DEFAULT_UPSTREAM_PATHS == seen["paths"]
+
+
+def test_materialize_upstream_tree_returns_none_without_refs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(count_ratchet, "_upstream_refs", lambda _repo_root: [])
+
+    assert count_ratchet.materialize_upstream_tree(tmp_path, ("src",), tmp_path / "dest") is None
+
+
+def test_materialize_upstream_tree_extracts_first_ref(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The merge base leads ``_upstream_refs``, and it is the tree a branch is graded against."""
+    monkeypatch.setattr(count_ratchet, "_upstream_refs", lambda _repo_root: ["abc123", "origin/main"])
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        count_ratchet,
+        "_extract_upstream_tree",
+        lambda _repo_root, ref, paths, dest: calls.append((ref, tuple(paths), dest)) or dest,
+    )
+    dest = tmp_path / "dest"
+
+    assert count_ratchet.materialize_upstream_tree(tmp_path, ("src", "tests"), dest) == dest
+    assert calls == [("abc123", ("src", "tests"), dest)]
+
+
 def test_run_count_ratchet_rejects_baseline_above_ceiling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A committed baseline above upstream fails, and writes nothing."""
     baseline = tmp_path / "counts.json"

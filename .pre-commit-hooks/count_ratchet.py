@@ -65,6 +65,11 @@ from typing import NoReturn, TextIO
 #: there — the list is filtered to refs that resolve, never assumed.
 MAIN_REF = "origin/main"
 
+#: What ``git archive`` extracts from the upstream ref when a ratchet counts upstream
+#: source (``count_upstream``). A hook that counts other roots passes its own paths as
+#: ``run_count_ratchet(upstream_paths=...)``.
+DEFAULT_UPSTREAM_PATHS: tuple[str, ...] = ("src", "tests", "scripts", "pyproject.toml")
+
 
 def iter_python_sources(root: Path) -> Iterator[tuple[Path, str]]:
     """Yield ``(path, text)`` for every ``.py`` under *root*, in path order.
@@ -366,6 +371,18 @@ def _extract_upstream_tree(repo_root: Path, ref: str, paths: Sequence[str], dest
     return dest
 
 
+def materialize_upstream_tree(repo_root: Path, paths: Sequence[str], dest: Path) -> Path | None:
+    """Extract the first upstream ref's copy of ``paths`` into the existing directory ``dest``.
+
+    The first ref is the one ``resolve_upstream_ceiling`` counts for a key no baseline
+    carries (``_upstream_refs`` order: merge base, then ``origin/main``). A hook that
+    needs the upstream tree itself, not a count of it, calls this. Returns ``None``
+    when no upstream ref resolves; raises what ``_extract_upstream_tree`` raises.
+    """
+    refs = _upstream_refs(repo_root)
+    return _extract_upstream_tree(repo_root, refs[0], paths, dest) if refs else None
+
+
 def resolve_upstream_ceiling(
     *,
     repo_root: Path,
@@ -373,7 +390,7 @@ def resolve_upstream_ceiling(
     keys: Sequence[str],
     parse: Callable[[str], object],
     count_upstream: Callable[[Path], Mapping[str, int]] | None = None,
-    upstream_paths: Sequence[str] = ("src", "tests", "scripts", "pyproject.toml"),
+    upstream_paths: Sequence[str] = DEFAULT_UPSTREAM_PATHS,
 ) -> dict[str, int]:
     """Highest value each key is allowed to hold, per upstream evidence.
 
@@ -463,6 +480,7 @@ def run_count_ratchet(
     repo_root: Path | None = None,
     parse_upstream: Callable[[str], object] | None = None,
     count_upstream: Callable[[Path], Mapping[str, int]] | None = None,
+    upstream_paths: Sequence[str] = DEFAULT_UPSTREAM_PATHS,
     format_key: Callable[[str], str] | None = None,
     unit: str = "",
     out: TextIO | None = None,
@@ -482,6 +500,9 @@ def run_count_ratchet(
       because ``current`` is what is about to be written;
     - the normal compare probes ``min(baseline, current)``, so an auto-lower
       cannot mask a committed raise and a failed probe never writes.
+
+    ``upstream_paths`` names what is archived from the upstream ref for
+    ``count_upstream`` to count; it defaults to ``DEFAULT_UPSTREAM_PATHS``.
     """
     out_stream = sys.stdout if out is None else out
     err_stream = sys.stderr if err is None else err
@@ -497,6 +518,7 @@ def run_count_ratchet(
         keys=keys,
         parse=parse_upstream if parse_upstream is not None else json.loads,
         count_upstream=count_upstream,
+        upstream_paths=upstream_paths,
     )
     if (
         check_against_ceiling(
