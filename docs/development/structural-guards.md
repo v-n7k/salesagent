@@ -527,8 +527,9 @@ They replaced grep-based pre-commit hooks (issue #1234).
 | `test_architecture_query_type_safety.py` | `enforce-sqlalchemy-2-0` (partial) | `test_no_legacy_session_query`, `test_models_use_mapped_not_column` |
 | `test_architecture_pre_commit_hook_count.py` | — | Commit-stage hook count ≤12 (D27) |
 | `test_architecture_pre_commit_no_additional_deps.py` | — | No `additional_dependencies` in pre-commit config |
-| `test_architecture_ci_bdd_shard_manifest.py` | — | BDD CI shards partition suite; matrix matches `SHARD_COUNTS` |
 | `test_architecture_repo_invariants.py` | `repo-invariants` (partial) | Self-tests for `.fn()` detection in consolidated hook |
+| `test_architecture_ci_suite_coverage.py` | — | Every suite `run_all_tests.sh` runs has a gating CI job; the `bdd-tests-shard` matrix equals `SHARD_COUNTS["bdd"]`; the Coverage job requires every shard artifact |
+| `test_architecture_required_ci_checks_frozen.py` | — | Rendered `CI / …` check names, the four BDD shards included, are frozen for branch protection |
 
 Guards use the `@pytest.mark.arch_guard` marker (distinct from the
 entity-marker `architecture`).

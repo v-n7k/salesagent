@@ -15,6 +15,7 @@ CI job, or a broken suite can silently land on main again.
 
 import pytest
 
+from scripts.ci.shard_split import SHARD_COUNTS
 from scripts.ci.workflow_helpers import load_ci_workflow
 
 # Suite jobs that must appear in summary.needs — a suite that runs but is absent
@@ -55,6 +56,25 @@ class TestCISuiteCoverage:
         services = load_ci_workflow()["jobs"]["bdd-tests-shard"].get("services", {})
 
         assert "postgres" in services, "bdd-tests-shard has no postgres service."
+
+    @pytest.mark.arch_guard
+    def test_ci_bdd_matrix_matches_shard_config(self):
+        """The bdd-tests-shard matrix is SHARD_COUNTS["bdd"] written out by hand.
+
+        ci.yml cannot import the constant, so the list is a copy, and the two drift
+        in silence: with the constant ahead of the matrix, shard_paths.py splits the
+        suite into more buckets than the matrix runs, every shard job passes, and the
+        files in the unrun bucket are graded by nobody until the Coverage job fails on
+        the missing .coverage.bdd-N artifact, after the shards have spent their
+        minutes. This pins the two together before either run starts.
+        """
+        matrix = load_ci_workflow()["jobs"]["bdd-tests-shard"]["strategy"]["matrix"]["shard"]
+        expected = list(range(1, SHARD_COUNTS["bdd"] + 1))
+
+        assert matrix == expected, (
+            f"bdd-tests-shard runs shards {matrix} but scripts/ci/shard_split.py splits the "
+            f"suite into {SHARD_COUNTS['bdd']}; keep strategy.matrix.shard equal to {expected}."
+        )
 
     @pytest.mark.arch_guard
     def test_bdd_aggregate_is_status_proxy_only(self):

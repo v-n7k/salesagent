@@ -41,7 +41,8 @@ _SCENARIOS_CALL = re.compile(r"""scenarios\s*\(\s*["'](features/[^"']+)["']""")
 _SCENARIO_DECORATOR = re.compile(r"^@scenario\s*\(", re.MULTILINE)
 
 # Keep in sync with strategy.matrix.shard in .github/workflows/ci.yml
-# (bdd-tests-shard). Pinned by test_ci_bdd_matrix_matches_shard_config.
+# (bdd-tests-shard). Pinned by test_ci_bdd_matrix_matches_shard_config in
+# tests/unit/test_architecture_ci_suite_coverage.py.
 #
 # FOUR, not two, and not the three that looks like it should do. The suite holds
 # ~212 minutes of measured work; at -n auto on a 4-vCPU runner that is ~53 minutes
