@@ -26,6 +26,10 @@ REQUIRED_SUMMARY_GATES = frozenset({"unit-tests", "integration-tests", "e2e-test
 PYTEST_ACTION_PATH = CI_WORKFLOW_PATH.parents[1] / "actions" / "_pytest" / "action.yml"
 
 
+# The call that names every suite's data file; the script's own contract is tests/unit/test_collect_coverage_data.py.
+COLLECT_CALL = './scripts/ci/collect_coverage_data.sh --bdd-shards "${bdd_shards}" --host-groups "${host_groups}"'
+
+
 def _load_pytest_action() -> dict:
     return yaml.safe_load(PYTEST_ACTION_PATH.read_text(encoding="utf-8"))
 
@@ -237,11 +241,15 @@ class TestCISuiteCoverage:
         """A missing data file fails the gate by name; a partial combine would report a lower number as the truth."""
         job = load_ci_workflow()["jobs"]["coverage"]
         run_steps = " ".join(str(step.get("run", "")) for step in job["steps"])
-        assert "INTEGRATION_HOST_GROUPS" in run_steps, "the gate loops over shard_split.INTEGRATION_HOST_GROUPS"
-        assert "Missing integration coverage artifact for group" in run_steps
-        assert "Missing admin coverage artifact" in run_steps
-        assert '"${bdd_data_files[@]}" "${integration_data_files[@]}" admin-coverage/.coverage.admin' in run_steps, (
-            "the combine must name every suite's data file"
+        assert "INTEGRATION_HOST_GROUPS" in run_steps, (
+            "the gate hands shard_split.INTEGRATION_HOST_GROUPS to the script"
+        )
+        assert f'collected="$({COLLECT_CALL})"' in run_steps, (
+            "the script names every suite's data file or fails by name; bound to a variable, its failure stops the step"
+        )
+        assert 'mapfile -t data_files <<< "${collected}"' in run_steps
+        assert 'uv run coverage combine --data-file=.coverage.combined "${data_files[@]}"' in run_steps, (
+            "the combine must take exactly the files the script named"
         )
         downloads = [
             step.get("with", {}) for step in job["steps"] if "actions/download-artifact" in str(step.get("uses", ""))
@@ -324,13 +332,13 @@ class TestCISuiteCoverage:
 
         assert "SHARD_COUNTS" in run_steps, "coverage gate must read SHARD_COUNTS from shard_split."
         assert "expected_bdd_shards" in run_steps, "coverage gate must bind BDD shard count to a variable."
-        assert "Missing BDD coverage artifact for shard" in run_steps, (
-            "coverage gate must fail when any shard's .coverage.bdd-N file is missing."
-        )
         assert 'bdd_shards="$(seq 1 "${expected_bdd_shards}")"' in run_steps, (
             "the shard ids are bound before the call, so a failing seq stops the step under set -e"
         )
-        assert "no ids to collect" in run_steps, "an empty id list must fail the step, not combine nothing"
+        assert COLLECT_CALL in run_steps, (
+            "the bound ids go to the script, which fails by shard id on a missing file and refuses an empty id list "
+            "(tests/unit/test_collect_coverage_data.py)"
+        )
         bdd_downloads = [
             step.get("with", {})
             for step in coverage_job.get("steps", [])

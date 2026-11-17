@@ -830,46 +830,14 @@ jobs:
       - name: Combine coverage data
         run: |
           set -euo pipefail
-          # collect_data_files <array> <dir> <file prefix> <error prefix> <ids>
-          # Appends each id's data file under <dir> to <array>. A missing file or directory fails by name.
-          collect_data_files() {
-            local -n collected_ref="$1"
-            local dir="$2" prefix="$3" missing="$4" ids="$5" id found
-            if [ -z "${ids}" ]; then
-              echo "::error::${missing}: no ids to collect"
-              exit 1
-            fi
-            for id in ${ids}; do
-              found=""
-              # find on a missing directory would stop the step here, before the error below names the id.
-              if [ -d "${dir}" ]; then
-                found="$(find "${dir}" -name "${prefix}${id}" -type f | head -1)"
-              fi
-              if [ -z "${found}" ]; then
-                echo "::error::${missing} ${id} (${prefix}${id})"
-                exit 1
-              fi
-              collected_ref+=("${found}")
-            done
-          }
           expected_bdd_shards="$(uv run python -c "from scripts.ci.shard_split import SHARD_COUNTS; print(SHARD_COUNTS['bdd'])")"
           bdd_shards="$(seq 1 "${expected_bdd_shards}")"
-          bdd_data_files=()
-          collect_data_files bdd_data_files bdd-coverage-shards .coverage.bdd- \
-            "Missing BDD coverage artifact for shard" "${bdd_shards}"
-          if [ ! -f .coverage ]; then
-            echo "::error::Unit coverage data file missing."
-            exit 1
-          fi
           host_groups="$(uv run python -c "from scripts.ci.shard_split import INTEGRATION_HOST_GROUPS; print(' '.join(INTEGRATION_HOST_GROUPS))")"
-          integration_data_files=()
-          collect_data_files integration_data_files integration-coverage-groups .coverage.integration- \
-            "Missing integration coverage artifact for group" "${host_groups}"
-          if [ ! -f admin-coverage/.coverage.admin ]; then
-            echo "::error::Missing admin coverage artifact (.coverage.admin)"
-            exit 1
-          fi
-          uv run coverage combine --data-file=.coverage.combined .coverage "${bdd_data_files[@]}" "${integration_data_files[@]}" admin-coverage/.coverage.admin
+          # The script names every suite's data file or fails by name (tests/unit/test_collect_coverage_data.py).
+          # Bound first: a failing script stops the step here, which a process substitution into mapfile would not.
+          collected="$(./scripts/ci/collect_coverage_data.sh --bdd-shards "${bdd_shards}" --host-groups "${host_groups}")"
+          mapfile -t data_files <<< "${collected}"
+          uv run coverage combine --data-file=.coverage.combined "${data_files[@]}"
       - name: Diff coverage report
         run: |
           set -euo pipefail

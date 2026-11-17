@@ -111,7 +111,9 @@ Each of those suites names its artifact, data file and XML report on the
 has run, pass or fail. A suite that names no artifact uploads nothing.
 
 The **Coverage** job combines the unit artifact, the four BDD shards, the four
-host integration groups and the admin suite (ten data files in all). It writes a
+host integration groups and the admin suite (ten data files in all);
+`scripts/ci/collect_coverage_data.sh` names them, in combine order, and refuses
+a missing one by name. It writes a
 diff-cover report of the changed lines against `HEAD^1` (the base of the merge
 commit on a `pull_request` run; the previous commit on a `push` or
 `workflow_dispatch` run) into its step summary and the `diff-cover` artifact,
