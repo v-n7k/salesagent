@@ -211,19 +211,25 @@ exist" log entries.
 
 ## Branch protection migration
 
-**Do this before merging PR #1372**, or PRs will show green checks that are not
-required (or stay blocked on stale `Test Suite / …` names).
+Branch protection matches rendered check names exactly, so every job rename and
+every matrix change needs an out-of-band settings update, or PRs show green
+checks that are not required (or stay blocked on names that no longer render).
+The set of names is whatever `REQUIRED_RENDERED_CHECKS` in
+[`tests/unit/test_architecture_required_ci_checks_frozen.py`](../../tests/unit/test_architecture_required_ci_checks_frozen.py)
+pins: 24 rendered names at the time of writing. How it got there: PR #1372
+established 18; PR #1379 added two BDD shard checks and made `CI / BDD Tests`
+their aggregate (20); PR #1430 added `CI / BDD In-Network (e2e_rest)` (21);
+PR #1721 widened the split to four shards, `CI / BDD Tests (Shard 1/4)` through
+`CI / BDD Tests (Shard 4/4)` (23); PR #1858 added `CI / Storyboard Conformance`
+(24), which is rendered and pinned but stays outside the Summary job's `needs`
+until a branch-protection change promotes it.
 
 ### Maintainer checklist
 
-1. Merge PR #1370 (PR2) and rebase PR #1372 (PR3) onto `main`.
-2. Run `./scripts/capture-rendered-names.sh` on the rebased PR branch and copy the output.
-3. In GitHub → Settings → Rules → `main` branch protection:
-   - Remove legacy required checks prefixed with `Test Suite /`.
-   - Add all 18 checks prefixed with `CI /` from the script output.
-4. Keep non-CI required checks unchanged (`check-pr-title`, CodeQL, `security.yml` jobs, etc.).
-5. Merge PR #1372 only after a test PR shows all 18 `CI / …` checks as required and green.
-6. After PR #1379 (BDD sharding): add the 2 `CI / BDD Tests (Shard …/2)` required checks and keep `CI / BDD Tests` as the aggregate proxy — **separate** branch-protection update from PR3.
+1. Run `./scripts/capture-rendered-names.sh` on the branch and check the output against the frozen guard; the two must agree.
+2. In GitHub → Settings → Rules → `main` branch protection, add every `CI /` name from the output that is not yet required (see the note on `CI / Storyboard Conformance` above) and remove every required name the output no longer lists (the two `CI / BDD Tests (Shard …/2)` checks went when the split widened to four; `CI / BDD Tests` stays as the aggregate proxy).
+3. Keep non-CI required checks unchanged (`check-pr-title`, CodeQL, `security.yml` jobs, etc.).
+4. Merge the renaming PR only after a test PR shows every `CI / …` check as required and green.
 
 ### Local vs CI quality targets
 
@@ -293,7 +299,7 @@ uv run pytest tests/e2e/ -m requires_gam -v --timeout=300
 | Commit (~12 hooks) | `git commit` | ruff, hygiene, gitleaks, repo-invariants — warm target <2s |
 | Pre-push (~11 hooks) | `git push` | docs, routes, contracts, mypy — installed via `default_install_hook_types` |
 | pytest `arch_guard` | `make quality` | AST guards in `tests/unit/test_architecture_*.py` |
-| CI | PR to main | `make quality-ci` in Quality Gate + dedicated jobs (**20** frozen checks after PR #1379) |
+| CI | PR to main | `make quality-ci` in Quality Gate + dedicated jobs (the check names frozen in `tests/unit/test_architecture_required_ci_checks_frozen.py`) |
 
 Requires pre-commit ≥3.2.0. Run `pre-commit install` once per clone (installs both commit and pre-push hooks). If `pre-commit install` fails with a version-too-old `FatalError`, upgrade with `uv tool install pre-commit`.
 
