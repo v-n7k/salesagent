@@ -105,6 +105,11 @@ a line only it exercises reads as uncovered in the diff-cover report.
 
 ## Coverage
 
+Each of those suites names its artifact, data file and XML report on the
+`_pytest` composite action (`coverage_artifact`, `coverage_data_file`,
+`coverage_xml`), and the action uploads the data file and the XML once pytest
+has run, pass or fail. A suite that names no artifact uploads nothing.
+
 The **Coverage** job combines the unit artifact, the four BDD shards, the four
 host integration groups and the admin suite (ten data files in all). It writes a
 diff-cover report of the changed lines against `HEAD^1` (the base of the merge

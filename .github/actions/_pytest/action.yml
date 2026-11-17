@@ -1,5 +1,5 @@
 name: Run pytest
-description: Run pytest via uv with shared CI defaults.
+description: Run pytest via uv with shared CI defaults, and upload the suite's coverage data when an artifact is named.
 inputs:
   paths:
     description: Space-separated pytest paths or files.
@@ -12,12 +12,16 @@ inputs:
     description: When true, pass -p no:randomly.
     required: false
     default: "false"
-  with_coverage:
-    description: When true, pass --cov=src with xml/term reports.
-    required: false
-    default: "false"
   coverage_xml:
-    description: Custom XML coverage report path; enables --cov=src with no terminal report (xdist-friendly).
+    description: XML coverage report path; enables --cov=src with no terminal report (xdist-friendly).
+    required: false
+    default: ""
+  coverage_data_file:
+    description: Coverage data file pytest writes (COVERAGE_FILE) and the upload carries.
+    required: false
+    default: .coverage
+  coverage_artifact:
+    description: When set, upload coverage_data_file and coverage_xml under this artifact name once pytest has run, pass or fail.
     required: false
     default: ""
   tb:
@@ -29,6 +33,8 @@ runs:
   steps:
     - name: Run pytest
       shell: bash
+      env:
+        COVERAGE_FILE: ${{ inputs.coverage_data_file }}
       run: |
         set -euo pipefail
         args=(uv run pytest ${{ inputs.paths }})
@@ -36,12 +42,33 @@ runs:
           args+=(-p no:randomly)
         fi
         args+=(-q "--tb=${{ inputs.tb }}")
-        if [ "${{ inputs.with_coverage }}" = "true" ]; then
-          args+=(--cov=src --cov-report=xml --cov-report=term)
-        fi
         if [ -n "${{ inputs.coverage_xml }}" ]; then
           args+=(--cov=src "--cov-report=xml:${{ inputs.coverage_xml }}" --cov-report=)
         fi
         # Inject extra_args at compile time — do not bash-word-split (marker exprs contain parentheses).
         # shellcheck disable=SC2086,SC2093
         exec "${args[@]}" ${{ inputs.extra_args }}
+    # Both steps below run after a failed suite too: the Coverage job needs every data file, and a
+    # suite that names no artifact (schema-contract, smoke) uploads nothing.
+    - name: Combine xdist coverage fragments
+      if: ${{ always() && inputs.coverage_artifact != '' }}
+      shell: bash
+      env:
+        DATA_FILE: ${{ inputs.coverage_data_file }}
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        fragments=("${DATA_FILE}".*)
+        if [ "${#fragments[@]}" -gt 0 ]; then
+          uv run coverage combine --data-file="${DATA_FILE}" "${DATA_FILE}" "${fragments[@]}"
+        fi
+    - name: Upload coverage data
+      if: ${{ always() && inputs.coverage_artifact != '' }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ inputs.coverage_artifact }}
+        path: |
+          ${{ inputs.coverage_data_file }}
+          ${{ inputs.coverage_xml }}
+        include-hidden-files: true
+        if-no-files-found: error

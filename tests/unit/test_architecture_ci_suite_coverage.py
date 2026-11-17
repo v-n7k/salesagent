@@ -14,21 +14,31 @@ CI job, or a broken suite can silently land on main again.
 """
 
 import pytest
+import yaml
 
-from scripts.ci.workflow_helpers import load_ci_workflow
+from scripts.ci.workflow_helpers import CI_WORKFLOW_PATH, load_ci_workflow
 
 # Suite jobs that must appear in summary.needs — a suite that runs but is absent
 # from summary.needs leaves CI green on its failure (PR #1299 silent-breakage class).
 REQUIRED_SUMMARY_GATES = frozenset({"unit-tests", "integration-tests", "e2e-tests", "bdd-tests", "admin-ui-tests"})
 
+# The one upload path for coverage data: a suite names its artifact on this action's inputs.
+PYTEST_ACTION_PATH = CI_WORKFLOW_PATH.parents[1] / "actions" / "_pytest" / "action.yml"
+
+
+def _load_pytest_action() -> dict:
+    return yaml.safe_load(PYTEST_ACTION_PATH.read_text(encoding="utf-8"))
+
 
 def _assert_job_uploads_coverage(
     job: dict, *, artifact: str, data_file: str, xml: str, pytest_if: str | None = None
 ) -> dict:
-    """Assert that one `_pytest` step writes `data_file` and `xml`, and one upload named `artifact` carries both.
+    """Assert that one `_pytest` step declares `artifact`, `data_file` and `xml`, and nothing else uploads them.
 
+    The action writes the data file and the XML and uploads both (test_pytest_action_uploads_the_declared_coverage),
+    so a suite's whole contract is the three inputs on its one `_pytest` step.
     `pytest_if` narrows the `_pytest` steps to those whose `if` equals it; None counts every `_pytest` step.
-    Returns the upload step, so a caller can assert what is specific to its job.
+    Returns the `_pytest` step, so a caller can assert what is specific to its job.
     """
     pytest_steps = [
         step
@@ -36,21 +46,19 @@ def _assert_job_uploads_coverage(
         if str(step.get("uses", "")).endswith("/_pytest") and (pytest_if is None or step.get("if") == pytest_if)
     ]
     assert len(pytest_steps) == 1, f"expected one _pytest step (if={pytest_if!r}), found {len(pytest_steps)}"
-    assert pytest_steps[0].get("env", {}).get("COVERAGE_FILE") == data_file, "the suite must write its own data file"
-    assert pytest_steps[0].get("with", {}).get("coverage_xml") == xml, "the suite must write its own XML report"
-    uploads = [
-        step
-        for step in job["steps"]
-        if "actions/upload-artifact" in str(step.get("uses", "")) and step.get("with", {}).get("name") == artifact
+    step = pytest_steps[0]
+    inputs = step.get("with", {})
+    assert inputs.get("coverage_artifact") == artifact, "the suite must name the artifact the action uploads"
+    assert inputs.get("coverage_data_file") == data_file, "the suite must name its own data file"
+    assert inputs.get("coverage_xml") == xml, "the suite must name its own XML report"
+    assert "COVERAGE_FILE" not in step.get("env", {}), "the data file is declared once, as coverage_data_file"
+    job_uploads = [
+        s
+        for s in job["steps"]
+        if "actions/upload-artifact" in str(s.get("uses", "")) and s.get("with", {}).get("name") == artifact
     ]
-    assert len(uploads) == 1, f"expected one upload named {artifact!r}, found {len(uploads)}"
-    upload = uploads[0]
-    assert "always()" in str(upload.get("if", "")), "the upload must run when the suite fails, or its data is lost"
-    assert data_file in upload["with"].get("path", ""), "the upload must carry the data file"
-    assert xml in upload["with"].get("path", ""), "the upload must carry the XML report"
-    assert upload["with"].get("include-hidden-files") is True, "the data file is a dotfile; upload skips it otherwise"
-    assert upload["with"].get("if-no-files-found") == "error", "a missing data file must fail the upload, not warn"
-    return upload
+    assert not job_uploads, f"{artifact!r} is uploaded by the _pytest action; a second upload in the job would race it"
+    return step
 
 
 class TestCISuiteCoverage:
@@ -154,14 +162,14 @@ class TestCISuiteCoverage:
             "the matrix's host groups and shard_split.INTEGRATION_HOST_GROUPS must be the same list; "
             "the coverage gate loops over the constant"
         )
-        upload = _assert_job_uploads_coverage(
+        step = _assert_job_uploads_coverage(
             job,
             artifact="integration-${{ matrix.group }}-coverage",
             data_file=".coverage.integration-${{ matrix.group }}",
             xml="coverage-integration-${{ matrix.group }}.xml",
             pytest_if="matrix.group != 'creative'",
         )
-        assert "matrix.group != 'creative'" in str(upload.get("if", "")), "the creative group must upload no coverage"
+        assert "matrix.group != 'creative'" in str(step.get("if", "")), "the creative group must upload no coverage"
 
     @pytest.mark.arch_guard
     def test_admin_job_uploads_coverage(self):
@@ -172,6 +180,57 @@ class TestCISuiteCoverage:
             data_file=".coverage.admin",
             xml="coverage-admin.xml",
         )
+
+    @pytest.mark.arch_guard
+    def test_unit_job_uploads_coverage(self):
+        """The unit suite uploads through the same action as every other suite, so its upload runs on a failure too."""
+        _assert_job_uploads_coverage(
+            load_ci_workflow()["jobs"]["unit-tests"],
+            artifact="unit-coverage",
+            data_file=".coverage",
+            xml="coverage.xml",
+        )
+
+    @pytest.mark.arch_guard
+    def test_bdd_shards_upload_coverage(self):
+        """Every BDD shard writes its own data file and uploads it under the name the Coverage job downloads."""
+        _assert_job_uploads_coverage(
+            load_ci_workflow()["jobs"]["bdd-tests-shard"],
+            artifact="bdd-shard-${{ matrix.shard }}-coverage",
+            data_file=".coverage.bdd-${{ matrix.shard }}",
+            xml="coverage-bdd-${{ matrix.shard }}.xml",
+        )
+
+    @pytest.mark.arch_guard
+    def test_pytest_action_uploads_the_declared_coverage(self):
+        """The action writes the declared data file, folds xdist fragments into it, and uploads it even on a failure."""
+        action = _load_pytest_action()
+        inputs = action["inputs"]
+        assert inputs["coverage_data_file"]["default"] == ".coverage", "the default is coverage's own default"
+        assert inputs["coverage_artifact"]["default"] == "", "a suite that names no artifact uploads nothing"
+        steps = action["runs"]["steps"]
+        pytest_step = steps[0]
+        assert "uv run pytest" in pytest_step["run"]
+        assert pytest_step["env"]["COVERAGE_FILE"] == "${{ inputs.coverage_data_file }}", (
+            "pytest must write the data file the upload carries"
+        )
+        uploads = [i for i, s in enumerate(steps) if "actions/upload-artifact" in str(s.get("uses", ""))]
+        assert len(uploads) == 1, f"expected one upload step, found {len(uploads)}"
+        upload = steps[uploads[0]]
+        for guarded in (upload, steps[uploads[0] - 1]):
+            condition = str(guarded.get("if", ""))
+            assert "always()" in condition, "the step must run when the suite fails, or its data is lost"
+            assert "inputs.coverage_artifact != ''" in condition, "a suite that names no artifact uploads nothing"
+        combine = steps[uploads[0] - 1]
+        assert "coverage combine" in combine["run"] and "${DATA_FILE}" in combine["run"], (
+            "xdist fragments are folded into the data file before it is uploaded, for every suite"
+        )
+        assert combine["env"]["DATA_FILE"] == "${{ inputs.coverage_data_file }}"
+        assert upload["with"]["name"] == "${{ inputs.coverage_artifact }}"
+        assert "${{ inputs.coverage_data_file }}" in upload["with"]["path"], "the upload must carry the data file"
+        assert "${{ inputs.coverage_xml }}" in upload["with"]["path"], "the upload must carry the XML report"
+        assert upload["with"]["include-hidden-files"] is True, "the data file is a dotfile; upload skips it otherwise"
+        assert upload["with"]["if-no-files-found"] == "error", "a missing data file must fail the upload, not warn"
 
     @pytest.mark.arch_guard
     def test_coverage_gate_requires_every_host_suite_artifact(self):

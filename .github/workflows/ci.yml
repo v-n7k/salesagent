@@ -183,7 +183,9 @@ jobs:
       - uses: ./.github/actions/_pytest
         with:
           paths: tests/unit/ tests/harness/
-          with_coverage: "true"
+          coverage_data_file: .coverage
+          coverage_xml: coverage.xml
+          coverage_artifact: unit-coverage
           # Run the unit suite the way the runner does. Without these three
           # flags this job cannot observe the failure it is meant to gate:
           # `--json-report` is the discriminator (pytest-json-report attaches
@@ -194,14 +196,6 @@ jobs:
           # and a green run here says nothing about the parallel one.
           # The JSON file is not consumed; producing it is the point.
           extra_args: -n auto --dist loadgroup --json-report --json-report-file=unit-ci.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: unit-coverage
-          path: |
-            .coverage
-            coverage.xml
-          include-hidden-files: true
-          if-no-files-found: error
 
   integration-tests:
     name: Integration (${{ matrix.group }})
@@ -281,23 +275,14 @@ jobs:
       # group's own step below for where that hatch now lives.
       - uses: ./.github/actions/_pytest
         if: matrix.group != 'creative'
-        env:
-          # One data file per group so the artifacts cannot collide with unit's .coverage.
-          COVERAGE_FILE: .coverage.integration-${{ matrix.group }}
         with:
           paths: tests/integration/
           disable_randomly: "true"
+          # One data file per group so the artifacts cannot collide with unit's .coverage.
+          coverage_data_file: .coverage.integration-${{ matrix.group }}
           coverage_xml: coverage-integration-${{ matrix.group }}.xml
+          coverage_artifact: integration-${{ matrix.group }}-coverage
           extra_args: --timeout=60 -m "(${{ matrix.marker }}) and not skip_ci"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: ${{ always() && matrix.group != 'creative' }}
-        with:
-          name: integration-${{ matrix.group }}-coverage
-          path: |
-            .coverage.integration-${{ matrix.group }}
-            coverage-integration-${{ matrix.group }}.xml
-          include-hidden-files: true
-          if-no-files-found: error
       # `creative` is the one group that needs the reference agent, so it runs
       # IN-NETWORK — the same hammer bdd-in-network already swings. The agent is
       # reached by SERVICE NAME on the stack's own network
@@ -683,23 +668,14 @@ jobs:
       - uses: ./.github/actions/_postgres
         with:
           database-url: ${{ env.DATABASE_URL }}
-      # Uploaded below and combined by the Coverage job.
+      # Uploaded by the action and combined by the Coverage job.
       - uses: ./.github/actions/_pytest
-        env:
-          COVERAGE_FILE: .coverage.admin
         with:
           paths: tests/admin/
+          coverage_data_file: .coverage.admin
           coverage_xml: coverage-admin.xml
+          coverage_artifact: admin-coverage
           extra_args: -m "not slow"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always()
-        with:
-          name: admin-coverage
-          path: |
-            .coverage.admin
-            coverage-admin.xml
-          include-hidden-files: true
-          if-no-files-found: error
 
   bdd-tests-shard:
     name: BDD Tests (Shard ${{ matrix.shard }}/${{ strategy.job-total }})
@@ -751,30 +727,13 @@ jobs:
           joined="${TEST_FILES[*]}"
           echo "paths=${joined}" >> "$GITHUB_OUTPUT"
       - uses: ./.github/actions/_pytest
-        env:
-          # Separate data file per shard so artifacts cannot collide with unit's .coverage.
-          COVERAGE_FILE: .coverage.bdd-${{ matrix.shard }}
         with:
           paths: ${{ steps.bdd_shard.outputs.paths }}
+          # Separate data file per shard so artifacts cannot collide with unit's .coverage.
+          coverage_data_file: .coverage.bdd-${{ matrix.shard }}
           coverage_xml: coverage-bdd-${{ matrix.shard }}.xml
+          coverage_artifact: bdd-shard-${{ matrix.shard }}-coverage
           extra_args: -n auto --dist=load --timeout=60
-      - name: Combine xdist coverage fragments
-        run: |
-          shopt -s nullglob
-          fragments=(.coverage.bdd-${{ matrix.shard }}.*)
-          if [ "${#fragments[@]}" -gt 0 ]; then
-            uv run coverage combine --data-file=.coverage.bdd-${{ matrix.shard }} \
-              .coverage.bdd-${{ matrix.shard }} "${fragments[@]}"
-          fi
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always()
-        with:
-          name: bdd-shard-${{ matrix.shard }}-coverage
-          path: |
-            .coverage.bdd-${{ matrix.shard }}
-            coverage-bdd-${{ matrix.shard }}.xml
-          include-hidden-files: true
-          if-no-files-found: error
 
   bdd-tests:
     name: BDD Tests
